@@ -20,15 +20,25 @@
   tags: [section6, firewall]
 
   tasks:
-    - name: Check firewall rich rules
+    - name: Check firewall rich rules (firewalld)
       command: firewall-cmd --list-rich-rules
       register: s6_fw_rules
       changed_when: false
       failed_when: false
 
-    - name: Check firewall has SSH restrictions
+    - name: Check sshd_config ZTA lockdown block (container fallback)
+      command: grep -c "ZTA SSH LOCKDOWN" /etc/ssh/sshd_config
+      register: s6_sshd_lockdown
+      changed_when: false
+      failed_when: false
+
+    - name: Check SSH source restriction is active (either method)
       set_fact:
-        s6_fw_locked: "{{ 'reject' in (s6_fw_rules.stdout | default('')) or 'drop' in (s6_fw_rules.stdout | default('')) }}"
+        s6_fw_locked: >-
+          {{
+            'accept' in (s6_fw_rules.stdout | default('')) or
+            (s6_sshd_lockdown.rc | default(1)) == 0
+          }}
 
 - name: "Section 6 Check | HBAC Rules"
   hosts: zta_services
@@ -155,9 +165,9 @@
       - name: HBAC rule allow_breakglass exists
         ok: "{{ (c.s6_hbac_breakglass.rc | default(1)) == 0 }}"
       - name: aap-service passes HBAC test
-        ok: "{{ 'matched' in (c.s6_hbac_test_aap.stdout | default('')) | lower or 'Access granted' in (c.s6_hbac_test_aap.stdout | default('')) }}"
+        ok: "{{ 'Access granted: True' in (c.s6_hbac_test_aap.stdout | default('')) }}"
       - name: neteng denied by HBAC
-        ok: "{{ 'not matched' in (c.s6_hbac_test_neteng.stdout | default('')) | lower or 'Access denied' in (c.s6_hbac_test_neteng.stdout | default('')) }}"
+        ok: "{{ 'Access granted: False' in (c.s6_hbac_test_neteng.stdout | default('')) or 'Access denied: True' in (c.s6_hbac_test_neteng.stdout | default('')) }}"
       - name: Vault lockdown (human cannot sign SSH)
         ok: "{{ (c.s6_vault_ssh_sign.status | default(200)) == 403 }}"
       - name: Vault lockdown (human can read KV)

@@ -81,7 +81,7 @@
 
     - name: Check EDA event stream 'Splunk EDA' exists
       uri:
-        url: "{{ aap_host }}/api/eda/v1/event_streams/?name=Splunk+EDA"
+        url: "{{ aap_host }}/api/eda/v1/event-streams/?name=Splunk+EDA"
         method: GET
         user: "{{ aap_user }}"
         password: "{{ aap_password }}"
@@ -107,7 +107,7 @@
     - validation_vars.yml
 
   tasks:
-    - name: Check Splunk saved search 'ZTA: SSH Brute Force Detected'
+    - name: "Check Splunk saved search 'ZTA: SSH Brute Force Detected'"
       uri:
         url: "{{ splunk_mgmt_url }}/services/saved/searches/ZTA%3A+SSH+Brute+Force+Detected?output_mode=json"
         method: GET
@@ -139,7 +139,7 @@
             | selectattr('name', 'equalto', 'ZTA') | list | length) > 0 and
             (s5_splunk_addon_config.json.entry | default([])
             | selectattr('name', 'equalto', 'ZTA') | list
-            | first | default({}) ).get('content', {}).get('webhook_url', '') | length > 0
+            | first | default({}) ).get('content', {}).get('url', '') | length > 0
           }}
       when: s5_splunk_addon_config.status | default(0) == 200
 
@@ -180,7 +180,7 @@
         ok: "{{ s5_eda_event_stream_ok | default(false) }}"
       - name: EDA activation 'Splunk Events' running (Ex 5.3)
         ok: "{{ s5_eda_running | default(false) }}"
-      - name: Splunk saved search 'ZTA: SSH Brute Force Detected' exists
+      - name: "Splunk saved search 'ZTA: SSH Brute Force Detected' exists"
         ok: "{{ (c.s5_splunk_saved_search.status | default(0)) == 200 }}"
       - name: Splunk EDA addon webhook configured (ZTA stanza with URL)
         ok: "{{ c.s5_splunk_addon_ok | default(false) }}"

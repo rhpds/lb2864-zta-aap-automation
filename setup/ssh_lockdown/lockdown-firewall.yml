@@ -1,19 +1,22 @@
 ---
-# SSH Lockdown — Layer 1: Firewall
+# SSH Lockdown — Layer 1: SSH Source Restriction
 #
-# Restrict SSH on all managed RHEL hosts so that ONLY the AAP controller
+# Restricts SSH on app/db servers so ONLY the AAP controller (control)
 # and the management host (central) can reach port 22.
+#
+# Uses firewalld rich rules when available (RHEL VMs), or falls back to
+# sshd_config AllowUsers restriction for container environments where
+# firewalld is not present.
 #
 # After this playbook runs:
 #   ✓ ssh from control (AAP)    → ALLOWED
 #   ✓ ssh from central (mgmt)   → ALLOWED
-#   ✗ ssh from any workstation   → CONNECTION REFUSED
+#   ✗ ssh from any other source → REFUSED
 #
 # WARNING: Run this AFTER all other setup playbooks are complete.
-#          Only rollback-firewall.yml or manual intervention will undo this.
 
-- name: "SSH Lockdown | Layer 1 — Firewall: Restrict SSH Sources"
-  hosts: idm_clients
+- name: "SSH Lockdown | Layer 1 — SSH Source Restriction"
+  hosts: app_servers:db_servers
   become: true
   gather_facts: false
 
@@ -23,9 +26,18 @@
         label: "AAP Controller (control)"
       - ip: "192.168.1.11"
         label: "Management / Break-glass (central)"
+    ssh_lockdown_marker: "# ZTA SSH LOCKDOWN"
 
   tasks:
-    - name: "Add rich rule — allow SSH from {{ item.label }}"
+    - name: Check if firewalld is available
+      command: which firewall-cmd
+      register: fw_available
+      changed_when: false
+      failed_when: false
+
+    # ── Firewalld path (RHEL VMs) ──────────────────────────────────────
+
+    - name: "Firewalld | Add rich rule for {{ item.label }}"
       firewalld:
         rich_rule: >-
           rule family="ipv4"
@@ -38,35 +50,59 @@
       loop: "{{ allowed_ssh_sources }}"
       loop_control:
         label: "{{ item.label }} ({{ item.ip }})"
+      when: fw_available.rc == 0
 
-    - name: Remove default SSH service (blocks untrusted sources)
+    - name: "Firewalld | Remove default SSH service (block untrusted sources)"
       firewalld:
         service: ssh
         permanent: true
         immediate: true
         state: disabled
+      when: fw_available.rc == 0
 
-    - name: Verify firewall rules applied
-      command: firewall-cmd --list-rich-rules
-      register: rich_rules
+    # ── sshd_config path (containers without firewalld) ────────────────
+
+    - name: "sshd_config | Remove previous ZTA lockdown block"
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "{{ ssh_lockdown_marker }} {mark}"
+        state: absent
+      when: fw_available.rc != 0
+
+    - name: "sshd_config | Add AllowUsers restriction for trusted sources"
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "{{ ssh_lockdown_marker }} {mark}"
+        block: |
+          # ZTA Lab: restrict SSH to AAP controller and management host only
+          Match Address {{ allowed_ssh_sources | map(attribute='ip') | join(',') }}
+            AllowUsers rhel root
+          Match Address *,!{{ allowed_ssh_sources | map(attribute='ip') | join(',!') }}
+            DenyUsers *
+      when: fw_available.rc != 0
+      notify: Reload sshd
+
+    - name: Verify lockdown method active
+      shell: |
+        if which firewall-cmd &>/dev/null; then
+          firewall-cmd --list-rich-rules
+        else
+          grep -A2 "ZTA SSH LOCKDOWN" /etc/ssh/sshd_config
+        fi
+      register: lockdown_verify
       changed_when: false
+      failed_when: false
 
     - name: Display lockdown summary
       debug:
         msg: |
-          ┌──────────────────────────────────────────────────────────────┐
-          │  {{ inventory_hostname }} — SSH Firewall Lockdown Active  │
-          ├──────────────────────────────────────────────────────────────┤
-          │                                                            │
-          │  Allowed sources:                                          │
-          {% for src in allowed_ssh_sources %}
-          │    ✓ {{ (src.ip + '/32 — ' + src.label) }}│
-          {% endfor %}
-          │                                                            │
-          │  All other SSH connections: REFUSED                        │
-          │                                                            │
-          │  Active rich rules:                                        │
-          {% for rule in rich_rules.stdout_lines %}
-          │    {{ rule }}│
-          {% endfor %}
-          └──────────────────────────────────────────────────────────────┘
+          {{ inventory_hostname }} — SSH Lockdown Active
+          Method: {{ 'firewalld' if fw_available.rc == 0 else 'sshd_config' }}
+          Allowed sources: {{ allowed_ssh_sources | map(attribute='ip') | join(', ') }}
+          Config: {{ lockdown_verify.stdout }}
+
+  handlers:
+    - name: Reload sshd
+      service:
+        name: sshd
+        state: reloaded

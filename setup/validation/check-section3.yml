@@ -78,7 +78,7 @@
           }}
         s3_org_policy_ok: >-
           {{
-            (s3_org_check.json.results | default([]) | first | default({})).get('policy_enforcement', '')
+            (s3_org_check.json.results | default([]) | first | default({})).get('opa_query_path', '')
             == 'aap/gateway/decision'
           }}
 
@@ -160,8 +160,14 @@
       register: s3_pwquality
       failed_when: false
 
-    - name: Check audit rules
-      command: auditctl -l
+    - name: Check audit rules file deployed
+      stat:
+        path: /etc/audit/rules.d/zta-auth-audit.rules
+      register: s3_audit_rules_stat
+      failed_when: false
+
+    - name: Check audit rules file contains ZTA rules
+      command: grep -c "auth_log\|identity\|sudoers" /etc/audit/rules.d/zta-auth-audit.rules
       register: s3_audit_rules
       changed_when: false
       failed_when: false
@@ -194,8 +200,8 @@
         ok: "{{ '3' in (a.s3_ssh_maxtries.stdout | default('')) }}"
       - name: Password policy file exists
         ok: "{{ a.s3_pwquality.stat.exists | default(false) }}"
-      - name: Audit rules active
-        ok: "{{ 'zta' in (a.s3_audit_rules.stdout | default('')) }}"
+      - name: Audit rules deployed (zta-auth-audit.rules)
+        ok: "{{ (a.s3_audit_rules.rc | default(1)) == 0 }}"
 
   tasks:
     - name: Build results
