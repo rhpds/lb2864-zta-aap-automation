@@ -1,6 +1,15 @@
 ---
 # Section 2 Validation: Deploy Application with Short-Lived Credentials
 #
+# RUNTIME-AUTOMATION CONTEXT:
+#   module-02/setup-central.sh fires when student advances to Section 2.
+#   It removes Section 1 templates (remove_section=1) and creates Section 2
+#   templates (section2,rbac). Run this check DURING Section 2.
+#
+#   After advancing to Section 3, module-03 mutates IdM groups:
+#   neteng moves from team-infrastructure → team-readonly.
+#   The "neteng in team-infrastructure" check below is only valid in Section 2.
+#
 # Checks:
 #   - 5 pipeline job templates exist in AAP
 #   - Workflow template "Deploy Application Pipeline" exists
@@ -196,6 +205,8 @@
       when: s2_vault_lease_check is not skipped
 
     - name: Check neteng is in team-infrastructure group in IdM
+      # Valid during Section 2 only. module-03 runtime-automation moves neteng
+      # from team-infrastructure → team-readonly as part of Section 3 setup.
       command: ipa user-show neteng --all
       register: s2_neteng_groups
       changed_when: false

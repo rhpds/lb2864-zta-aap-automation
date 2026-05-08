@@ -1,6 +1,12 @@
 ---
 # Section 5 Validation: Automated Incident Response (Splunk → EDA → Vault)
 #
+# RUNTIME-AUTOMATION CONTEXT:
+#   module-05/setup-central.sh fires when student advances to Section 5.
+#   It removes Section 4 templates (remove_section=4) and creates Section 5
+#   templates (section5,rbac). Splunk was deployed by module-01 and should be
+#   fully running by this point. Run this check DURING Section 5.
+#
 # Checks:
 #   - 3 job templates exist (Revoke, Simulate, Restore)
 #   - EDA webhook endpoint responding on control:5000

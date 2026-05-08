@@ -1,6 +1,12 @@
 ---
 # Section 4 Validation: SPIFFE-Verified Network VLAN Management
 #
+# RUNTIME-AUTOMATION CONTEXT:
+#   module-04/setup-central.sh fires when student advances to Section 4.
+#   It removes Section 3 templates (remove_section=3) and creates Section 4
+#   templates (section4,rbac). Run this check DURING Section 4.
+#   After advancing, module-05 removes S4 templates.
+#
 # Checks:
 #   - Configure VLAN template exists in AAP
 #   - SPIRE Agent running on control

@@ -102,6 +102,10 @@
       controller_host: "{{ aap_host }}"
       controller_username: "{{ aap_user }}"
       controller_password: "{{ aap_password }}"
+      # controller_oauthtoken, when provided via --extra-vars, bypasses awx.awx
+      # internal token generation (which targets the deprecated /api/v2/tokens/
+      # endpoint and returns 404 on AAP 2.6 gateway deployments).
+      controller_oauthtoken: "{{ controller_oauthtoken | default(omit) }}"
       validate_certs: "{{ aap_verify_ssl }}"
 
   tasks:

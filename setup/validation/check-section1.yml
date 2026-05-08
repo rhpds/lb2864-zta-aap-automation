@@ -1,14 +1,26 @@
 ---
 # Section 1 Validation: Configure ZTA Components & AAP Integration
 #
+# RUNTIME-AUTOMATION CONTEXT:
+#   module-01/setup-central.sh fires when student enters Section 1.
+#   It starts deploy-splunk.yml in the background (async) — Splunk may still
+#   be deploying while the student works through Section 1 exercises.
+#   Section 1 templates (Verify ZTA Services, Test Vault Integration, etc.)
+#   are created by the initial setup-control-configure.sh, NOT by this module.
+#
+#   Run this check WHILE the student is on Section 1 (before advancing to
+#   Section 2). After advancing, module-02 removes Section 1 templates.
+#
 # Checks:
 #   - AAP credentials exist (Vault, Machine, Arista, NetBox, Vault SSH)
 #   - AAP project synced
 #   - AAP inventory with NetBox source, hosts populated
-#   - Job templates created (Verify ZTA Services, Test Vault Integration, etc.)
+#   - Job templates created AND at least one successful run each
+#   - LDAP authenticator 'IdM LDAP' configured with all 8 maps
+#   - ztauser exists in gateway (confirms student first login)
+#   - Vault: KV readable, SSH CA key present, DB engine configured
 #   - ZTA service health (IdM, Vault, OPA, NetBox, Kerberos, DNS, PostgreSQL, cEOS)
-#   - Vault KV readable, SSH CA role exists
-#   - OPA policies loaded and responding
+#   - OPA policies loaded and responding correctly
 #
 # Usage:
 #   ansible-playbook -i inventory/hosts.ini setup/validation/check-section1.yml
@@ -335,6 +347,15 @@
           target_server_status: Active
           maintenance_approved: true
 
+    - name: Check Splunk web UI reachable (deployed async by module-01)
+      uri:
+        url: "http://localhost:8000/en-US/account/login"
+        method: GET
+        status_code: [200, 302]
+        validate_certs: false
+      register: s1_splunk_health
+      failed_when: false
+
     - name: Check Vault KV readable
       uri:
         url: "{{ vault_addr }}/v1/secret/data/machine/rhel"
@@ -380,9 +401,9 @@
         s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
       when: s1_vault_login is defined and s1_vault_login is not failed
 
-    - name: Check Vault DB engine configured (ztaapp connection)
+    - name: Check Vault DB engine configured (ztaapp-postgres connection)
       uri:
-        url: "{{ vault_addr }}/v1/database/config/ztaapp"
+        url: "{{ vault_addr }}/v1/database/config/ztaapp-postgres"
         method: GET
         headers:
           X-Vault-Token: "{{ s1_vault_token }}"
@@ -504,6 +525,8 @@
         ok: "{{ (c.s1_opa_policies.json.result | default([]) | length) > 0 }}"
       - name: NetBox API accessible
         ok: "{{ (c.s1_netbox_health.status | default(0)) == 200 }}"
+      - name: Splunk web UI reachable (async deploy by module-01)
+        ok: "{{ (c.s1_splunk_health.status | default(0)) in [200, 302] }}"
       - name: Kerberos TGT
         ok: "{{ (c.s1_krb_check.rc | default(1)) == 0 }}"
       - name: DNS resolution
@@ -518,7 +541,7 @@
         ok: "{{ (c.s1_vault_ssh_ca.status | default(0)) == 200 and (c.s1_vault_ssh_ca.json.data.public_key | default('')) | length > 0 }}"
       - name: Vault SSH CA role exists (ssh-signer)
         ok: "{{ (c.s1_vault_ssh_role.status | default(0)) == 200 }}"
-      - name: Vault DB engine configured (ztaapp connection)
+      - name: Vault DB engine configured (ztaapp-postgres connection)
         ok: "{{ (c.s1_vault_db_config.status | default(0)) == 200 }}"
       - name: Vault DB short-lived role exists (ztaapp-short-lived)
         ok: "{{ (c.s1_vault_db_role.status | default(0)) == 200 }}"

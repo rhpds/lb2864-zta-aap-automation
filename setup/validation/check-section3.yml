@@ -1,6 +1,14 @@
 ---
 # Section 3 Validation: AAP Policy as Code — Platform-Gated Patching
 #
+# RUNTIME-AUTOMATION CONTEXT:
+#   module-03/setup-central.sh fires when student advances to Section 3.
+#   It creates Section 3 templates (section3,rbac) AND mutates IdM:
+#     - Removes neteng from team-infrastructure
+#     - Creates team-readonly group, adds neteng to it
+#   This is the permanent IdM state for Sections 3-6.
+#   Run this check DURING Section 3. After advancing, module-04 removes S3 templates.
+#
 # Checks:
 #   - Apply Security Patch template exists in AAP
 #   - OPA aap.gateway blocks neteng from patching templates
