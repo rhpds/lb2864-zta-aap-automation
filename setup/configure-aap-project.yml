@@ -72,7 +72,7 @@
 
     project_name: ZTA Workshop
     project_scm_url: http://gitea:3000/gitea/zta-workshop-aap.git
-    #project_scm_url: https://github.com/nmartins0611/zta-workshop-aap.git
+    #project_scm_url: https://github.com/rhpds/lb2864-zta-aap-automation.git
 
     inventory_name: ZTA Lab Inventory
     machine_credential_name: ZTA Machine Credential
@@ -80,8 +80,8 @@
     aap_remove_section: 0
 
     eda_project_name: ZTA Workshop EDA
-    eda_project_scm_url: https://github.com/nmartins0611/zta-workshop-aap.git
-    eda_project_scm_branch: zta-container
+    eda_project_scm_url: https://github.com/rhpds/lb2864-zta-aap-automation.git
+    eda_project_scm_branch: main
     eda_credential_name: ZTA AAP Credential
     eda_aap_cred_type_name: Red Hat Ansible Automation Platform
     eda_de_name: ZTA Decision Environment
