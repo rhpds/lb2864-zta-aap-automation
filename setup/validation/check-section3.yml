@@ -37,6 +37,43 @@
       set_fact:
         s3_template_ok: "{{ (s3_template_check.json.count | default(0)) > 0 }}"
 
+    - name: Check AAP Policy as Code settings (policyascode endpoint)
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/settings/policyascode/"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s3_opa_settings
+      failed_when: false
+
+    - name: Check Default org policy_enforcement set
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/organizations/?name=Default"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s3_org_check
+      failed_when: false
+
+    - name: Store policyascode check results
+      set_fact:
+        s3_opa_enabled: >-
+          {{
+            (s3_opa_settings.json.OPA_HOST | default('')) | length > 0 and
+            (s3_opa_settings.json.OPA_PORT | default(0)) | int == 8181
+          }}
+        s3_org_policy_ok: >-
+          {{
+            (s3_org_check.json.results | default([]) | first | default({})).get('policy_enforcement', '')
+            == 'aap/gateway/decision'
+          }}
+
 - name: "Section 3 Check | OPA Gateway Policy"
   hosts: zta_services
   become: false
@@ -133,6 +170,10 @@
     checks:
       - name: "Template: Apply Security Patch"
         ok: "{{ s3_template_ok | default(false) }}"
+      - name: AAP Policy as Code configured (OPA_HOST set)
+        ok: "{{ s3_opa_enabled | default(false) }}"
+      - name: Default org policy_enforcement = aap/gateway/decision
+        ok: "{{ s3_org_policy_ok | default(false) }}"
       - name: OPA gateway denies neteng (patching)
         ok: "{{ (c.s3_gw_deny.json.result.allowed | default(true)) == false }}"
       - name: OPA gateway allows ztauser (patching)

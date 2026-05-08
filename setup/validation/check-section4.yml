@@ -115,6 +115,47 @@
       register: s4_opa_vlan_range
       failed_when: false
 
+    - name: Test OPA network deny (rogue SPIFFE ID — same valid user + groups)
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: netadmin
+            user_groups: [network-admins]
+            spiffe_id: "spiffe://{{ idm_domain }}/workload/rogue-automation"
+            action: create_vlan
+            vlan_id: 200
+      register: s4_opa_rogue_spiffe
+      failed_when: false
+
+- name: "Section 4 Check | AAP Student Template"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section4, aap]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check 'Update NetBox VLAN (Student)' template exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name=Update+NetBox+VLAN+(Student)"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s4_student_template_check
+      failed_when: false
+
+    - name: Store student template check
+      set_fact:
+        s4_student_template_ok: "{{ (s4_student_template_check.json.count | default(0)) > 0 }}"
+
 - name: "Section 4 Check | VLAN on Switches"
   hosts: network
   gather_facts: false
@@ -171,6 +212,8 @@
         ok: "{{ (c.s4_opa_deny.json.result.allow | default(true)) == false }}"
       - name: OPA network denies invalid VLAN (5000)
         ok: "{{ (c.s4_opa_vlan_range.json.result.allow | default(true)) == false }}"
+      - name: OPA network denies rogue SPIFFE ID (Ex 4.3)
+        ok: "{{ (c.s4_opa_rogue_spiffe.json.result.allow | default(true)) == false }}"
       - name: VLAN 200 on ceos1
         ok: "{{ '200' in (hostvars['ceos1']['s4_vlan_check']['stdout'] | default(['']) | first) }}"
       - name: VLAN 200 on ceos2
@@ -179,6 +222,8 @@
         ok: "{{ '200' in (hostvars['ceos3']['s4_vlan_check']['stdout'] | default(['']) | first) }}"
       - name: VLAN 200 in NetBox
         ok: "{{ (c.s4_netbox_vlan.json.count | default(0)) > 0 }}"
+      - name: "Student template: Update NetBox VLAN (Student) exists"
+        ok: "{{ hostvars['localhost']['s4_student_template_ok'] | default(false) }}"
 
   tasks:
     - name: Build results

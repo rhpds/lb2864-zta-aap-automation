@@ -61,6 +61,71 @@
     - name: Store workflow check
       set_fact:
         s2_workflow_ok: "{{ (s2_workflow_check.json.count | default(0)) > 0 }}"
+        s2_workflow_id: "{{ (s2_workflow_check.json.results | default([]) | first | default({})).id | default('') }}"
+
+    - name: Check workflow node topology
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_templates/{{ s2_workflow_id }}/workflow_nodes/?page_size=20"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s2_workflow_nodes
+      failed_when: false
+      when: s2_workflow_id | length > 0
+
+    - name: Parse workflow node names
+      set_fact:
+        s2_node_names: >-
+          {{ s2_workflow_nodes.json.results | default([])
+             | map(attribute='unified_job_template')
+             | map(attribute='name', default='')
+             | list }}
+        s2_node_count: "{{ s2_workflow_nodes.json.count | default(0) }}"
+      when: s2_workflow_nodes is not skipped and s2_workflow_nodes.status == 200
+
+    - name: Check workflow team assignments (role_team_assignments)
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/role_team_assignments/?content_type__model=workflowjobtemplate&object_id={{ s2_workflow_id }}&page_size=50"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s2_workflow_teams
+      failed_when: false
+      when: s2_workflow_id | length > 0
+
+    - name: Check 'Check DB Policy' student template exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name=Check+DB+Policy"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s2_student_template_check
+      failed_when: false
+
+    - name: Store extended workflow checks
+      set_fact:
+        s2_node_count: "{{ s2_node_count | default(0) }}"
+        s2_node_names: "{{ s2_node_names | default([]) }}"
+        s2_workflow_teams_ok: >-
+          {{ (s2_workflow_teams.json.count | default(0)) >= 4 }}
+        s2_student_template_ok: "{{ (s2_student_template_check.json.count | default(0)) > 0 }}"
+        s2_workflow_nodes_ok: >-
+          {{
+            (s2_node_count | int) == 4 and
+            'Check DB Access Policy' in (s2_node_names | default([])) and
+            'Create DB Credential' in (s2_node_names | default([])) and
+            'Configure DB Access List' in (s2_node_names | default([])) and
+            'Deploy Application' in (s2_node_names | default([]))
+          }}
 
 - name: "Section 2 Check | OPA DB Access Policy"
   hosts: zta_services
@@ -98,6 +163,44 @@
             requested_permissions: [SELECT, INSERT, UPDATE]
       register: s2_opa_db_deny
       failed_when: false
+
+    - name: Authenticate to Vault for lease check
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/admin"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ idm_admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: s2_vault_login
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Check active Vault DB leases (dynamic users exist)
+      shell: >
+        curl -sk -X LIST
+        -H "X-Vault-Token: {{ s2_vault_login.json.auth.client_token | default('') }}"
+        {{ vault_addr }}/v1/sys/leases/lookup/database/creds/ztaapp-short-lived/
+      register: s2_vault_lease_check
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      when: s2_vault_login.status | default(0) == 200
+
+    - name: Parse Vault lease check result
+      set_fact:
+        s2_vault_leases_ok: >-
+          {{ (s2_vault_lease_check.stdout | default('{}') | from_json).data.keys | default([]) | length > 0 }}
+      failed_when: false
+      when: s2_vault_lease_check is not skipped
+
+    - name: Check neteng is in team-infrastructure group in IdM
+      command: ipa user-show neteng --all
+      register: s2_neteng_groups
+      changed_when: false
+      failed_when: false
+      become: true
 
 - name: "Section 2 Check | Application Health"
   hosts: zta_services
@@ -174,6 +277,16 @@
             (hostvars['ceos2']['s2_acl_check']['stdout'] | default(['']) | first) is search('host 10.20.0.10')
             and not ((hostvars['ceos2']['s2_acl_check']['stdout'] | default(['']) | first) is search('permit ip any'))
           }}
+      - name: Workflow has 4 nodes (correct topology)
+        ok: "{{ s2_workflow_nodes_ok | default(false) }}"
+      - name: Workflow team access assigned (4+ teams)
+        ok: "{{ s2_workflow_teams_ok | default(false) }}"
+      - name: neteng in team-infrastructure (IdM)
+        ok: "{{ 'team-infrastructure' in (c.s2_neteng_groups.stdout | default('')) }}"
+      - name: Vault DB leases active (dynamic users present)
+        ok: "{{ c.s2_vault_leases_ok | default(false) }}"
+      - name: "Student template: Check DB Policy exists"
+        ok: "{{ s2_student_template_ok | default(false) }}"
 
   tasks:
     - name: Build results

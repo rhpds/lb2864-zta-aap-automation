@@ -73,6 +73,70 @@
           {{ (s5_eda_activation.json.results | default([])
               | selectattr('status', 'equalto', 'running') | list | length) > 0 }}
 
+    - name: Check EDA event stream 'Splunk EDA' exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/event_streams/?name=Splunk+EDA"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s5_eda_event_stream
+      failed_when: false
+
+    - name: Store EDA event stream result
+      set_fact:
+        s5_eda_event_stream_ok: "{{ (s5_eda_event_stream.json.count | default(0)) > 0 }}"
+
+- name: "Section 5 Check | Splunk Integration"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section5, splunk]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check Splunk saved search 'ZTA: SSH Brute Force Detected'
+      uri:
+        url: "{{ splunk_mgmt_url }}/services/saved/searches/ZTA%3A+SSH+Brute+Force+Detected?output_mode=json"
+        method: GET
+        user: "{{ splunk_mgmt_user }}"
+        password: "{{ splunk_mgmt_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 404]
+      register: s5_splunk_saved_search
+      failed_when: false
+
+    - name: Check Splunk EDA addon webhook configured (ZTA stanza present)
+      uri:
+        url: "{{ splunk_mgmt_url }}/services/configs/conf-ansible_addon_for_splunk_environment?output_mode=json"
+        method: GET
+        user: "{{ splunk_mgmt_user }}"
+        password: "{{ splunk_mgmt_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 404]
+      register: s5_splunk_addon_config
+      failed_when: false
+
+    - name: Parse Splunk addon webhook URL configured
+      set_fact:
+        s5_splunk_addon_ok: >-
+          {{
+            (s5_splunk_addon_config.json.entry | default([])
+            | selectattr('name', 'equalto', 'ZTA') | list | length) > 0 and
+            (s5_splunk_addon_config.json.entry | default([])
+            | selectattr('name', 'equalto', 'ZTA') | list
+            | first | default({}) ).get('content', {}).get('webhook_url', '') | length > 0
+          }}
+      when: s5_splunk_addon_config.status | default(0) == 200
+
 - name: "Section 5 Check | Application Health"
   hosts: zta_services
   become: false
@@ -106,8 +170,14 @@
         ok: "{{ (s5_template_results | default({}))['Simulate Brute Force'] | default(false) }}"
       - name: "Template: Restore App Credentials"
         ok: "{{ (s5_template_results | default({}))['Restore App Credentials'] | default(false) }}"
-      - name: EDA activation 'Splunk Events' running
+      - name: EDA event stream 'Splunk EDA' created (Ex 5.1)
+        ok: "{{ s5_eda_event_stream_ok | default(false) }}"
+      - name: EDA activation 'Splunk Events' running (Ex 5.3)
         ok: "{{ s5_eda_running | default(false) }}"
+      - name: Splunk saved search 'ZTA: SSH Brute Force Detected' exists
+        ok: "{{ (c.s5_splunk_saved_search.status | default(0)) == 200 }}"
+      - name: Splunk EDA addon webhook configured (ZTA stanza with URL)
+        ok: "{{ c.s5_splunk_addon_ok | default(false) }}"
       - name: Application healthy (pre-attack)
         ok: "{{ (c.s5_app_health.status | default(0)) == 200 }}"
 

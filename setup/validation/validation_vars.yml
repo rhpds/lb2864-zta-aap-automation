@@ -157,3 +157,11 @@ opa_test_dc_internal_appdev:
 # "gitea" resolves to the Kubernetes service from within the AAP EE.
 # "gitea.zta.lab" is only reachable from lab VMs, not from OpenShift pods.
 gitea_project_url: "http://gitea:3000/gitea/zta-workshop-aap.git"
+
+# ── Splunk management API ─────────────────────────────────────────────
+# Splunk's management port 8089 is bound to localhost only on central.
+# check-section5.yml tasks that use these vars MUST run on zta_services
+# (hosts: central) — do NOT delegate_to: localhost.
+splunk_mgmt_url: "https://localhost:8089"
+splunk_mgmt_user: admin
+splunk_mgmt_password: "{{ idm_admin_password }}"

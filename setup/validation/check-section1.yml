@@ -86,6 +86,22 @@
         label: "{{ item }}"
       failed_when: false
 
+    - name: Check last successful run for S1 templates
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/{{ item.json.results[0].id }}/jobs/?status=successful&order_by=-started&page_size=1"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s1_template_runs
+      loop: "{{ s1_template_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      failed_when: false
+      when: (item.json.count | default(0)) > 0
+
     - name: Parse credential results
       set_fact:
         s1_cred_results: >-
@@ -106,11 +122,116 @@
       loop_control:
         label: "{{ item.item }}"
 
+    - name: Parse template last-run results
+      set_fact:
+        s1_template_ran: >-
+          {{ s1_template_ran | default({}) | combine({
+            item.item.item: ((item.json.count | default(0)) > 0)
+          }) }}
+      loop: "{{ s1_template_runs.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item | default('skipped') }}"
+      when: item.skipped is not defined or not item.skipped
+
     - name: Store AAP resource checks
       set_fact:
         s1_aap_ok: "{{ (s1_aap_ping.status | default(0)) == 200 }}"
         s1_project_ok: "{{ (s1_project_check.json.count | default(0)) > 0 }}"
         s1_inventory_ok: "{{ (s1_inventory_check.json.count | default(0)) > 0 }}"
+
+    # ── Gateway token for LDAP authenticator checks ─────────────────────
+    - name: Obtain AAP gateway Bearer token
+      uri:
+        url: "{{ aap_host }}/api/gateway/v1/tokens/"
+        method: POST
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        body_format: json
+        body: {}
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200, 201]
+      register: s1_gw_token_resp
+      failed_when: false
+
+    - name: Set gateway token fact
+      set_fact:
+        s1_gw_token: "{{ (s1_gw_token_resp.json | default({})).token | default('') }}"
+
+    - name: Check LDAP authenticator 'IdM LDAP' exists
+      uri:
+        url: "{{ aap_host }}/api/gateway/v1/authenticators/?name=IdM+LDAP"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        headers:
+          Authorization: "Bearer {{ s1_gw_token }}"
+        status_code: [200]
+      register: s1_ldap_auth_check
+      failed_when: false
+      when: s1_gw_token | length > 0
+
+    - name: Parse LDAP authenticator result
+      set_fact:
+        s1_ldap_auth_id: "{{ (s1_ldap_auth_check.json.results | default([]) | first | default({})).id | default('') }}"
+        s1_ldap_auth_ok: >-
+          {{
+            (s1_ldap_auth_check.json.results | default([]) | length) > 0 and
+            (s1_ldap_auth_check.json.results | default([]) | first | default({})).get('type', '')
+            is search('ldap')
+          }}
+      when: s1_ldap_auth_check is not skipped
+
+    - name: Check LDAP authenticator maps exist
+      uri:
+        url: "{{ aap_host }}/api/gateway/v1/authenticator_maps/?name={{ item | urlencode }}"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        headers:
+          Authorization: "Bearer {{ s1_gw_token }}"
+        status_code: [200]
+      register: s1_ldap_map_checks
+      loop:
+        - ZTA-ORG
+        - ZTA-Admins
+        - ZTA-SuperUser
+        - Infrastructure
+        - DevOps
+        - Security
+        - Applications
+        - Readonly
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+      when: s1_gw_token | length > 0
+
+    - name: Parse LDAP map results
+      set_fact:
+        s1_ldap_map_results: >-
+          {{ s1_ldap_map_results | default({}) | combine({
+            item.item: ((item.json.count | default(0)) > 0)
+          }) }}
+      loop: "{{ s1_ldap_map_checks.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('skipped') }}"
+      when: item.skipped is not defined or not item.skipped
+
+    - name: Check ztauser exists in gateway (proxy for first LDAP login)
+      uri:
+        url: "{{ aap_host }}/api/gateway/v1/users/?username=ztauser"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        headers:
+          Authorization: "Bearer {{ s1_gw_token }}"
+        status_code: [200]
+      register: s1_ztauser_check
+      failed_when: false
+      when: s1_gw_token | length > 0
+
+    - name: Store gateway check results
+      set_fact:
+        s1_ldap_auth_ok: "{{ s1_ldap_auth_ok | default(false) }}"
+        s1_ldap_maps_ok: "{{ (s1_ldap_map_results | default({})).values() | list | select('equalto', true) | list | length == 8 }}"
+        s1_ztauser_ok: "{{ (s1_ztauser_check.json.count | default(0)) > 0 }}"
 
 - name: "Section 1 Check | ZTA Service Health"
   hosts: zta_services
@@ -244,6 +365,51 @@
         s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
       when: s1_vault_login is defined and s1_vault_login is not failed
 
+    - name: Check Vault SSH CA public key configured
+      uri:
+        url: "{{ vault_addr }}/v1/ssh/config/ca"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ s1_vault_token }}"
+        validate_certs: false
+        status_code: [200]
+      register: s1_vault_ssh_ca
+      failed_when: false
+      delegate_to: localhost
+      vars:
+        s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
+      when: s1_vault_login is defined and s1_vault_login is not failed
+
+    - name: Check Vault DB engine configured (ztaapp connection)
+      uri:
+        url: "{{ vault_addr }}/v1/database/config/ztaapp"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ s1_vault_token }}"
+        validate_certs: false
+        status_code: [200, 403, 404]
+      register: s1_vault_db_config
+      failed_when: false
+      delegate_to: localhost
+      vars:
+        s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
+      when: s1_vault_login is defined and s1_vault_login is not failed
+
+    - name: Check Vault DB short-lived role exists
+      uri:
+        url: "{{ vault_addr }}/v1/database/roles/ztaapp-short-lived"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ s1_vault_token }}"
+        validate_certs: false
+        status_code: [200, 403, 404]
+      register: s1_vault_db_role
+      failed_when: false
+      delegate_to: localhost
+      vars:
+        s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
+      when: s1_vault_login is defined and s1_vault_login is not failed
+
   pre_tasks:
     - name: Authenticate to Vault
       uri:
@@ -348,8 +514,28 @@
         ok: "{{ (c.s1_opa_patch_deny.json.result.allow | default(false)) == false }}"
       - name: Vault KV readable
         ok: "{{ (c.s1_vault_kv.status | default(0)) == 200 }}"
-      - name: Vault SSH CA role exists
+      - name: Vault SSH CA public key present
+        ok: "{{ (c.s1_vault_ssh_ca.status | default(0)) == 200 and (c.s1_vault_ssh_ca.json.data.public_key | default('')) | length > 0 }}"
+      - name: Vault SSH CA role exists (ssh-signer)
         ok: "{{ (c.s1_vault_ssh_role.status | default(0)) == 200 }}"
+      - name: Vault DB engine configured (ztaapp connection)
+        ok: "{{ (c.s1_vault_db_config.status | default(0)) == 200 }}"
+      - name: Vault DB short-lived role exists (ztaapp-short-lived)
+        ok: "{{ (c.s1_vault_db_role.status | default(0)) == 200 }}"
+      - name: LDAP authenticator 'IdM LDAP' configured
+        ok: "{{ hostvars['localhost']['s1_ldap_auth_ok'] | default(false) }}"
+      - name: LDAP authenticator maps (8 maps)
+        ok: "{{ hostvars['localhost']['s1_ldap_maps_ok'] | default(false) }}"
+      - name: ztauser created (first LDAP login confirmed)
+        ok: "{{ hostvars['localhost']['s1_ztauser_ok'] | default(false) }}"
+      - name: "Template ran: Verify ZTA Services"
+        ok: "{{ (hostvars['localhost']['s1_template_ran'] | default({}))['Verify ZTA Services'] | default(false) }}"
+      - name: "Template ran: Test Vault Integration"
+        ok: "{{ (hostvars['localhost']['s1_template_ran'] | default({}))['Test Vault Integration'] | default(false) }}"
+      - name: "Template ran: Test Vault SSH Certificates"
+        ok: "{{ (hostvars['localhost']['s1_template_ran'] | default({}))['Test Vault SSH Certificates'] | default(false) }}"
+      - name: "Template ran: Test OPA Policy"
+        ok: "{{ (hostvars['localhost']['s1_template_ran'] | default({}))['Test OPA Policy'] | default(false) }}"
       - name: PostgreSQL running
         ok: "{{ (hostvars['db']['s1_pg_status']['status']['ActiveState'] | default('')) == 'active' }}"
       - name: Database connectivity
