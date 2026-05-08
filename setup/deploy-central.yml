@@ -596,7 +596,7 @@
                   NAME=${sw%%:*}; PORTS=${sw#*:}; \
                   SSH_PORT=${PORTS%%:*}; EAPI_PORT=${PORTS##*:}; \
                   MGMT_IP=$(podman inspect "$NAME" \
-                    --format "{{ mgmt_fmt }}" 2>/dev/null) || continue; \
+                    --format "{% raw %}{{.NetworkSettings.Networks.management.IPAddress}}{% endraw %}" 2>/dev/null) || continue; \
                   for port in $SSH_PORT $EAPI_PORT; do \
                     iptables -t nat -S 2>/dev/null | \
                       grep -E "dport ${port}\\b.*DNAT" | grep -v "$MGMT_IP" | \
@@ -608,9 +608,6 @@
 
               [Install]
               WantedBy=multi-user.target
-          vars:
-            mgmt_fmt: !unsafe '{{.NetworkSettings.Networks.management.IPAddress}}'
-
         - name: "Phase 8 | Enable cEOS DNAT fix service"
           ansible.builtin.systemd:
             name: ceos-dnat-fix
