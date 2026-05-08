@@ -609,7 +609,7 @@
               [Install]
               WantedBy=multi-user.target
           vars:
-            mgmt_fmt: '{{.NetworkSettings.Networks.management.IPAddress}}'
+            mgmt_fmt: !unsafe '{{.NetworkSettings.Networks.management.IPAddress}}'
 
         - name: "Phase 8 | Enable cEOS DNAT fix service"
           ansible.builtin.systemd:
