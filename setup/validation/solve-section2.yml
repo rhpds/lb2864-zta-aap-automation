@@ -151,6 +151,26 @@
         state: present
       tags: [workflow]
 
+    # ── Workflow RBAC ──────────────────────────────────────────────────
+
+    - name: Grant workshop teams execute on Deploy Application Pipeline workflow
+      ansible.controller.role:
+        role: execute
+        workflows:
+          - "{{ expected_section2_workflow }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: [Infrastructure, DevOps, Security, Applications]
+      loop_control:
+        label: "{{ item }} → execute"
+      retries: 3
+      delay: 3
+      until: _wf_team_result is not failed
+      register: _wf_team_result
+      tags: [workflow, rbac]
+
     # ── Launch the workflow ────────────────────────────────────────────
 
     - name: Launch Deploy Application Pipeline

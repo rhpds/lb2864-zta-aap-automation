@@ -89,6 +89,7 @@
       set_fact:
         s2_node_names: >-
           {{ s2_workflow_nodes.json.results | default([])
+             | map(attribute='summary_fields')
              | map(attribute='unified_job_template')
              | map(attribute='name', default='')
              | list }}
@@ -120,20 +121,23 @@
       register: s2_student_template_check
       failed_when: false
 
-    - name: Store extended workflow checks
+    - name: Initialise workflow node defaults (safe before conditional parse)
       set_fact:
         s2_node_count: "{{ s2_node_count | default(0) }}"
         s2_node_names: "{{ s2_node_names | default([]) }}"
+
+    - name: Store extended workflow checks
+      set_fact:
         s2_workflow_teams_ok: >-
           {{ (s2_workflow_teams.json.count | default(0)) >= 4 }}
         s2_student_template_ok: "{{ (s2_student_template_check.json.count | default(0)) > 0 }}"
         s2_workflow_nodes_ok: >-
           {{
             (s2_node_count | int) == 4 and
-            'Check DB Access Policy' in (s2_node_names | default([])) and
-            'Create DB Credential' in (s2_node_names | default([])) and
-            'Configure DB Access List' in (s2_node_names | default([])) and
-            'Deploy Application' in (s2_node_names | default([]))
+            'Check DB Access Policy' in s2_node_names and
+            'Create DB Credential' in s2_node_names and
+            'Configure DB Access List' in s2_node_names and
+            'Deploy Application' in s2_node_names
           }}
 
 - name: "Section 2 Check | OPA DB Access Policy"
@@ -200,7 +204,7 @@
     - name: Parse Vault lease check result
       set_fact:
         s2_vault_leases_ok: >-
-          {{ (s2_vault_lease_check.stdout | default('{}') | from_json).data.keys | default([]) | length > 0 }}
+          {{ ((s2_vault_lease_check.stdout | default('{}') | from_json).get('data', {}) | default({})).get('keys', []) | length > 0 }}
       failed_when: false
       when: s2_vault_lease_check is not skipped
 
@@ -249,7 +253,7 @@
     - name: Check ACL on ceos2
       arista.eos.eos_command:
         commands:
-          - show access-lists ZTA-APP-TO-DB
+          - show ip access-lists ZTA-APP-TO-DB
       register: s2_acl_check
       failed_when: false
 

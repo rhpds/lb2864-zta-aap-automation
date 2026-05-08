@@ -456,6 +456,44 @@
       when: _active_template_names | length > 0
       tags: [templates, section1, section2, section3, section4, section5, section6, section7, rbac, aap-bootstrap, aap, aap-project]
 
+    # ──────────────────────────────────────────────────────────────────────
+    #  3d. "Deploy Application Pipeline" workflow RBAC
+    #  Pre-created workflow gets same team access as job templates so students
+    #  can see and launch the completed pipeline from the UI.
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Grant workshop teams execute on Deploy Application Pipeline workflow
+      ansible.controller.role:
+        role: execute
+        workflows:
+          - Deploy Application Pipeline
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }} → execute → Deploy Application Pipeline"
+      register: _wf_rbac_result
+      retries: 5
+      delay: 3
+      until: _wf_rbac_result is not failed
+      tags: [section2, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant Readonly team read on Deploy Application Pipeline workflow
+      ansible.controller.role:
+        role: read
+        workflows:
+          - Deploy Application Pipeline
+        teams:
+          - "{{ zta_workshop_readonly_team }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      register: _wf_rbac_result
+      retries: 5
+      delay: 3
+      until: _wf_rbac_result is not failed
+      tags: [section2, rbac, aap-bootstrap, aap, aap-project]
+
     - name: Grant Readonly team read on project
       ansible.controller.role:
         role: read

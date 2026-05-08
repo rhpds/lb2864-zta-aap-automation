@@ -123,6 +123,16 @@
       failed_when: false
       tags: [phase2, idm-users]
 
+    - name: "Phase 2 | Add neteng to team-infrastructure group"
+      # neteng starts in team-infrastructure for Sections 1-2.
+      # module-03 runtime-automation moves them to team-readonly when the
+      # student advances to Section 3 (demonstrating AAP Policy as Code).
+      command: ipa group-add-member team-infrastructure --users=neteng
+      register: neteng_group
+      changed_when: neteng_group.rc == 0
+      failed_when: false
+      tags: [phase2, idm-users]
+
     # ═══════════════════════════════════════════════════════════════════
     # Phase 3 — Configure Keycloak realm and LDAP federation with IdM
     # ═══════════════════════════════════════════════════════════════════
