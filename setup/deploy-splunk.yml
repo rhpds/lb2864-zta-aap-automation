@@ -453,7 +453,7 @@
         url: "https://localhost:8089/servicesNS/admin/{{ item }}/data/models/{{ item | regex_replace('-', '_') | upper }}"
         method: POST
         user: admin
-        password: "{{ splunk_admin_password }}"
+        password: "{{ splunk_password }}"
         force_basic_auth: true
         validate_certs: false
         body_format: form-urlencoded
