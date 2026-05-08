@@ -1,0 +1,795 @@
+---
+# Integrate ZTA Workshop Components with Splunk for Monitoring
+#
+# Data flows:
+#   Linux hosts (auth/system logs)  →  Splunk HEC  (rsyslog omprog)
+#   RHEL containers (db, app)       →  Splunk HEC  (rsyslog omprog)
+#   Arista switches (syslog)        →  Wazuh Manager (UDP 514) → Splunk HEC
+#   Vault (audit log)               →  Splunk HEC  (systemd tail service)
+#   Wazuh Manager (security alerts) →  Splunk HEC  (native integration)
+#   OPA (decision logs)             →  Splunk HEC  (container log shipper)
+#
+# Prerequisites:
+#   - Splunk deployed:   ansible-playbook setup/deploy-splunk.yml
+#   - Wazuh deployed:    ansible-playbook setup/deploy-wazuh.yml  (only for wazuh_splunk tag)
+#   - Vault running:     ansible-playbook setup/deploy-vault.yml
+#   - DNS configured:    ansible-playbook setup/configure-dns.yml
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/integrate-splunk.yml
+#
+# Tags (each play has its own tag — skip or include individually):
+#   splunk_indexes    — Phase 1: Create Splunk indexes and verify HEC
+#   vm_syslog         — Phase 2: Linux VM rsyslog → Splunk HEC
+#   container_syslog  — Phase 3: RHEL container (app/db) rsyslog → Splunk HEC
+#   arista_syslog     — Phase 4: Arista switch syslog config (needs network group)
+#   vault_audit       — Phase 5: Vault audit log → Splunk HEC
+#   wazuh_splunk      — Phase 6: Wazuh alerts → Splunk HEC (needs Wazuh manager)
+#   opa_decisions     — Phase 7: OPA decision logs → Splunk HEC
+#   port_repair       — Phase 8: Repair Netavark port mappings after container restarts
+#   splunk_verify     — Phase 9: Send test events and verify all indexes
+#
+# Common skip patterns:
+#   --skip-tags arista_syslog,wazuh_splunk         — Standard lab boot (no Arista/Wazuh)
+#   --tags splunk_indexes,container_syslog          — Minimal Section 5 (app/db logs only)
+#   --tags splunk_indexes,vm_syslog,container_syslog,vault_audit,opa_decisions,splunk_verify
+#                                                   — Everything except Arista + Wazuh
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 1 — Create Splunk indexes and verify HEC
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 1 — Configure Splunk indexes"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  tags: [splunk_indexes]
+
+  vars:
+    splunk_password: "{{ idm_admin_password }}"
+    splunk_mgmt: "https://localhost:8089"
+    splunk_indexes:
+      - { name: zta_syslog,   description: "Linux host syslog (auth, system, daemon)" }
+      - { name: zta_network,  description: "Arista cEOS switch syslog" }
+      - { name: zta_vault,    description: "HashiCorp Vault audit log" }
+      - { name: zta_app,      description: "Application and database logs" }
+      - { name: zta_opa,      description: "OPA policy decision logs" }
+      - { name: zta_wazuh,    description: "Wazuh SIEM alerts" }
+
+  tasks:
+    - name: Wait for Splunk management API
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/services/server/info"
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: splunk_ready
+      until: splunk_ready.status == 200
+      retries: 12
+      delay: 10
+
+    - name: Create workshop monitoring indexes
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/data/indexes"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: "{{ item.name }}"
+          datatype: event
+        status_code: [200, 201, 409]
+      loop: "{{ splunk_indexes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Verify HEC endpoint is accepting events
+      ansible.builtin.uri:
+        url: "https://localhost:8088/services/collector/health/1.0"
+        method: GET
+        headers:
+          Authorization: "Splunk {{ splunk_hec_token }}"
+        validate_certs: false
+        status_code: [200]
+      register: hec_health
+
+    - name: HEC status
+      ansible.builtin.debug:
+        msg: "Splunk HEC is {{ 'READY' if hec_health.status == 200 else 'NOT READY' }} — indexes created: {{ splunk_indexes | map(attribute='name') | join(', ') }}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 2 — Deploy rsyslog → Splunk HEC on Linux VMs
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 2 — Linux VM syslog → Splunk HEC"
+  hosts: zta_services:vault_servers:netbox_servers:automation
+  become: true
+  gather_facts: true
+  tags: [vm_syslog]
+
+  vars:
+    hec_url: "https://{{ hostvars['central']['ansible_host'] }}:8088/services/collector/event"
+    hec_index: zta_syslog
+
+  tasks:
+    - name: Deploy Splunk HEC shipper script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/splunk-hec-shipper
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """rsyslog omprog → Splunk HEC shipper (zero external deps)."""
+          import json, signal, socket, ssl, sys, urllib.request
+
+          HEC_URL   = "{{ hec_url }}"
+          HEC_TOKEN = "{{ splunk_hec_token }}"
+          INDEX     = "{{ hec_index }}"
+          HOST      = socket.getfqdn()
+          CTX       = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+          for line in sys.stdin:
+              line = line.rstrip("\n")
+              if not line:
+                  continue
+              payload = json.dumps({
+                  "event": line,
+                  "sourcetype": "syslog",
+                  "source": "rsyslog",
+                  "host": HOST,
+                  "index": INDEX,
+              }).encode()
+              req = urllib.request.Request(
+                  HEC_URL, data=payload, method="POST",
+                  headers={
+                      "Authorization": "Splunk " + HEC_TOKEN,
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  urllib.request.urlopen(req, context=CTX, timeout=5)
+              except Exception:
+                  pass
+
+    - name: Deploy rsyslog Splunk HEC forwarding config
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/90-splunk-hec.conf
+        mode: '0644'
+        content: |
+          # Forward auth/security logs to Splunk via HEC
+          module(load="omprog")
+
+          template(name="splunk_fwd" type="string"
+                   string="%timegenerated:::date-rfc3339% %hostname% %syslogtag%%msg%\n")
+
+          if $syslogfacility-text == 'auth'
+             or $syslogfacility-text == 'authpriv'
+             or $programname == 'sshd'
+             or $programname == 'sudo'
+             or $programname == 'systemd-logind'
+             or $programname == 'polkitd'
+          then {
+              action(type="omprog"
+                     binary="/usr/local/bin/splunk-hec-shipper"
+                     template="splunk_fwd"
+                     output="/var/log/splunk-hec-shipper.log"
+                     confirmMessages="off")
+          }
+      register: rsyslog_conf
+
+    - name: Restart rsyslog to load new config
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+      when: rsyslog_conf.changed
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 3 — Deploy rsyslog → Splunk HEC on RHEL containers
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 3 — RHEL container syslog → Splunk HEC"
+  hosts: db_servers:app_servers
+  become: true
+  gather_facts: true
+  tags: [container_syslog]
+
+  vars:
+    hec_url: "https://{{ hostvars['central']['ansible_host'] }}:8088/services/collector/event"
+
+  tasks:
+    - name: Ensure rsyslog is installed in container
+      ansible.builtin.dnf:
+        name: rsyslog
+        state: present
+
+    - name: Deploy Splunk HEC shipper script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/splunk-hec-shipper
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """rsyslog omprog → Splunk HEC shipper."""
+          import json, signal, socket, ssl, sys, urllib.request
+
+          HEC_URL   = "{{ hec_url }}"
+          HEC_TOKEN = "{{ splunk_hec_token }}"
+          INDEX     = "zta_app"
+          HOST      = socket.getfqdn()
+          CTX       = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+          for line in sys.stdin:
+              line = line.rstrip("\n")
+              if not line:
+                  continue
+              payload = json.dumps({
+                  "event": line,
+                  "sourcetype": "syslog",
+                  "source": "rsyslog",
+                  "host": HOST,
+                  "index": INDEX,
+              }).encode()
+              req = urllib.request.Request(
+                  HEC_URL, data=payload, method="POST",
+                  headers={
+                      "Authorization": "Splunk " + HEC_TOKEN,
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  urllib.request.urlopen(req, context=CTX, timeout=5)
+              except Exception:
+                  pass
+
+    - name: Deploy rsyslog Splunk HEC forwarding config
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/90-splunk-hec.conf
+        mode: '0644'
+        content: |
+          module(load="omprog")
+
+          template(name="splunk_fwd" type="string"
+                   string="%timegenerated:::date-rfc3339% %hostname% %syslogtag%%msg%\n")
+
+          if $syslogfacility-text == 'auth'
+             or $syslogfacility-text == 'authpriv'
+             or $programname == 'sshd'
+             or $programname == 'sudo'
+             or $programname == 'postgres'
+             or $programname == 'gunicorn'
+             or $programname == 'flask'
+          then {
+              action(type="omprog"
+                     binary="/usr/local/bin/splunk-hec-shipper"
+                     template="splunk_fwd"
+                     output="/var/log/splunk-hec-shipper.log"
+                     confirmMessages="off")
+          }
+      register: rsyslog_container_conf
+
+    - name: Enable and restart rsyslog in container
+      ansible.builtin.systemd:
+        name: rsyslog
+        enabled: true
+        state: restarted
+      when: rsyslog_container_conf.changed
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 4 — Configure Arista switches to send syslog
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 4 — Arista switch syslog → Wazuh + Splunk"
+  hosts: network
+  gather_facts: false
+  tags: arista_syslog
+
+  tasks:
+    - name: Configure syslog on Arista switches
+      arista.eos.eos_config:
+        lines:
+          - logging host 192.168.1.11 514 protocol udp
+          - logging trap informational
+          - logging facility local6
+          - logging source-interface Management0
+        save_when: modified
+
+    - name: Log config change to confirm
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — syslog configured → 192.168.1.11:514 (Wazuh Manager)"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 5 — Configure Vault audit log → Splunk HEC
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 5 — Vault audit → Splunk HEC"
+  hosts: vault_servers
+  become: true
+  gather_facts: false
+  tags: [vault_audit]
+
+  vars:
+    hec_url: "https://{{ hostvars['central']['ansible_host'] }}:8088/services/collector/event"
+    vault_audit_log: /var/log/vault/audit.log
+
+  pre_tasks:
+    - name: Authenticate to Vault (userpass)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/admin"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ idm_admin_password }}"
+        status_code: [200]
+      register: vault_login
+
+    - name: Set Vault token
+      ansible.builtin.set_fact:
+        vault_token: "{{ vault_login.json.auth.client_token }}"
+
+  tasks:
+    - name: Create Vault audit log directory
+      ansible.builtin.file:
+        path: /var/log/vault
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+
+    - name: Enable Vault file audit device
+      ansible.builtin.command:
+        cmd: >-
+          vault audit enable -path=file file
+          file_path={{ vault_audit_log }}
+          log_raw=true
+      environment:
+        VAULT_ADDR: "{{ vault_addr }}"
+        VAULT_TOKEN: "{{ vault_token }}"
+      register: vault_audit_enable
+      failed_when:
+        - vault_audit_enable.rc != 0
+        - "'path already in use' not in vault_audit_enable.stderr"
+      changed_when: vault_audit_enable.rc == 0
+
+    - name: Deploy Vault audit → Splunk HEC shipper script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/vault-splunk-shipper
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """Tail Vault audit log and ship to Splunk HEC."""
+          import json, os, signal, ssl, sys, time, urllib.request
+
+          AUDIT_LOG = "{{ vault_audit_log }}"
+          HEC_URL   = "{{ hec_url }}"
+          HEC_TOKEN = "{{ splunk_hec_token }}"
+          INDEX     = "zta_vault"
+          CTX       = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+          def ship(line):
+              try:
+                  event = json.loads(line)
+              except (json.JSONDecodeError, ValueError):
+                  event = line
+              payload = json.dumps({
+                  "event": event,
+                  "sourcetype": "hashicorp:vault:audit",
+                  "source": "vault-audit",
+                  "host": "vault.zta.lab",
+                  "index": INDEX,
+              }).encode()
+              req = urllib.request.Request(
+                  HEC_URL, data=payload, method="POST",
+                  headers={
+                      "Authorization": "Splunk " + HEC_TOKEN,
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  urllib.request.urlopen(req, context=CTX, timeout=5)
+              except Exception:
+                  pass
+
+          while not os.path.exists(AUDIT_LOG):
+              time.sleep(2)
+
+          with open(AUDIT_LOG, "r") as f:
+              f.seek(0, 2)
+              while True:
+                  line = f.readline()
+                  if line:
+                      ship(line.strip())
+                  else:
+                      time.sleep(0.5)
+
+    - name: Deploy Vault audit shipper systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vault-splunk-shipper.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Vault Audit Log → Splunk HEC Shipper
+          After=vault.service network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/vault-splunk-shipper
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start Vault Splunk shipper
+      ansible.builtin.systemd:
+        name: vault-splunk-shipper
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 6 — Configure Wazuh → Splunk HEC integration
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 6 — Wazuh alerts → Splunk HEC"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  tags: wazuh_splunk
+
+  vars:
+    wazuh_data_dir: /opt/wazuh-data
+    ossec_conf: "{{ wazuh_data_dir }}/manager-etc/ossec.conf"
+    hec_url: "https://{{ hostvars['central']['ansible_host'] }}:8088/services/collector/event"
+    integration_script_dir: "{{ wazuh_data_dir }}/manager-integrations"
+
+  tasks:
+    - name: Deploy custom Splunk integration script for Wazuh
+      ansible.builtin.copy:
+        dest: "{{ integration_script_dir }}/custom-splunk"
+        mode: '0750'
+        content: |
+          #!/usr/bin/env python3
+          """Wazuh → Splunk HEC integration script.
+          Called by Wazuh Manager for each alert matching the integration rule."""
+          import json, ssl, sys, urllib.request
+
+          HEC_URL   = "{{ hec_url }}"
+          HEC_TOKEN = "{{ splunk_hec_token }}"
+          INDEX     = "zta_wazuh"
+          CTX       = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          def main():
+              alert_file = sys.argv[1]
+              with open(alert_file) as f:
+                  alert = json.load(f)
+
+              payload = json.dumps({
+                  "event": alert,
+                  "sourcetype": "wazuh:alerts",
+                  "source": "wazuh-manager",
+                  "host": alert.get("agent", {}).get("name", "wazuh-manager"),
+                  "index": INDEX,
+              }).encode()
+
+              req = urllib.request.Request(
+                  HEC_URL, data=payload, method="POST",
+                  headers={
+                      "Authorization": "Splunk " + HEC_TOKEN,
+                      "Content-Type": "application/json",
+                  },
+              )
+              urllib.request.urlopen(req, context=CTX, timeout=10)
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as e:
+                  sys.stderr.write(str(e) + "\n")
+                  sys.exit(1)
+
+    - name: Check if Splunk integration already configured in ossec.conf
+      ansible.builtin.command:
+        cmd: grep -c 'custom-splunk' {{ ossec_conf }}
+      register: splunk_integration_check
+      changed_when: false
+      failed_when: false
+
+    - name: Add Splunk integration block to ossec.conf
+      ansible.builtin.blockinfile:
+        path: "{{ ossec_conf }}"
+        insertbefore: '</ossec_config>'
+        marker: "<!-- {mark} SPLUNK INTEGRATION -->"
+        block: |
+          <integration>
+            <name>custom-splunk</name>
+            <hook_url>{{ hec_url }}</hook_url>
+            <api_key>{{ splunk_hec_token }}</api_key>
+            <alert_format>json</alert_format>
+            <level>3</level>
+          </integration>
+      when: splunk_integration_check.stdout | int == 0
+      register: ossec_updated
+
+    - name: Add syslog collection for network devices to ossec.conf
+      ansible.builtin.blockinfile:
+        path: "{{ ossec_conf }}"
+        insertbefore: '</ossec_config>'
+        marker: "<!-- {mark} NETWORK SYSLOG COLLECTION -->"
+        block: |
+          <remote>
+            <connection>syslog</connection>
+            <port>514</port>
+            <protocol>udp</protocol>
+            <allowed-ips>192.168.1.0/24</allowed-ips>
+            <allowed-ips>10.10.0.0/24</allowed-ips>
+            <allowed-ips>10.20.0.0/24</allowed-ips>
+            <allowed-ips>10.30.0.0/24</allowed-ips>
+          </remote>
+      register: syslog_collection_updated
+
+    - name: Restart Wazuh Manager to load integration
+      ansible.builtin.command:
+        cmd: podman restart wazuh-manager
+      when: ossec_updated.changed or syslog_collection_updated.changed
+
+    - name: Wait for Wazuh Manager API after restart
+      ansible.builtin.uri:
+        url: "https://localhost:55000"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401]
+      register: wazuh_post_restart
+      until: wazuh_post_restart.status in [200, 401]
+      retries: 20
+      delay: 10
+      when: ossec_updated.changed or syslog_collection_updated.changed
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 7 — Configure OPA decision log → Splunk HEC
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 7 — OPA decision logs → Splunk HEC"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  tags: [opa_decisions]
+
+  vars:
+    hec_url: "https://{{ hostvars['central']['ansible_host'] }}:8088/services/collector/event"
+
+  tasks:
+    - name: Deploy OPA decision log → Splunk HEC shipper
+      ansible.builtin.copy:
+        dest: /usr/local/bin/opa-splunk-shipper
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """Tail OPA container logs and ship decision entries to Splunk HEC."""
+          import json, signal, ssl, subprocess, sys, urllib.request
+
+          HEC_URL   = "{{ hec_url }}"
+          HEC_TOKEN = "{{ splunk_hec_token }}"
+          INDEX     = "zta_opa"
+          CTX       = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+          proc = subprocess.Popen(
+              ["podman", "logs", "-f", "--since", "1s", "opa"],
+              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+          )
+          for line in proc.stdout:
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  event = json.loads(line)
+              except (json.JSONDecodeError, ValueError):
+                  event = line
+              payload = json.dumps({
+                  "event": event,
+                  "sourcetype": "opa:decision",
+                  "source": "opa",
+                  "host": "central.zta.lab",
+                  "index": INDEX,
+              }).encode()
+              req = urllib.request.Request(
+                  HEC_URL, data=payload, method="POST",
+                  headers={
+                      "Authorization": "Splunk " + HEC_TOKEN,
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  urllib.request.urlopen(req, context=CTX, timeout=5)
+              except Exception:
+                  pass
+
+    - name: Deploy OPA Splunk shipper systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/opa-splunk-shipper.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=OPA Decision Log → Splunk HEC Shipper
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/opa-splunk-shipper
+          Restart=always
+          RestartSec=15
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start OPA Splunk shipper
+      ansible.builtin.systemd:
+        name: opa-splunk-shipper
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 8 — Repair Netavark port mappings after container restarts
+# Restarting containers (e.g. wazuh-manager) can corrupt nftables rules for
+# other containers when firewalld is disabled.  A quick restart of affected
+# containers forces Netavark to recreate their port-mapping rules.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 8 — Repair container port mappings"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  tags: [port_repair]
+
+  tasks:
+    - name: Verify Splunk web port is reachable after integration
+      ansible.builtin.uri:
+        url: "http://localhost:8000"
+        method: GET
+        status_code: [200, 302, 303]
+      register: splunk_post_check
+      failed_when: false
+
+    - name: Restart Splunk container to repair nftables rules if needed
+      ansible.builtin.command:
+        cmd: podman restart splunk
+      when: splunk_post_check.status | default(0) not in [200, 302, 303]
+      register: splunk_restarted
+
+    - name: Wait for Splunk to come back after restart
+      ansible.builtin.uri:
+        url: "http://localhost:8000"
+        method: GET
+        status_code: [200, 302, 303]
+      register: splunk_recovery
+      until: splunk_recovery.status in [200, 302, 303]
+      retries: 30
+      delay: 10
+      when: splunk_restarted is changed
+
+    - name: Port mapping repair status
+      ansible.builtin.debug:
+        msg: "{{ 'Splunk port mapping was broken — container restarted to repair nftables rules' if splunk_restarted is changed else 'Splunk port mapping intact' }}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Play 9 — Verification: send test events from each source
+# ═════════════════════════════════════════════════════════════════════════════
+- name: "Phase 9 — Verify all Splunk integrations"
+  hosts: zta_services
+  become: true
+  gather_facts: true
+  tags: [splunk_verify]
+
+  vars:
+    splunk_password: "{{ idm_admin_password }}"
+    hec_endpoint: "https://localhost:8088/services/collector/event"
+
+  tasks:
+    - name: Send test event for each index
+      ansible.builtin.uri:
+        url: "{{ hec_endpoint }}"
+        method: POST
+        headers:
+          Authorization: "Splunk {{ splunk_hec_token }}"
+        body_format: json
+        body:
+          event: "Integration test — {{ item.index }} — {{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+          sourcetype: "{{ item.sourcetype }}"
+          source: "ansible-integration-test"
+          index: "{{ item.index }}"
+        validate_certs: false
+        status_code: [200]
+      loop:
+        - { index: zta_syslog,   sourcetype: "syslog" }
+        - { index: zta_network,  sourcetype: "syslog" }
+        - { index: zta_vault,    sourcetype: "hashicorp:vault:audit" }
+        - { index: zta_app,      sourcetype: "syslog" }
+        - { index: zta_opa,      sourcetype: "opa:decision" }
+        - { index: zta_wazuh,    sourcetype: "wazuh:alerts" }
+      loop_control:
+        label: "{{ item.index }}"
+
+    - name: Verify indexes have data (search last 15 min)
+      ansible.builtin.uri:
+        url: "https://localhost:8089/services/search/jobs/export"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          search: "search index={{ item }} earliest=-15m | stats count"
+          output_mode: json
+        status_code: [200]
+      loop:
+        - zta_syslog
+        - zta_network
+        - zta_vault
+        - zta_app
+        - zta_opa
+        - zta_wazuh
+      loop_control:
+        label: "{{ item }}"
+      register: index_counts
+      ignore_errors: true
+
+    - name: Display integration summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════════════╗
+          ║        Splunk Integration — Complete                                 ║
+          ╠════════════════════════════════════════════════════════════════════════╣
+          ║                                                                      ║
+          ║  Splunk UI:  http://{{ ansible_host }}:8000                            ║
+          ║  HEC:        https://{{ ansible_host }}:8088                           ║
+          ║                                                                      ║
+          ║  Indexes:                                                            ║
+          ║    zta_syslog   — Linux host auth / system logs                      ║
+          ║    zta_network  — Arista cEOS switch syslog                          ║
+          ║    zta_vault    — Vault audit log (every secret access)              ║
+          ║    zta_app      — DB + App container logs                            ║
+          ║    zta_opa      — OPA policy decisions (allow/deny)                  ║
+          ║    zta_wazuh    — Wazuh security alerts (level >= 3)                 ║
+          ║                                                                      ║
+          ║  Data flows:                                                         ║
+          ║    Linux VMs       → rsyslog omprog → Splunk HEC                     ║
+          ║    RHEL containers → rsyslog omprog → Splunk HEC                     ║
+          ║    Arista switches → Wazuh (UDP 514) → Splunk HEC                   ║
+          ║    Vault           → file audit → systemd shipper → Splunk HEC       ║
+          ║    Wazuh           → custom-splunk integration → Splunk HEC          ║
+          ║    OPA             → container log shipper → Splunk HEC              ║
+          ║                                                                      ║
+          ║  Useful searches:                                                    ║
+          ║    index=zta_syslog sourcetype=syslog sshd                           ║
+          ║    index=zta_vault sourcetype=hashicorp:vault:audit                  ║
+          ║    index=zta_wazuh sourcetype=wazuh:alerts | stats count by rule.id  ║
+          ║    index=zta_network sourcetype=syslog                               ║
+          ║    index=zta_opa sourcetype=opa:decision                             ║
+          ║    index=zta_app sourcetype=syslog postgres                          ║
+          ║                                                                      ║
+          ║  Systemd services:                                                   ║
+          ║    vault-splunk-shipper  — vault audit tailer                        ║
+          ║    opa-splunk-shipper    — OPA log tailer                            ║
+          ╚════════════════════════════════════════════════════════════════════════╝

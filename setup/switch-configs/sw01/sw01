@@ -1,0 +1,34 @@
+! ceos1 — spine (inter-tier routing)
+!
+hostname ceos1
+!
+username admin privilege 15 role network-admin secret 0 admin
+!
+aaa authorization exec default local
+!
+ip routing
+!
+interface Management0
+   no shutdown
+!
+interface Ethernet1
+   no switchport
+   ip address 10.10.0.1/24
+   no shutdown
+!
+interface Ethernet2
+   no switchport
+   ip address 10.20.0.254/24
+   no shutdown
+!
+ip route 10.30.0.0/24 10.10.0.2
+!
+management api http-commands
+   protocol http
+   no shutdown
+!
+management ssh
+   idle-timeout 120
+   no shutdown
+!
+end

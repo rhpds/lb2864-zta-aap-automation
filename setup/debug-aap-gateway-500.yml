@@ -1,0 +1,40 @@
+---
+# Debug: localize AAP Envoy 500 on user operations (writes NDJSON session log).
+#
+# Usage (from repo root, adjust inventory/extra vars as needed):
+#   ansible-playbook setup/debug-aap-gateway-500.yml
+#   ansible-playbook setup/debug-aap-gateway-500.yml -e aap_controller_url=https://control.zta.lab
+#
+# Bash (same log format; requires curl + jq):
+#   export AAP_URL=https://control.zta.lab AAP_USER=admin AAP_ADMIN_PASSWORD='...'
+#   bash setup/scripts/debug_aap_gateway_probe.sh
+#
+# Log file (NDJSON, one object per line):
+#   /home/nmartins/Development/.cursor/debug-aba44c.log
+#
+# Does not log passwords or bearer tokens.
+
+- name: Debug AAP gateway user path (Envoy 500 triage)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+
+  tasks:
+    - name: Run gateway probe script
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/scripts/debug_aap_gateway_probe.py"
+      environment:
+        AAP_URL: "{{ aap_host }}"
+        AAP_USER: "{{ aap_debug_user | default('admin') }}"
+        AAP_PASSWORD: "{{ lookup('env', 'AAP_ADMIN_PASSWORD') | default('ansible123!', true) }}"
+        DEBUG_RUN_ID: "{{ aap_debug_run_id | default('ansible-probe') }}"
+      changed_when: false
+
+    - name: Hint log location
+      ansible.builtin.debug:
+        msg: "Wrote NDJSON lines to /home/nmartins/Development/.cursor/debug-aba44c.log — open in editor or share with support."

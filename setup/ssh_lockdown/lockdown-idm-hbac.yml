@@ -1,0 +1,168 @@
+---
+# SSH Lockdown — Layer 2: IdM Host-Based Access Control (HBAC)
+#
+# Even if a connection reaches the SSH port (Layer 1 passed), SSSD+HBAC
+# decides whether the IdM user is allowed to log in to that host.
+#
+# This playbook:
+#   1. Creates a dedicated 'aap-service' IdM account for AAP machine credentials
+#   2. Creates the 'breakglass-admins' group for emergency access
+#   3. Disables the default allow_all HBAC rule
+#   4. Creates granular HBAC rules:
+#        - aap-service   → all managed hosts (SSH)
+#        - breakglass    → all managed hosts (SSH + sudo)
+#        - zta-admins    → central only (for IdM management)
+#
+# NOTE: The local 'rhel' user is NOT subject to HBAC because it bypasses
+# SSSD.  It remains available from central as a fallback — controlled by
+# the firewall layer instead.
+
+- name: "SSH Lockdown | Layer 2 — IdM HBAC: Restrict Login Access"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    aap_service_user: aap-service
+    breakglass_group: breakglass-admins
+    managed_hosts:
+      - app.zta.lab
+      - db.zta.lab
+      - vault.zta.lab
+      - netbox.zta.lab
+      - wazuh.zta.lab
+      - control.zta.lab
+
+  tasks:
+    # ── 1. Create AAP service account ──
+    - name: Create AAP service account in IdM
+      redhat.rhel_idm.ipauser:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ aap_service_user }}"
+        first: AAP
+        last: Service
+        title: "Ansible Automation Platform — dedicated machine credential"
+        loginshell: /bin/bash
+        password: "{{ idm_admin_password }}"
+        update_password: on_create
+        state: present
+
+    - name: Add aap-service to zta-admins group
+      redhat.rhel_idm.ipagroup:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: zta-admins
+        user: "{{ aap_service_user }}"
+        action: member
+        state: present
+
+    # ── 2. Create break-glass group ──
+    - name: Create breakglass-admins group
+      redhat.rhel_idm.ipagroup:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ breakglass_group }}"
+        description: "Emergency SSH access — audited, requires justification"
+        state: present
+
+    - name: Add admin users to breakglass-admins
+      redhat.rhel_idm.ipagroup:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ breakglass_group }}"
+        user:
+          - ztauser
+          - jsmith
+          - mrodriguez
+        action: member
+        state: present
+
+    # ── 3. Register managed hosts in IdM (if not already) ──
+    - name: Ensure managed hosts exist in IdM
+      redhat.rhel_idm.ipahost:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ item }}"
+        force: true
+        state: present
+      loop: "{{ managed_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    # ── 4. Disable the default allow_all rule ──
+    - name: Disable the default allow_all HBAC rule
+      redhat.rhel_idm.ipahbacrule:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: allow_all
+        state: disabled
+
+    # ── 5. HBAC: AAP service account → all managed hosts ──
+    - name: "HBAC rule — AAP automation ({{ aap_service_user }} → managed hosts)"
+      redhat.rhel_idm.ipahbacrule:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: allow_aap_automation
+        description: "Only path to managed hosts is through AAP"
+        user:
+          - "{{ aap_service_user }}"
+        host: "{{ managed_hosts }}"
+        hbacsvc:
+          - sshd
+        state: present
+
+    # ── 6. HBAC: Break-glass admins → all hosts ──
+    - name: HBAC rule — break-glass emergency access
+      redhat.rhel_idm.ipahbacrule:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: allow_breakglass
+        description: "Emergency admin access — audited, time-limited in production"
+        group:
+          - "{{ breakglass_group }}"
+        host: "{{ managed_hosts }}"
+        hbacsvc:
+          - sshd
+          - sudo
+        state: present
+
+    # ── 7. HBAC: zta-admins → central (IdM management) ──
+    - name: HBAC rule — ZTA admins can access central for IdM management
+      redhat.rhel_idm.ipahbacrule:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: allow_zta_admins_central
+        description: "ZTA admins can SSH to central for IdM/OPA management"
+        group:
+          - zta-admins
+        host:
+          - central.zta.lab
+        hbacsvc:
+          - sshd
+          - sudo
+        state: present
+
+    # ── Summary ──
+    - name: Display HBAC summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║         IdM HBAC Lockdown — Configuration Complete           ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  AAP Service Account:                                        ║
+          ║    User:   {{ aap_service_user }}║
+          ║    Groups: zta-admins                                        ║
+          ║    Access: SSH to all managed hosts                          ║
+          ║                                                              ║
+          ║  Break-Glass Group:                                          ║
+          ║    Group:  {{ breakglass_group }}║
+          ║    Users:  ztauser, jsmith, mrodriguez                       ║
+          ║    Access: SSH + sudo to all managed hosts                   ║
+          ║                                                              ║
+          ║  Default allow_all: DISABLED                                 ║
+          ║                                                              ║
+          ║  What this means:                                            ║
+          ║    ✓ aap-service can SSH to targets (AAP jobs work)          ║
+          ║    ✓ breakglass-admins can SSH in emergencies                ║
+          ║    ✓ zta-admins can SSH to central for management            ║
+          ║    ✗ neteng, appdev, etc. CANNOT SSH directly                ║
+          ║    ✗ Any unlisted IdM user is DENIED at login                ║
+          ║                                                              ║
+          ║  NOTE: The local 'rhel' user bypasses HBAC as it             ║
+          ║        authenticates via PAM, not SSSD. It is controlled     ║
+          ║        by the firewall layer (Layer 1) instead.              ║
+          ╚════════════════════════════════════════════════════════════════╝

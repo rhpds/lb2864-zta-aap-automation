@@ -1,0 +1,207 @@
+---
+# Diagnostic playbook — gather runtime evidence for ceos2/ceos3 SSH failures
+- name: Diagnose cEOS switch connectivity
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: "H1 — Check container status (all ceos)"
+      command: podman ps -a --filter name=ceos --format "{{ '{{' }}.Names{{ '}}' }} {{ '{{' }}.Status{{ '}}' }} {{ '{{' }}.State{{ '}}' }}"
+      register: container_status
+      changed_when: false
+
+    - name: "H1 — Show container status"
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+    - name: "H2 — Check port mappings for ceos1"
+      command: podman port ceos1
+      register: ports_ceos1
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Check port mappings for ceos2"
+      command: podman port ceos2
+      register: ports_ceos2
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Check port mappings for ceos3"
+      command: podman port ceos3
+      register: ports_ceos3
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Show port mappings"
+      debug:
+        msg:
+          ceos1: "{{ ports_ceos1.stdout_lines | default(['NONE']) }}"
+          ceos2: "{{ ports_ceos2.stdout_lines | default(['NONE']) }}"
+          ceos3: "{{ ports_ceos3.stdout_lines | default(['NONE']) }}"
+
+    - name: "H3 — Check firewalld open ports"
+      command: firewall-cmd --list-ports
+      register: fw_ports
+      changed_when: false
+      failed_when: false
+
+    - name: "H3 — Show firewall ports"
+      debug:
+        msg: "{{ fw_ports.stdout }}"
+
+    - name: "H3 — Check nftables rules for port 2002"
+      shell: "nft list ruleset 2>/dev/null | grep -i 2002 || echo 'No nft rules for 2002'"
+      register: nft_2002
+      changed_when: false
+      failed_when: false
+
+    - name: "H3 — Check nftables rules for port 2003"
+      shell: "nft list ruleset 2>/dev/null | grep -i 2003 || echo 'No nft rules for 2003'"
+      register: nft_2003
+      changed_when: false
+      failed_when: false
+
+    - name: "H3 — Show nftables for 2002/2003"
+      debug:
+        msg:
+          nft_2002: "{{ nft_2002.stdout_lines }}"
+          nft_2003: "{{ nft_2003.stdout_lines }}"
+
+    - name: "H4 — Check SSH listener inside ceos1"
+      shell: "podman exec ceos1 ss -tlnp 2>/dev/null | grep ':22 ' || echo 'SSH NOT listening'"
+      register: ssh_ceos1
+      changed_when: false
+      failed_when: false
+
+    - name: "H4 — Check SSH listener inside ceos2"
+      shell: "podman exec ceos2 ss -tlnp 2>/dev/null | grep ':22 ' || echo 'SSH NOT listening'"
+      register: ssh_ceos2
+      changed_when: false
+      failed_when: false
+
+    - name: "H4 — Check SSH listener inside ceos3"
+      shell: "podman exec ceos3 ss -tlnp 2>/dev/null | grep ':22 ' || echo 'SSH NOT listening'"
+      register: ssh_ceos3
+      changed_when: false
+      failed_when: false
+
+    - name: "H4 — Show SSH listener status"
+      debug:
+        msg:
+          ceos1: "{{ ssh_ceos1.stdout }}"
+          ceos2: "{{ ssh_ceos2.stdout }}"
+          ceos3: "{{ ssh_ceos3.stdout }}"
+
+    - name: "H5 — Check EOS agent status in ceos2"
+      shell: "podman exec ceos2 Cli -c 'show version' 2>&1 || echo 'Cli command failed'"
+      register: eos_ceos2
+      changed_when: false
+      failed_when: false
+
+    - name: "H5 — Check EOS agent status in ceos3"
+      shell: "podman exec ceos3 Cli -c 'show version' 2>&1 || echo 'Cli command failed'"
+      register: eos_ceos3
+      changed_when: false
+      failed_when: false
+
+    - name: "H5 — Show EOS status"
+      debug:
+        msg:
+          ceos2: "{{ eos_ceos2.stdout_lines[:10] }}"
+          ceos3: "{{ eos_ceos3.stdout_lines[:10] }}"
+
+    - name: "CONNECTIVITY — Test localhost:2001 (ceos1 - working baseline)"
+      wait_for:
+        host: localhost
+        port: 2001
+        timeout: 5
+      register: conn_2001
+      failed_when: false
+
+    - name: "CONNECTIVITY — Test localhost:2002 (ceos2)"
+      wait_for:
+        host: localhost
+        port: 2002
+        timeout: 5
+      register: conn_2002
+      failed_when: false
+
+    - name: "CONNECTIVITY — Test localhost:2003 (ceos3)"
+      wait_for:
+        host: localhost
+        port: 2003
+        timeout: 5
+      register: conn_2003
+      failed_when: false
+
+    - name: "CONNECTIVITY — Show results"
+      debug:
+        msg:
+          port_2001_ceos1: "{{ 'OPEN' if conn_2001 is not failed else 'CLOSED/UNREACHABLE' }}"
+          port_2002_ceos2: "{{ 'OPEN' if conn_2002 is not failed else 'CLOSED/UNREACHABLE' }}"
+          port_2003_ceos3: "{{ 'OPEN' if conn_2003 is not failed else 'CLOSED/UNREACHABLE' }}"
+
+    - name: "H2 — Check podman network list"
+      command: podman network ls
+      register: net_list
+      changed_when: false
+
+    - name: "H2 — Show networks"
+      debug:
+        msg: "{{ net_list.stdout_lines }}"
+
+    - name: "H2 — Check which networks ceos2 is on"
+      shell: "podman inspect ceos2 --format '{{ '{{' }}json .NetworkSettings.Networks{{ '}}' }}' | python3 -m json.tool 2>/dev/null || echo 'inspect failed'"
+      register: ceos2_nets
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Check which networks ceos3 is on"
+      shell: "podman inspect ceos3 --format '{{ '{{' }}json .NetworkSettings.Networks{{ '}}' }}' | python3 -m json.tool 2>/dev/null || echo 'inspect failed'"
+      register: ceos3_nets
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Show container networks"
+      debug:
+        msg:
+          ceos2_networks: "{{ ceos2_nets.stdout_lines }}"
+          ceos3_networks: "{{ ceos3_nets.stdout_lines }}"
+
+    - name: "H2 — Check podman port forwarding via inspect for ceos2"
+      shell: "podman inspect ceos2 --format '{{ '{{' }}json .HostConfig.PortBindings{{ '}}' }}' 2>/dev/null || echo 'inspect failed'"
+      register: ceos2_portbindings
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Check podman port forwarding via inspect for ceos3"
+      shell: "podman inspect ceos3 --format '{{ '{{' }}json .HostConfig.PortBindings{{ '}}' }}' 2>/dev/null || echo 'inspect failed'"
+      register: ceos3_portbindings
+      changed_when: false
+      failed_when: false
+
+    - name: "H2 — Show PortBindings"
+      debug:
+        msg:
+          ceos2: "{{ ceos2_portbindings.stdout }}"
+          ceos3: "{{ ceos3_portbindings.stdout }}"
+
+    - name: "CONTAINER LOGS — last 20 lines from ceos2"
+      shell: "podman logs --tail 20 ceos2 2>&1 || echo 'no logs'"
+      register: logs_ceos2
+      changed_when: false
+      failed_when: false
+
+    - name: "CONTAINER LOGS — last 20 lines from ceos3"
+      shell: "podman logs --tail 20 ceos3 2>&1 || echo 'no logs'"
+      register: logs_ceos3
+      changed_when: false
+      failed_when: false
+
+    - name: "CONTAINER LOGS — show"
+      debug:
+        msg:
+          ceos2_logs: "{{ logs_ceos2.stdout_lines }}"
+          ceos3_logs: "{{ logs_ceos3.stdout_lines }}"

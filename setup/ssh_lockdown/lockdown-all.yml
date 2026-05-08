@@ -1,0 +1,84 @@
+---
+# SSH Lockdown — Master Playbook
+#
+# Applies all four lockdown layers in the correct order:
+#   Layer 1: Firewall     — restrict SSH source IPs
+#   Layer 2: IdM HBAC     — restrict which IdM users can log in
+#   Layer 3: Vault        — restrict who can generate credentials
+#   Layer 4: Wazuh        — detect and alert on bypass attempts
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/ssh_lockdown/lockdown-all.yml
+#
+# WARNING: This will restrict SSH access to managed hosts.
+#          Ensure you have console/out-of-band access before running.
+
+- name: "SSH Lockdown — Pre-flight Checks"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Confirm lockdown intent
+      pause:
+        prompt: |
+
+          ╔════════════════════════════════════════════════════════════════╗
+          ║              SSH LOCKDOWN — CONFIRMATION                      ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  This will apply all 4 lockdown layers:                      ║
+          ║                                                              ║
+          ║    Layer 1: Firewall  — SSH only from AAP + central          ║
+          ║    Layer 2: HBAC     — IdM login restricted to aap-service   ║
+          ║    Layer 3: Vault    — Only AAP AppRole can issue creds      ║
+          ║    Layer 4: Wazuh    — Bypass detection + EDA alerting       ║
+          ║                                                              ║
+          ║  After this, the ONLY way to reach managed hosts is          ║
+          ║  through AAP or the break-glass path from central.           ║
+          ║                                                              ║
+          ╚════════════════════════════════════════════════════════════════╝
+
+          Press ENTER to continue or Ctrl+C to abort
+
+- import_playbook: lockdown-firewall.yml
+- import_playbook: lockdown-idm-hbac.yml
+- import_playbook: lockdown-vault-policies.yml
+- import_playbook: lockdown-wazuh-bypass.yml
+
+- name: "SSH Lockdown — Final Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Display lockdown complete message
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║         SSH LOCKDOWN COMPLETE — ALL 4 LAYERS ACTIVE          ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  ┌─────────────────────────────────────────────────────────┐  ║
+          ║  │  User at workstation                                   │  ║
+          ║  │       │                                                │  ║
+          ║  │       ▼                                                │  ║
+          ║  │  [Layer 1: Firewall] ──── CONNECTION REFUSED           │  ║
+          ║  │       │ (if from AAP/central)                          │  ║
+          ║  │       ▼                                                │  ║
+          ║  │  [Layer 2: HBAC] ──────── LOGIN DENIED                │  ║
+          ║  │       │ (if aap-service or breakglass)                 │  ║
+          ║  │       ▼                                                │  ║
+          ║  │  [Layer 3: Vault] ─────── NO CREDENTIALS               │  ║
+          ║  │       │ (only AppRole can generate)                    │  ║
+          ║  │       ▼                                                │  ║
+          ║  │  [Layer 4: Wazuh] ─────── ALERT → EDA → RESPOND       │  ║
+          ║  │       │                                                │  ║
+          ║  │       ▼                                                │  ║
+          ║  │  Access granted (via AAP only)                         │  ║
+          ║  └─────────────────────────────────────────────────────────┘  ║
+          ║                                                              ║
+          ║  Next steps:                                                 ║
+          ║    1. Configure AAP Machine Credential with aap-service      ║
+          ║    2. Configure AAP Vault Credential with AppRole creds      ║
+          ║    3. Test: SSH from workstation → REFUSED                   ║
+          ║    4. Test: Launch AAP job → SUCCEEDS                        ║
+          ╚════════════════════════════════════════════════════════════════╝

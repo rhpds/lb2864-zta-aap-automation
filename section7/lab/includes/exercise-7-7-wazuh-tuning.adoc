@@ -1,0 +1,11 @@
+=== Exercise 7.7 — Wazuh tuning / custom rules (extended)
+
+[TIP]
+.Legitimate automation looks like attacks
+====
+Failed SSH attempts from AAP during inventories or credential tests can resemble brute force. **Tuning** encodes organisational knowledge (“this IP is the controller”) so **high-signal** alerts remain actionable—core **SOC maturity** for ZTA environments heavy on automation.
+====
+
+Suppress false positives from AAP controller IP using `local_rules.xml` child rules with `level="0"` and `<if_sid>5712</if_sid>` (see full XML in `section7/README.md`).
+
+After editing inside manager container: `wazuh-analysisd -t`, restart manager, re-test brute force from AAP vs other source.

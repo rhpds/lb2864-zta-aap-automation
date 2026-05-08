@@ -1,0 +1,82 @@
+---
+# Section 1 Extension: Replace the self-signed cert with one issued by IdM CA.
+# Also cleans up the test endpoint.
+#
+# Usage:
+#   ansible-playbook section1/playbooks/fix-cert-trust.yml
+
+- name: "Section 1 | Fix Certificate Trust — Use IdM CA"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    test_cert_dir: /etc/pki/tls/certs
+    test_key_dir: /etc/pki/tls/private
+    test_port: 9443
+
+  tasks:
+    - name: Request a certificate from IdM CA
+      command: >
+        ipa-getcert request
+        -K HTTP/central.zta.lab
+        -D central.zta.lab
+        -f {{ test_cert_dir }}/zta-test-idm.crt
+        -k {{ test_key_dir }}/zta-test-idm.key
+        -N CN=central.zta.lab
+        -w
+      register: getcert_result
+      changed_when: getcert_result.rc == 0
+
+    - name: Update the test endpoint to use the IdM cert
+      copy:
+        dest: /opt/zta-test-https.py
+        content: |
+          #!/usr/bin/env python3
+          import http.server
+          import ssl
+          import json
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  self.wfile.write(json.dumps({
+                      "status": "ok",
+                      "service": "zta-test-endpoint",
+                      "certificate": "IdM CA signed",
+                      "message": "TLS trust chain is now correct"
+                  }).encode())
+
+              def log_message(self, fmt, *args):
+                  pass
+
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain(
+              '{{ test_cert_dir }}/zta-test-idm.crt',
+              '{{ test_key_dir }}/zta-test-idm.key'
+          )
+          server = http.server.HTTPServer(('0.0.0.0', {{ test_port }}), Handler)
+          server.socket = ctx.wrap_socket(server.socket, server_side=True)
+          server.serve_forever()
+        mode: '0755'
+      notify: Restart test endpoint
+
+    - name: Display fix confirmation
+      debug:
+        msg: |
+          CERTIFICATE TRUST FIXED
+          =======================
+
+          IdM CA certificate issued for central.zta.lab
+          Test endpoint now serves IdM-signed cert
+
+          curl https://central.zta.lab:{{ test_port }}/ should work
+          (from any host that trusts the IdM CA)
+
+  handlers:
+    - name: Restart test endpoint
+      systemd:
+        name: zta-test-https
+        state: restarted

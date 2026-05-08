@@ -1,0 +1,207 @@
+---
+# Configure AAP Controller with NetBox CMDB integration.
+#
+# Creates:
+#   - Custom "NetBox" credential type (inputs NETBOX_API + NETBOX_TOKEN; injects as env)
+#   - "ZTA NetBox Credential" with the workshop API token
+#   - "ZTA Lab Inventory" (empty — add the NetBox source in Exercise 1.2)
+#
+# The credential type's environment variable injection enables:
+#   - netbox.netbox.nb_inventory plugin (dynamic inventory sync)
+#   - netbox.netbox collection modules (playbook lookups)
+#
+# Prerequisites:
+#   - AAP Controller is installed and reachable
+#   - NetBox is deployed and seeded (deploy-netbox.yml + configure-netbox.yml)
+#   - ansible.controller collection available
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-netbox.yml
+
+- name: Configure AAP NetBox CMDB Integration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+    aap_user: admin
+    aap_password: "{{ lookup('env', 'AAP_ADMIN_PASSWORD') | default('ansible123!', true) }}"
+    aap_verify_ssl: false
+    aap_organization: Default
+
+    project_name: ZTA Workshop
+    inventory_name: ZTA Lab Inventory
+    netbox_ee_name: Netbox
+    netbox_inv_source_name: NetBox Dynamic Inventory
+
+    nb_api_url: "{{ netbox_url | default('http://netbox.zta.lab:8000') }}"
+    nb_api_token: "{{ netbox_token | default('0123456789abcdef0123456789abcdef01234567') }}"
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+    # ── Verify prerequisites ──────────────────────────────────────────
+
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: aap_ping
+
+    - name: Display AAP version
+      debug:
+        msg: "AAP Controller {{ aap_ping.json.version }} detected"
+
+    - name: Verify NetBox API with token (same URL/token as ZTA NetBox Credential)
+      uri:
+        url: "{{ nb_api_url.rstrip('/') }}/api/status/"
+        method: GET
+        headers:
+          Authorization: "Token {{ nb_api_token }}"
+        status_code: 200
+      register: netbox_cred_connectivity
+
+    - name: Assert NetBox returned status payload
+      assert:
+        that:
+          - netbox_cred_connectivity.json is mapping
+        fail_msg: "NetBox /api/status/ did not return JSON; check NETBOX_API URL and NETBOX_TOKEN."
+
+    # ── Create NetBox credential type ─────────────────────────────────
+
+    - name: Check if NetBox credential type already exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/credential_types/?name=NetBox"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: nb_cred_type_check
+
+    # Field IDs match the existing type in AAP (netbox_url / netbox_token).
+    # Injectors map them to NETBOX_API / NETBOX_TOKEN env vars consumed by
+    # the netbox.netbox.nb_inventory plugin and collection modules.
+    - name: Create NetBox credential type
+      ansible.controller.credential_type:
+        name: NetBox
+        description: "NetBox CMDB API credentials for inventory sync and module lookups"
+        kind: cloud
+        inputs:
+          fields:
+            - id: netbox_url
+              type: string
+              label: "NetBox URL"
+              help_text: "Full URL (e.g. http://netbox.zta.lab:8000)"
+            - id: netbox_token
+              type: string
+              label: "API Token"
+              secret: true
+          required:
+            - netbox_url
+            - netbox_token
+        injectors:
+          env:
+            NETBOX_API: "{% raw %}{{ netbox_url }}{% endraw %}"
+            NETBOX_TOKEN: "{% raw %}{{ netbox_token }}{% endraw %}"
+        state: present
+      when: nb_cred_type_check.json.count == 0
+
+    # ── Create NetBox credential ──────────────────────────────────────
+
+    - name: Create ZTA NetBox Credential
+      ansible.controller.credential:
+        name: ZTA NetBox Credential
+        description: "NetBox CMDB — workshop API token for inventory sync and lookups"
+        credential_type: NetBox
+        organization: Default
+        inputs:
+          netbox_url: "{{ nb_api_url }}"
+          netbox_token: "{{ nb_api_token }}"
+        state: present
+
+    # ── Create inventory ──────────────────────────────────────────────
+
+    - name: Create ZTA Lab Inventory
+      ansible.controller.inventory:
+        name: ZTA Lab Inventory
+        description: "ZTA workshop lab — static hosts + NetBox dynamic source"
+        organization: Default
+        state: present
+
+    # ── Add NetBox inventory source (requires ZTA Workshop project) ───
+
+    - name: Check if ZTA Workshop project exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/projects/?name__exact={{ project_name | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: aap_project_lookup
+
+    - name: Fail if ZTA Workshop project not found
+      fail:
+        msg: >
+          Project '{{ project_name }}' not found on controller.
+          Run setup/configure-aap-project.yml first, then re-run this playbook.
+      when: aap_project_lookup.json.count | default(0) | int == 0
+
+    - name: Add NetBox dynamic inventory source
+      ansible.controller.inventory_source:
+        name: "{{ netbox_inv_source_name }}"
+        description: "Hosts from NetBox CMDB via netbox.netbox.nb_inventory plugin"
+        inventory: "{{ inventory_name }}"
+        organization: "{{ aap_organization }}"
+        source: scm
+        source_project: "{{ project_name }}"
+        source_path: inventory/netbox_inventory.yml
+        credential: ZTA NetBox Credential
+        execution_environment: "{{ netbox_ee_name }}"
+        overwrite: false
+        overwrite_vars: false
+        update_on_launch: false
+        state: present
+
+    - name: Sync NetBox inventory source
+      ansible.controller.inventory_source_update:
+        inventory_source: "{{ netbox_inv_source_name }}"
+        inventory: "{{ inventory_name }}"
+        wait: true
+        timeout: 120
+
+    # ── Summary ───────────────────────────────────────────────────────
+
+    - name: Display configuration summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║     AAP NetBox CMDB Integration — Configuration Complete      ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Credential Type:  NetBox (custom)                           ║
+          ║  Credential:       ZTA NetBox Credential                     ║
+          ║  Inventory:        {{ inventory_name }}
+          ║  Inventory Source: {{ netbox_inv_source_name }} — CREATED + SYNCED
+          ║  Project:          {{ project_name }}
+          ║  Execution Env:    {{ netbox_ee_name }}
+          ║                                                              ║
+          ║  NetBox Host URL:  {{ nb_api_url }}
+          ║                                                              ║
+          ║  Injected env vars (available to playbooks & inventory):     ║
+          ║    NETBOX_API   ← credential field netbox_url                 ║
+          ║    NETBOX_TOKEN ← credential field netbox_token (secret)      ║
+          ║                                                              ║
+          ╚════════════════════════════════════════════════════════════════╝
+

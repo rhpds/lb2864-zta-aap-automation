@@ -1,0 +1,201 @@
+---
+# Pre-workshop setup: Register all workshop VMs in IdM DNS
+# Run AFTER site.yml and integrate.yml from zta-lab-idm-keycloak
+- name: Register Workshop VMs in IdM DNS
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    central_ip: "{{ hostvars['central']['ansible_host'] }}"
+
+    dns_records:
+      # ── Physical hosts ──
+      - hostname: central
+        ip: "{{ hostvars['central']['ansible_host'] }}"
+      - hostname: control
+        ip: "192.168.1.10"
+      - hostname: vault
+        ip: "192.168.1.12"
+      - hostname: netbox
+        ip: "192.168.1.15"
+      - hostname: app
+        ip: "192.168.1.11"
+      - hostname: db
+        ip: "192.168.1.11"
+      - hostname: aap
+        ip: "192.168.1.10"
+      # ── Services on central (containers) ──
+      - hostname: keycloak
+        ip: "{{ central_ip }}"
+      - hostname: opa
+        ip: "{{ central_ip }}"
+      - hostname: splunk
+        ip: "{{ central_ip }}"
+      - hostname: wazuh
+        ip: "192.168.1.13"
+      - hostname: ceos1
+        ip: "{{ central_ip }}"
+      - hostname: ceos2
+        ip: "{{ central_ip }}"
+      - hostname: ceos3
+        ip: "{{ central_ip }}"
+
+  tasks:
+    - name: Remove stale gitea DNS record
+      redhat.rhel_idm.ipadnsrecord:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        zone_name: "{{ idm_domain }}"
+        name: gitea
+        record_type: A
+        record_value: "{{ central_ip }}"
+        state: absent
+
+    - name: Authenticate to IdM
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+
+    - name: Check current DNS forwarders
+      command: ipa dnsconfig-show --raw
+      register: dns_current
+      changed_when: false
+
+    - name: Set IdM global DNS forwarder to 172.30.0.10
+      command: ipa dnsconfig-mod --forwarder=172.30.0.10
+      register: dns_fwd
+      changed_when: "'Modified' in dns_fwd.stdout"
+      failed_when:
+        - dns_fwd.rc != 0
+        - "'no modifications' not in dns_fwd.stderr"
+      when: "'172.30.0.10' not in dns_current.stdout"
+
+    - name: Verify DNS forwarder is set correctly
+      shell: ipa dnsconfig-show | grep -i forwarder
+      register: dns_verify_fwd
+      changed_when: false
+      failed_when: "'172.30.0.10' not in dns_verify_fwd.stdout"
+
+    - name: Add DNS A records for workshop VMs
+      redhat.rhel_idm.ipadnsrecord:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        zone_name: "{{ idm_domain }}"
+        name: "{{ item.hostname }}"
+        record_type: A
+        record_value: "{{ item.ip }}"
+        state: present
+      loop: "{{ dns_records }}"
+      loop_control:
+        label: "{{ item.hostname }}.{{ idm_domain }} → {{ item.ip }}"
+
+    - name: Verify DNS resolution
+      command: "dig +short {{ item.hostname }}.{{ idm_domain }} @127.0.0.1"
+      loop: "{{ dns_records }}"
+      loop_control:
+        label: "{{ item.hostname }}.{{ idm_domain }}"
+      register: dns_verify
+      changed_when: false
+      failed_when: dns_verify.stdout | length == 0
+
+    - name: Add upstream DNS to /etc/resolv.conf on central
+      lineinfile:
+        path: /etc/resolv.conf
+        line: "nameserver 172.30.0.10"
+        insertafter: "^nameserver"
+        state: present
+
+    - name: Display DNS configuration
+      debug:
+        msg: |
+          ═══════════════════════════════════════════
+            IdM DNS Records Configured
+          ═══════════════════════════════════════════
+          {% for item in dns_records %}
+            {{ item.hostname }}.{{ idm_domain }} → {{ item.ip }}
+          {% endfor %}
+
+          All workshop VMs should point their
+          /etc/resolv.conf to {{ idm_hostname }}
+          to resolve *.{{ idm_domain }} names.
+          ═══════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════════
+# Play 2 — Configure DNS inside RHEL containers (db, app)
+#
+# Points container /etc/resolv.conf at the IdM server on central so that
+# dnf, ipa-client-install, and all hostname resolution works correctly.
+# Safe to re-run: always overwrites resolv.conf with the correct values.
+# ═════════════════════════════════════════════════════════════════════════
+
+- name: Configure DNS Inside RHEL Containers
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    central_ip: "{{ ansible_host | default('192.168.1.11') }}"
+    upstream_dns: "{{ upstream_dns_server | default('172.30.0.10') }}"
+    rhel_containers:
+      - name: db
+        hostname: db.zta.lab
+      - name: app
+        hostname: app.zta.lab
+
+  tasks:
+    - name: Check which containers are running
+      command: "podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' {{ item.name }}"
+      loop: "{{ rhel_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: container_state
+      failed_when: false
+      changed_when: false
+
+    - name: Set DNS resolver in running containers (IdM + upstream fallback)
+      shell: >-
+        podman exec {{ item.item.name }} bash -c
+        'printf "search zta.lab\nnameserver {{ central_ip }}\nnameserver {{ upstream_dns }}\n" > /etc/resolv.conf'
+      loop: "{{ container_state.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.rc == 0 and item.stdout == 'true'
+      changed_when: true
+
+    - name: Verify internal DNS (zta.lab via IdM)
+      command: >
+        podman exec {{ item.item.name }}
+        dig +short central.zta.lab @{{ central_ip }}
+      loop: "{{ container_state.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.rc == 0 and item.stdout == 'true'
+      register: container_dns_internal
+      changed_when: false
+      failed_when: false
+
+    - name: Verify external DNS (cdn.redhat.com for repo access)
+      command: >
+        podman exec {{ item.item.name }}
+        dig +short cdn.redhat.com
+      loop: "{{ container_state.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.rc == 0 and item.stdout == 'true'
+      register: container_dns_external
+      changed_when: false
+      failed_when: false
+
+    - name: Display container DNS status
+      debug:
+        msg: |
+          ═══════════════════════════════════════════
+            Container DNS Configuration
+          ═══════════════════════════════════════════
+          {% for result in container_state.results %}
+          {% if result.rc == 0 and result.stdout == 'true' %}
+            {{ result.item.name }} ({{ result.item.hostname }}): IdM → {{ central_ip }}, upstream → {{ upstream_dns }} ✓
+          {% else %}
+            {{ result.item.name }} ({{ result.item.hostname }}): Not running — skipped
+          {% endif %}
+          {% endfor %}
+          ═══════════════════════════════════════════

@@ -1,0 +1,141 @@
+---
+# Section 1 Solve: ZTA + AAP integration
+#
+# Auto-creates AAP resources when participants skip hands-on setup (credentials
+# are normally pre-created with configure-aap-credentials.yml; students verify):
+#   - All 5 credentials (delegates to configure-aap-credentials.yml)
+#   - Project from Gitea
+#   - Inventory with NetBox source
+#   - 4 verification job templates
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section1.yml
+
+- name: "Section 1 Solve | Prerequisites — Credentials"
+  ansible.builtin.import_playbook: ../configure-aap-credentials.yml
+  tags: [section1, credentials]
+
+- name: "Section 1 Solve | Project, Inventory, Templates"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section1]
+
+  vars_files:
+    - validation_vars.yml
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: aap_ping
+
+    # ── Project ────────────────────────────────────────────────────────
+
+    - name: Create ZTA Workshop project
+      ansible.controller.project:
+        name: "{{ expected_project }}"
+        description: "ZTA Workshop — playbooks and inventory from Gitea"
+        organization: "{{ aap_organization }}"
+        scm_type: git
+        scm_url: "{{ gitea_project_url }}"
+        scm_update_on_launch: true
+        state: present
+      tags: [project]
+
+    - name: Sync project
+      ansible.controller.project_update:
+        project: "{{ expected_project }}"
+        wait: true
+        timeout: 120
+      tags: [project]
+
+    # ── Inventory ──────────────────────────────────────────────────────
+
+    - name: Create ZTA Lab Inventory
+      ansible.controller.inventory:
+        name: "{{ expected_inventory }}"
+        description: "Dynamic inventory from NetBox CMDB"
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [inventory]
+
+    - name: Add NetBox inventory source
+      ansible.controller.inventory_source:
+        name: "{{ expected_inventory_source }}"
+        description: "NetBox CMDB — synced from project"
+        inventory: "{{ expected_inventory }}"
+        source: scm
+        source_project: "{{ expected_project }}"
+        source_path: inventory/netbox_inventory.yml
+        credential: ZTA NetBox Credential
+        overwrite: true
+        update_on_launch: true
+        state: present
+      tags: [inventory]
+
+    - name: Sync inventory source
+      ansible.controller.inventory_source_update:
+        inventory_source: "{{ expected_inventory_source }}"
+        inventory: "{{ expected_inventory }}"
+        wait: true
+        timeout: 120
+      tags: [inventory]
+
+    # ── Job Templates ──────────────────────────────────────────────────
+
+    - name: Create Section 1 job templates
+      ansible.controller.job_template:
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        project: "{{ expected_project }}"
+        playbook: "{{ item.playbook }}"
+        inventory: "{{ expected_inventory }}"
+        credentials: "{{ item.credentials }}"
+        state: present
+      loop:
+        - name: Verify ZTA Services
+          description: "Section 1 — Verify all ZTA infrastructure services"
+          playbook: section1/playbooks/verify-zta-services.yml
+          credentials: [ZTA Machine Credential]
+        - name: Test Vault Integration
+          description: "Section 1 — Test Vault dynamic credentials"
+          playbook: section1/playbooks/test-vault-integration.yml
+          credentials: [ZTA Machine Credential]
+        - name: Test Vault SSH Certificates
+          description: "Section 1 — Test Vault SSH signed certificates"
+          playbook: section1/playbooks/test-vault-ssh.yml
+          credentials: [ZTA Machine Credential]
+        - name: Test OPA Policy
+          description: "Section 1 — Test OPA policy decisions"
+          playbook: section1/playbooks/test-opa-policy.yml
+          credentials: [ZTA Machine Credential]
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [templates]
+
+    - name: Display solve summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 1 Solve — Complete                                    ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  Created:                                                      ║
+          ║    ✓ 5 credentials (Vault, Machine, Arista, NetBox, SSH)       ║
+          ║    ✓ Project: ZTA Workshop (Gitea)                             ║
+          ║    ✓ Inventory: ZTA Lab Inventory (NetBox source)              ║
+          ║    ✓ 4 job templates (Verify, Vault, SSH, OPA)                 ║
+          ║                                                                ║
+          ║  Run check-section1.yml to verify.                             ║
+          ╚══════════════════════════════════════════════════════════════════╝

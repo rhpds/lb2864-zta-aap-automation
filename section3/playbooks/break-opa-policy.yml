@@ -1,0 +1,71 @@
+---
+# Section 3B: Deploy a deliberately buggy OPA data classification policy.
+#
+# The buggy policy has three logic errors:
+#   BUG 1: PII rule uses OR instead of AND for dual-group requirement
+#   BUG 2: Confidential rule checks wrong group (app-deployers vs db-admins)
+#   BUG 3: Internal rule missing classification check (allows any classification)
+#
+# Participants must find and fix these bugs by querying OPA and reading Rego.
+#
+# Usage (instructor only):
+#   ansible-playbook section3/playbooks/break-opa-policy.yml
+
+- name: "Section 3B | Deploy Buggy Data Classification Policy"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Deploy the BUGGY data classification policy
+      copy:
+        src: ../../opa-policies/data_classification_buggy.rego
+        dest: "{{ opa_policy_dir }}/data_classification.rego"
+        mode: '0644'
+      register: buggy_policy
+
+    - name: Restart OPA to load the buggy policy
+      command: podman restart {{ opa_container_name }}
+      when: buggy_policy.changed
+
+    - name: Wait for OPA health
+      uri:
+        url: "{{ opa_url }}/health"
+        method: GET
+      register: opa_health
+      until: opa_health.status == 200
+      retries: 10
+      delay: 3
+
+    - name: Verify policy is loaded
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: "test"
+            user_groups: []
+            data_classification: "public"
+        return_content: true
+      register: test_result
+
+    - name: Display deployment confirmation (instructor only)
+      debug:
+        msg: |
+          BUGGY OPA POLICY DEPLOYED
+          ==========================
+
+          Policy: zta.data_classification (with 3 bugs)
+
+          BUG 1: PII uses OR instead of AND
+            → security-ops alone can access PII (should need BOTH)
+
+          BUG 2: Confidential checks wrong group
+            → app-deployers can access confidential (should be db-admins only)
+
+          BUG 3: Internal rule missing classification check
+            → app-deployers can access ANY classification level
+
+          Instructor fix:
+            ansible-playbook section3/playbooks/fix-opa-policy.yml

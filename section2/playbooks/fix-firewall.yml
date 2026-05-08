@@ -1,0 +1,34 @@
+---
+# Section 2 Extension: Restore the PostgreSQL firewall port (instructor reset).
+#
+# Usage:
+#   ansible-playbook section2/playbooks/fix-firewall.yml
+
+- name: "Section 2 | Fix Firewall — Restore DB Port"
+  hosts: db_servers
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Restore PostgreSQL port in firewall
+      firewalld:
+        port: "{{ db_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Verify port is open
+      command: firewall-cmd --list-ports
+      register: ports_after
+      changed_when: false
+
+    - name: Display fix confirmation
+      debug:
+        msg: |
+          FIREWALL FIX APPLIED
+          ====================
+
+          Restored port {{ db_port }}/tcp on DB host
+          Current open ports: {{ ports_after.stdout }}
+
+          App should be able to reach PostgreSQL again.

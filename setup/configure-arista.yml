@@ -1,0 +1,45 @@
+---
+# configure-arista.yml — Push configs to running cEOS switches
+#
+# Uses arista.eos.eos_config over SSH (network_cli) to apply the full
+# startup configuration to each switch.
+#
+# Prerequisites:
+#   - cEOS containers (ceos1, ceos2, ceos3) are running on central
+#   - Firewall ports are open (run configure-firewall.yml first)
+#   - The [network] inventory group + vars are configured in hosts.ini
+#   - Switch config files exist in setup/switch-configs/
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-arista.yml
+
+- name: Apply Configuration to Running cEOS Switches
+  hosts: network
+  gather_facts: false
+
+  vars:
+    config_dir: "{{ playbook_dir }}/switch-configs"
+    host_config_map:
+      ceos1: sw01
+      ceos2: sw02
+      ceos3: sw03
+
+  tasks:
+
+    - name: Push full configuration to switch
+      arista.eos.eos_config:
+        src: "{{ config_dir }}/{{ host_config_map[inventory_hostname] }}/{{ host_config_map[inventory_hostname] }}"
+        replace: config
+      register: config_result
+
+    - name: Save running-config to startup-config
+      arista.eos.eos_command:
+        commands:
+          - write memory
+      when: config_result.changed
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} — config {{ 'applied and saved' if config_result.changed else 'already current' }}
+          (src: {{ host_config_map[inventory_hostname] }})

@@ -1,0 +1,96 @@
+---
+# SSH Lockdown — Layer 4: Splunk Bypass Detection
+#
+# Creates Splunk saved searches that alert when:
+#   - An SSH login succeeds from a source that is NOT the AAP controller
+#   - An SSH login is repeatedly denied by HBAC (reconnaissance pattern)
+#
+# These alerts fire webhook actions to EDA for automated incident response.
+#
+# Prerequisites:
+#   - Splunk is running on central (http://central.zta.lab:8000)
+#   - Log shipping is configured (setup/integrate-splunk.yml)
+#   - EDA is listening on control.zta.lab:5000
+
+- name: "SSH Lockdown | Layer 4 — Splunk: Detect SSH Bypass Attempts"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    splunk_url: "http://localhost:8089"
+    splunk_user: admin
+    splunk_password: "{{ splunk_admin_password | default('ansible123!') }}"
+    aap_controller_ip: "192.168.1.10"
+    management_ip: "192.168.1.11"
+    eda_webhook_url: "http://control.zta.lab:5000/endpoint"
+
+  tasks:
+    - name: Create Splunk saved search — SSH login from non-AAP source
+      uri:
+        url: "{{ splunk_url }}/servicesNS/admin/search/saved/searches"
+        method: POST
+        user: "{{ splunk_user }}"
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: "ZTA: SSH Bypass — Login from Non-AAP Source"
+          search: >-
+            index=main sourcetype=linux_secure "Accepted"
+            NOT src_ip={{ aap_controller_ip }}
+            NOT src_ip={{ management_ip }}
+            | stats count by src_ip, host, user
+          alert_type: always
+          alert.severity: "4"
+          alert.suppress: "0"
+          dispatch.earliest_time: "rt-60s"
+          dispatch.latest_time: "rt"
+          is_scheduled: "1"
+          cron_schedule: "*/1 * * * *"
+          actions: webhook
+          action.webhook.param.url: "{{ eda_webhook_url }}"
+        status_code: [200, 201, 409]
+      register: bypass_search
+      failed_when:
+        - bypass_search.status not in [200, 201, 409]
+
+    - name: Create Splunk saved search — Repeated HBAC denials
+      uri:
+        url: "{{ splunk_url }}/servicesNS/admin/search/saved/searches"
+        method: POST
+        user: "{{ splunk_user }}"
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: "ZTA: SSH Bypass — Repeated HBAC Denials"
+          search: >-
+            index=main sourcetype=linux_secure ("Permission denied" OR "not allowed" OR "Access denied")
+            | stats count by src_ip, user
+            | where count >= 3
+          alert_type: always
+          alert.severity: "5"
+          alert.suppress: "0"
+          dispatch.earliest_time: "rt-120s"
+          dispatch.latest_time: "rt"
+          is_scheduled: "1"
+          cron_schedule: "*/1 * * * *"
+          actions: webhook
+          action.webhook.param.url: "{{ eda_webhook_url }}"
+        status_code: [200, 201, 409]
+      register: hbac_search
+      failed_when:
+        - hbac_search.status not in [200, 201, 409]
+
+    - name: Display bypass detection summary
+      debug:
+        msg:
+          - "Splunk SSH bypass detection — active"
+          - "Saved searches: (1) SSH bypass — login from non-AAP source (sev 4); (2) repeated HBAC denials (sev 5)"
+          - "EDA webhooks: {{ eda_webhook_url }}"
+          - "Triggers: SSH from workstation; repeated HBAC denials"
+          - "Excluded from bypass rules: AAP controller {{ aap_controller_ip }}, central {{ management_ip }}"
+          - "View alerts: http://central.zta.lab:8000 → Activity → Triggered Alerts"

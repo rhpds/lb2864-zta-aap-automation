@@ -1,0 +1,52 @@
+---
+# Section 2 Extension: Reset SELinux context on the application data
+# directory, causing the app container to fail when writing logs or data.
+#
+# Participants must diagnose the SELinux denial and fix it with chcon.
+#
+# Usage (instructor only):
+#   ansible-playbook section2/playbooks/break-selinux.yml
+
+- name: "Section 2 | Break SELinux — Wrong Container File Context"
+  hosts: app_servers
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Reset SELinux context on app directory to default_t
+      command: "chcon -R -t default_t {{ app_deploy_dir }}"
+
+    - name: Restart the application to trigger the failure
+      systemd:
+        name: ztaapp
+        state: restarted
+      failed_when: false
+
+    - name: Wait briefly then check if it crashed
+      pause:
+        seconds: 3
+
+    - name: Check application status
+      systemd:
+        name: ztaapp
+      register: app_status
+
+    - name: Display breakage confirmation (instructor only)
+      debug:
+        msg: |
+          SELINUX CONTEXT BREAKAGE APPLIED
+          =================================
+
+          Changed: SELinux context on {{ app_deploy_dir }}
+            FROM: container_file_t (allows container access)
+            TO:   default_t (denies container access)
+
+          App status: {{ app_status.status.ActiveState | default('unknown') }}
+
+          Effect:
+            Application cannot write to its data directory
+            Container logs show "Permission denied" errors
+            ausearch will show AVC denials
+
+          Instructor fix:
+            ansible-playbook section2/playbooks/fix-selinux.yml

@@ -1,0 +1,166 @@
+---
+# Configure Splunk EDA Add-on — Update Event Stream URL
+#
+# Writes the ZTA environment webhook config to Splunk's filesystem conf
+# (ansible_addon_for_splunk_environment.conf) so the ansible_core alert
+# action script (ansible_core.py / solnlib.conf_manager) can read it.
+#
+# Root cause for previous failures: writing to the UCC KV store endpoint
+# (/servicesNS/.../ansible_addon_for_splunk_environment/ZTA) stores data
+# in Splunk's internal KV store, but ansible_core.py reads the conf via
+# solnlib.ConfManager.get_conf() which calls /services/configs/conf-<name>
+# (the filesystem conf endpoint). These are two different storage backends.
+#
+# This playbook uses /services/configs/conf-ansible_addon_for_splunk_environment
+# which writes to the local .conf file, making the stanza visible to the action.
+#
+# Also updates the saved search query to detect both "Failed password" (sshd)
+# and "Authentication failure" (PAM) events to ensure brute force detection.
+#
+# Prerequisites:
+#   - Splunk deployed with EDA add-on: ansible-playbook setup/deploy-splunk.yml
+#   - AAP EDA Token Event Stream created (copy URL from Automation Decisions → Event Streams)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-splunk-eda.yml \
+#     -e eda_event_stream_url="https://192.168.1.10:443/eda-event-streams/api/eda/v1/external_event_stream/<UUID>/post/"
+#
+# Also available as the "Configure Splunk EDA" AAP job template (Section 5, survey-driven).
+
+- name: "Update Splunk EDA webhook endpoint"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    splunk_password: "{{ idm_admin_password }}"
+    splunk_mgmt: "https://localhost:8089"
+    eda_event_stream_url: "{{ lookup('file', '/tmp/eda_event_stream_url') | default('CHANGE_ME_EDA_EVENT_STREAM_URL', true) }}"
+    eda_token: "{{ eda_webhook_token }}"
+    aap_controller_ip: "192.168.1.10"
+
+  tasks:
+    - name: Ensure aap.example.org resolves on central (Splunk container inherits host /etc/hosts)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ aap_controller_ip }} aap.example.org control.zta.lab"
+        regexp: "aap\\.example\\.org"
+        state: present
+
+    - name: Wait for Splunk management API
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/services/server/info"
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: splunk_ready
+      until: splunk_ready.status == 200
+      retries: 12
+      delay: 10
+
+    - name: Create ZTA environment in Splunk ansible addon (filesystem conf)
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/services/configs/conf-ansible_addon_for_splunk_environment"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: ZTA
+          integration_type: webhook
+          environment: ZTA
+          webhook_endpoint: "{{ eda_event_stream_url }}"
+          auth_type: apikey
+          token: "{{ eda_token }}"
+          ssl_check_hostname: "0"
+        status_code: [200, 201, 409]
+      register: _splunk_conf_create
+
+    - name: Update ZTA environment webhook endpoint (stanza already exists)
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/services/configs/conf-ansible_addon_for_splunk_environment/ZTA"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          integration_type: webhook
+          environment: ZTA
+          webhook_endpoint: "{{ eda_event_stream_url }}"
+          auth_type: apikey
+          token: "{{ eda_token }}"
+          ssl_check_hostname: "0"
+        status_code: [200]
+      when: _splunk_conf_create.status == 409
+
+    - name: Update ZTA saved search to detect Failed password (sshd) and Authentication failure (PAM)
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          search: >-
+            (index=zta_app OR index=zta_syslog) sourcetype=syslog
+            ("Failed password" OR "Authentication failure")
+            | rex field=_raw "from (?P<src_ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+            | stats count by src_ip, host
+            | where count >= 5
+            | sort -count
+        status_code: [200]
+      register: _alert_update
+
+    - name: Enable alert suppression to prevent repeated EDA triggers per brute-force event window
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          alert.suppress: "1"
+          alert.suppress.period: "10m"
+        status_code: [200]
+
+    - name: Verify alert is scheduled
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A+SSH+Brute+Force+Detected?output_mode=json"
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: alert_conf
+
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg: |
+          Splunk EDA configuration updated:
+            Environment:  ZTA (filesystem conf — ansible_addon_for_splunk_environment.conf)
+            Endpoint:     {{ eda_event_stream_url }}
+            Alert:        ZTA: SSH Brute Force Detected
+            Scheduled:    {{ alert_conf.json.entry[0].content.is_scheduled | default('unknown') }}
+            Cron:         {{ alert_conf.json.entry[0].content.cron_schedule | default('unknown') }}
+          {% if eda_event_stream_url == 'CHANGE_ME_EDA_EVENT_STREAM_URL' %}
+
+          WARNING: Placeholder URL — update with the real EDA Token Event Stream URL:
+            -e eda_event_stream_url="https://192.168.1.10:443/eda-event-streams/api/eda/v1/external_event_stream/<UUID>/post/"
+          {% endif %}
+
+    - name: Fail if placeholder URL is still in use
+      ansible.builtin.assert:
+        that:
+          - eda_event_stream_url != 'CHANGE_ME_EDA_EVENT_STREAM_URL'
+        fail_msg: "You must provide the EDA Event Stream URL via -e eda_event_stream_url=... or the AAP survey"
+        success_msg: "EDA endpoint configured successfully"
+

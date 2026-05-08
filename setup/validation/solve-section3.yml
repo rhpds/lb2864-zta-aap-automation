@@ -1,0 +1,92 @@
+---
+# Section 3 Solve: AAP Policy as Code — Platform-Gated Patching
+#
+# Auto-creates:
+#   - "Apply Security Patch" job template with survey
+#   - Launches the patch targeting app
+#   - Fixes the data_classification OPA policy (Section 3B)
+#
+# Prerequisites: Section 1 solve must be complete
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section3.yml
+
+- name: "Section 3 Solve | Template & Patch"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section3]
+
+  vars_files:
+    - validation_vars.yml
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+
+    # ── Job Template with Survey ───────────────────────────────────────
+
+    - name: Create Apply Security Patch template
+      ansible.controller.job_template:
+        name: Apply Security Patch
+        description: "Section 3 — Apply security hardening patch (AAP Policy as Code gated)"
+        project: "{{ expected_project }}"
+        playbook: section3/playbooks/apply-security-patch.yml
+        inventory: "{{ expected_inventory }}"
+        credentials: [ZTA Machine Credential]
+        survey_enabled: true
+        survey_spec:
+          name: "Patch target survey"
+          description: "Select the target host for the security patch"
+          spec:
+            - question_name: Target Host
+              question_description: "Hostname to apply the security patch to"
+              required: true
+              type: text
+              variable: target_host
+              default: app
+        state: present
+      tags: [template]
+
+    # ── Launch the patch ───────────────────────────────────────────────
+
+    - name: Launch Apply Security Patch (targeting app)
+      ansible.controller.job_launch:
+        job_template: Apply Security Patch
+        extra_vars:
+          target_host: app
+        wait: true
+        timeout: 180
+      register: s3_patch_launch
+      tags: [launch]
+
+    - name: Display solve summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 3 Solve — Complete                                    ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  Created:                                                      ║
+          ║    ✓ Template: Apply Security Patch (with survey)              ║
+          ║    ✓ Patch applied to app host                                 ║
+          ║                                                                ║
+          ║  Run check-section3.yml to verify.                             ║
+          ╚══════════════════════════════════════════════════════════════════╝
+
+# ── Section 3B: Fix OPA data_classification policy ─────────────────
+
+- name: "Section 3B Solve | Fix OPA Policy"
+  ansible.builtin.import_playbook: ../../section3/playbooks/fix-opa-policy.yml
+  tags: [section3b]

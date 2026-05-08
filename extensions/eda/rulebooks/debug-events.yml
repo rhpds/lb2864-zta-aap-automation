@@ -1,0 +1,21 @@
+---
+# Debug rulebook — logs every event received by the event stream.
+# Use this to inspect the payload structure before writing conditions.
+#
+# Usage: Create a Rulebook Activation in AAP EDA with this rulebook
+# and the same Event Stream credential as your real activation.
+
+- name: Debug — Log All Events
+  hosts: all
+
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  rules:
+    - name: Log every event
+      condition: event.meta is defined or event.search_name is defined or event.payload is defined or event.app is defined
+      action:
+        debug:
+          msg: "Event received: {{ event | to_json }}"

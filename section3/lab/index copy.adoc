@@ -1,0 +1,163 @@
+= Section 3 — AAP Policy as Code: platform-gated patching
+:toc: left
+:toclevels: 3
+:icons: font
+:idprefix:
+:idseparator: -
+
+[NOTE]
+====
+In Sections 1–2, OPA checks ran **inside** workflows — a playbook task queried OPA and failed if denied. That model depends on every playbook author remembering to add the check. Section 3 moves enforcement **up to the platform**: **AAP's Policy as Code** gateway queries OPA *before the job is even enqueued*. The playbook never executes, no partial changes land, and no rollback is needed.
+
+**AAP** is still the *Policy Enforcement Point (PEP)*, but now enforcement is **built into the platform**, not bolted onto individual playbooks. **OPA** (the *Policy Decision Point*) evaluates the launcher's **AAP team memberships** (populated via LDAP from IdM) against template metadata — a "Patch" template requires the **Infrastructure** or **Security** team. **IdM** remains the *single source of truth* for identity: changing a group membership in the directory changes what automation a user can launch, with no AAP reconfiguration.
+
+**Why that matters:** An insider or compromised account that bypasses a playbook-level check (by editing the playbook, calling the API directly, or running `ansible-playbook` from the CLI) is still blocked at the **platform gate**. Policy as Code makes the automation platform itself a **trust boundary** — not just a convenient scheduler.
+====
+
+
+== Overview
+
+
+[IMPORTANT]
+.Platform enforcement vs playbook checks
+====
+**AAP itself** asks OPA before starting the job. That is **Policy as Code on the automation platform**: even a playbook with *no* internal `uri` call to OPA cannot bypass the gate, because the **PEP (AAP)** refuses to enqueue the run. This models **separation of duties**—only the right **team** may even *attempt* patching templates—and shrinks insider “I’ll run ansible by hand” if your production design wires the same gateway for all changes.
+
+AAP 2.6 sends the full job context to OPA, including `created_by.teams` (the user's AAP team memberships, populated via LDAP). The policy checks these teams — not raw IdM groups — for its decisions.
+====
+
+|===
+| Template pattern | Required AAP team 
+| Patch | Infrastructure or Security
+| VLAN / Network | Infrastructure
+| Deploy, Credential, Application | Applications or DevOps
+| Everything else | Any authenticated user
+|===
+
+[TIP]
+.Why template names matter
+====
+The gateway policy uses **resource metadata** (here, template name substrings) as a coarse **risk classifier**. Production policies often add **inventory tags, execution environments, survey variables, or SAML claims**—the idea is the same: **encode risk in attributes** the PDP can evaluate consistently, not in tribal knowledge about “who is allowed to click what.”
+====
+
+== Exercise 3.1 — Job template
+
+
+We can use a template to deploy new policies to OPA. Login to our platform as the ztauser and navigate to 'Templates', create a new 'Template' with the following details:
+
+
+|===
+| Name | Deploy OPA Policy
+| Playbook | `setup/configure-aap-policy.yml'
+| Project | ZTA Workshop
+| Inventory | ZTA Lab Inventory
+| Credential | ZTA Machine Credential
+| Survey | `target_host` (default `app`)
+|===
+
+Save and launch this template. This will configure your automation controller to use Policy as code with the OPA server as well as load any additional policies. 
+
+To configure AAP navigate to 'Settings' -> 'Automation Execution' -> 'Policy'.
+We need to configure our OPA on our platform. Select 'Edit' and provide the following details:
+
+|===
+| Name | Deploy OPA Policy
+| OPA Hostname | 192.168.1.11
+| Port | 8181
+| OPA Authentication Type | None
+| OPA custom athentication headers | <blank>
+| OPA request timeout | 5
+| OPA request retry count | 2
+|===
+
+NOTE: We are using an IP Address here due to a dns bug with the containers.
+
+Next, we need to configure the Organization to use policy enforcement. Navigate to 'Access Management' -> 'Organizations'. Click on 'Default' and then click 'Edit organization'. Under Policy enforcement enter: **ap/gateway/decision**. Click Next and Finish.
+
+
+
+<PICTURE>
+
+
+
+Login as appdev and navigate to the Templates.
+
+Execute the 'Apply Security Patch' template as neteng. 
+
+|===
+| Name | Apply Security Patch
+| Playbook | `section3/playbooks/apply-security-patch.yml`
+| Inventory | ZTA Lab Inventory
+| Credential | ZTA Machine Credential
+| Survey | `target_host` (default `app`)
+|===
+
+
+We should see the Policy as Code operate now and the job will fail.
+
+[source:bash]
+----
+This job cannot be executed due to a policy violation or error. See the following details:
+{'Violations': {'Organization': ["user 'appdev' is not in an authorised team "
+'for patching templates (requires: '
+'{"Infrastructure", "Security"}, has: '
+'{"Applications"})']}}
+----
+
+[TIP]
+.Stronger than hiding buttons
+====
+Traditional RBAC might hide templates or rely on operator discipline. **Policy as Code** makes denial **explicit and uniform**—the PDP answer can be the same for UI, API, and integrated CI—reducing **policy drift** between teams and making exceptions visible in Git-tracked Rego rather than tribal knowledge.
+====
+
+
+You can now log in the platform as a user (ztauser) that is in the Infrastructure team or add appdev to the infrastructure team. 
+
+Trigger the 'Apply Security Patch' template now and it should succeed. 
+
+Review the template to see the OPA interaction:
+
+[source]
+----
+TASK [Post-patch | Display patch summary] **************************************
+ok: [app] => {
+"msg": [
+"Security patch applied",
+"Host: app.zta.lab",
+"Patch ID: ZTA-SEC-2026-001",
+"OS: Linux ",
+"Changes: login banner (/etc/issue, /etc/motd); SSH hardening; password policy; audit rules",
+"Authorised via AAP Policy as Code (Infrastructure/Security teams only)."
+]
+}
+----
+
+
+[TIP]
+.Identity lifecycle, not ticket forever
+====
+Granting `team-infrastructure` in IdM is how the organisation says “this identity may initiate high-risk automation.” Revoking the group later **closes the gate** without redeploying AAP—**continuous authorisation** tied to the directory.
+====
+
+[TIP]
+.Hardening as code
+====
+Once launch is authorised, the playbook still applies **defensive configuration** (banner, `sshd`, password quality, audit). ZTA is not only gates at the edge—it includes **measurable security posture** on endpoints, ideally still delivered *through* the same controlled automation channel.
+====
+
+Navigate to the 'Terminal' so we can verify the defensive configuration has been deployed.
+
+
+[source,bash]
+----
+ssh -p 2023 rhel@central.zta.lab
+sudo sshd -T | grep -E 'permitrootlogin|maxauthtries|permitemptypasswords'
+----
+
+[TIP]
+.Verify outcomes, not intentions
+====
+Spot-checking `sshd -T` and audit rules proves **the control landed**. Zero Trust operations depend on **observable state** (what the host actually enforces), not only on “the job was green.”
+====
+
+You can now proceed to the next section.

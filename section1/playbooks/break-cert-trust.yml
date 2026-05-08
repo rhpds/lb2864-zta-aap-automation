@@ -1,0 +1,120 @@
+---
+# Section 1 Extension: Deploy a test HTTPS endpoint with a self-signed
+# certificate (NOT from the IdM CA). Participants must diagnose the TLS
+# trust failure and fix it using ipa-getcert.
+#
+# Usage (instructor only):
+#   ansible-playbook section1/playbooks/break-cert-trust.yml
+
+- name: "Section 1 | Deploy Self-Signed HTTPS Endpoint (Broken Trust)"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    test_cert_dir: /etc/pki/tls/certs
+    test_key_dir: /etc/pki/tls/private
+    test_cert_cn: "central.zta.lab"
+    test_port: 9443
+
+  tasks:
+    - name: Generate a self-signed certificate (NOT from IdM CA)
+      command: >
+        openssl req -x509 -newkey rsa:2048 -nodes
+        -keyout {{ test_key_dir }}/zta-test-selfsigned.key
+        -out {{ test_cert_dir }}/zta-test-selfsigned.crt
+        -days 1
+        -subj "/CN={{ test_cert_cn }}/O=Self-Signed/OU=NOT-IDM-CA"
+      args:
+        creates: "{{ test_cert_dir }}/zta-test-selfsigned.crt"
+
+    - name: Set permissions on cert and key
+      file:
+        path: "{{ item }}"
+        mode: '0644'
+      loop:
+        - "{{ test_cert_dir }}/zta-test-selfsigned.crt"
+        - "{{ test_key_dir }}/zta-test-selfsigned.key"
+
+    - name: Deploy a simple HTTPS test endpoint with Python
+      copy:
+        dest: /opt/zta-test-https.py
+        content: |
+          #!/usr/bin/env python3
+          import http.server
+          import ssl
+          import json
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  self.wfile.write(json.dumps({
+                      "status": "ok",
+                      "service": "zta-test-endpoint",
+                      "message": "If you can see this, TLS trust is working"
+                  }).encode())
+
+              def log_message(self, fmt, *args):
+                  pass
+
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain(
+              '{{ test_cert_dir }}/zta-test-selfsigned.crt',
+              '{{ test_key_dir }}/zta-test-selfsigned.key'
+          )
+          server = http.server.HTTPServer(('0.0.0.0', {{ test_port }}), Handler)
+          server.socket = ctx.wrap_socket(server.socket, server_side=True)
+          print(f'ZTA test endpoint listening on https://0.0.0.0:{{ test_port }}')
+          server.serve_forever()
+        mode: '0755'
+
+    - name: Create systemd unit for the test endpoint
+      copy:
+        dest: /etc/systemd/system/zta-test-https.service
+        content: |
+          [Unit]
+          Description=ZTA Test HTTPS Endpoint (self-signed cert exercise)
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/zta-test-https.py
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Start the test endpoint
+      systemd:
+        name: zta-test-https
+        state: started
+        enabled: false
+        daemon_reload: true
+
+    - name: Open port in firewall
+      firewalld:
+        port: "{{ test_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Display deployment info (instructor only)
+      debug:
+        msg: |
+          SELF-SIGNED HTTPS ENDPOINT DEPLOYED
+          =====================================
+
+          URL:  https://central.zta.lab:{{ test_port }}/
+          Cert: Self-signed (NOT from IdM CA)
+          CN:   {{ test_cert_cn }}
+          Org:  Self-Signed / NOT-IDM-CA
+
+          curl https://central.zta.lab:{{ test_port }}/ will FAIL
+          with "certificate verify failed"
+
+          Instructor fix:
+            ansible-playbook section1/playbooks/fix-cert-trust.yml

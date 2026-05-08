@@ -1,0 +1,80 @@
+---
+# Section 7 (Optional): Simulate a brute-force SSH attack against the app server.
+#
+# This generates rapid failed SSH login attempts against app.zta.lab,
+# which the Wazuh agent detects via built-in rule 5712 (SSH brute force).
+# Wazuh then forwards the alert to Event-Driven Ansible, which triggers
+# an automatic credential revocation.
+#
+# Run this from the control/AAP host (or any host with SSH access):
+#   ansible-playbook section7/playbooks/simulate-bruteforce-wazuh.yml
+
+- name: Simulate Brute-Force Attack on App Server (Wazuh Detection)
+  hosts: automation
+  become: false
+  gather_facts: false
+
+  vars:
+    target_ip: "{{ hostvars['app']['ansible_host'] }}"
+    target_port: "{{ hostvars['app']['ansible_port'] | default(22) }}"
+    target_hostname: app.zta.lab
+    attack_user: rhel
+    attempt_count: 10
+    attempt_delay: 1
+
+  tasks:
+    - name: Verify app server is reachable
+      wait_for:
+        host: "{{ target_ip }}"
+        port: "{{ target_port }}"
+        timeout: 10
+
+    - name: Display attack simulation warning
+      debug:
+        msg: |
+          Attack simulation — brute-force SSH (Wazuh)
+          Target: {{ target_hostname }} ({{ target_ip }})
+          User: {{ attack_user }}, attempts: {{ attempt_count }}
+          Detection path: Wazuh agent → rule 5712 → webhook → EDA
+
+    - name: "Generate {{ attempt_count }} failed SSH login attempts"
+      shell: |
+        sshpass -p 'wrong-password-{{ item }}' \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o NumberOfPasswordPrompts=1 \
+              -o ConnectTimeout=3 \
+              -p {{ target_port }} \
+              {{ attack_user }}@{{ target_ip }} \
+              'echo should-not-reach' 2>&1 || true
+        sleep {{ attempt_delay }}
+      loop: "{{ range(1, attempt_count + 1) | list }}"
+      loop_control:
+        label: "Attempt {{ item }}/{{ attempt_count }}"
+      changed_when: false
+
+    - name: Wait for Wazuh to process the events
+      pause:
+        seconds: 15
+        prompt: "Waiting 15 seconds for Wazuh to detect the brute-force pattern..."
+
+    - name: Display post-attack status
+      debug:
+        msg: |
+          Attack Simulation Complete (Wazuh)
+          ===================================
+
+          Expected chain of events:
+            1. Wazuh agent on app.zta.lab detects failed logins
+            2. Wazuh manager fires rule 5712 (SSH brute force)
+            3. Wazuh integration sends webhook to EDA
+            4. EDA rulebook matches the event
+            5. EDA triggers AAP job: "Revoke App Credentials"
+            6. Vault DB lease is revoked
+            7. App loses database access
+
+          Check:
+            Wazuh dashboard: http://wazuh.zta.lab:5601
+            EDA Controller for rulebook activation events
+            AAP for the triggered revocation job
+            http://app.zta.lab:8081/health for app health

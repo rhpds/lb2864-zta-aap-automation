@@ -1,0 +1,41 @@
+---
+# Section 6: Restore the aap-service user to the HBAC rule.
+#
+# This is the instructor safety net — restores AAP access if participants
+# cannot complete the manual fix within the exercise time.
+#
+# Usage:
+#   ansible-playbook section6/playbooks/fix-hbac.yml
+
+- name: "Section 6 | Fix HBAC — Restore AAP Service Account"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    aap_service_user: aap-service
+
+  tasks:
+    - name: Restore aap-service to the automation HBAC rule
+      redhat.rhel_idm.ipahbacrule:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: allow_aap_automation
+        user:
+          - "{{ aap_service_user }}"
+        action: member
+        state: present
+
+    - name: Verify HBAC rule includes aap-service
+      command: >
+        ipa hbacrule-show allow_aap_automation --all
+      register: hbac_show
+      changed_when: false
+
+    - name: Display fix confirmation
+      debug:
+        msg: |
+          HBAC FIX APPLIED — AAP ACCESS RESTORED
+          ========================================
+
+          aap-service restored to allow_aap_automation HBAC rule
+          AAP job templates should now succeed again.

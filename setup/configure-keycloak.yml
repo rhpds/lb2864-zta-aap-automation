@@ -1,0 +1,828 @@
+---
+- name: Integrate ZTA Lab Services (with Keycloak)
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    keycloak_admin_user: admin
+    keycloak_admin_password: "{{ idm_admin_password }}"
+    keycloak_http_port: 8180
+    keycloak_https_port: 8543
+    keycloak_hostname: "{{ idm_hostname }}"
+    keycloak_container_name: keycloak
+    keycloak_realm: zta
+    keycloak_client_id: zta-app
+    keycloak_client_secret: zta-lab-secret-change-me
+    keycloak_base_url: "https://{{ keycloak_hostname }}:{{ keycloak_https_port }}"
+    opa_http_port: 8181
+    idm_ldap_url: "ldaps://{{ idm_hostname }}"
+    idm_base_dn: "dc={{ idm_domain.split('.') | join(',dc=') }}"
+    idm_users_dn: "cn=users,cn=accounts,{{ idm_base_dn }}"
+    idm_groups_dn: "cn=groups,cn=accounts,{{ idm_base_dn }}"
+    idm_server_ip: "{{ ansible_host }}"
+    idm_service_certs:
+      - hostname: "wazuh.{{ idm_domain }}"
+        cert_dir: /opt/certs/wazuh
+      - hostname: "aap.{{ idm_domain }}"
+        cert_dir: /opt/certs/aap
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Verify all services are running before integration
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 1 | Verify IdM is running"
+      command: ipactl status
+      register: idm_status
+      changed_when: false
+      failed_when: "'RUNNING' not in idm_status.stdout"
+      tags: [phase1, prerequisites]
+
+    - name: "Phase 1 | Verify Keycloak container is running"
+      command: podman ps --filter name={{ keycloak_container_name }} --format "{{ '{{' }}.Status{{ '}}' }}"
+      register: kc_status
+      changed_when: false
+      failed_when: "'Up' not in kc_status.stdout"
+      tags: [phase1, prerequisites]
+
+    - name: "Phase 1 | Verify OPA container is running"
+      command: podman ps --filter name={{ opa_container_name }} --format "{{ '{{' }}.Status{{ '}}' }}"
+      register: opa_status
+      changed_when: false
+      failed_when: "'Up' not in opa_status.stdout"
+      tags: [phase1, prerequisites]
+
+    # - name: "Phase 1 | Install python3-requests (needed for uri module)"
+    #   dnf:
+    #     name: python3-requests
+    #     state: present
+    #   tags: [phase1, prerequisites]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Create IdM service users, test user, and groups
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 2 | Obtain Kerberos TGT"
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+      tags: [phase2, idm-users]
+
+    - name: "Phase 2 | Check if keycloak-svc user exists"
+      command: ipa user-show keycloak-svc
+      register: kc_svc_user
+      changed_when: false
+      failed_when: false
+      tags: [phase2, idm-users]
+
+    - name: "Phase 2 | Create keycloak-svc bind user in IdM"
+      command: >
+        ipa user-add keycloak-svc
+        --first=Keycloak --last=Service
+        --password
+        --shell=/sbin/nologin
+      environment:
+        IPA_ADMIN_PASSWORD: "{{ idm_admin_password }}"
+      args:
+        stdin: "{{ idm_admin_password }}\n{{ idm_admin_password }}"
+      when: kc_svc_user.rc != 0
+      tags: [phase2, idm-users]
+
+    - name: "Phase 2 | Ensure keycloak-svc password is set"
+      shell: |
+        echo -e '{{ idm_admin_password }}\n{{ idm_admin_password }}\n{{ idm_admin_password }}' | \
+        ipa passwd keycloak-svc
+      when: kc_svc_user.rc != 0
+      no_log: true
+      tags: [phase2, idm-users]
+
+    - name: "Phase 2 | Create test user (ztauser) in IdM"
+      command: >
+        ipa user-add ztauser
+        --first=ZTA --last=User
+        --password
+      args:
+        stdin: "{{ idm_admin_password }}\n{{ idm_admin_password }}"
+      register: test_user
+      changed_when: test_user.rc == 0
+      failed_when: false
+      tags: [phase2, idm-users]
+
+    - name: "Phase 2 | Create zta-admins group in IdM"
+      command: ipa group-add zta-admins --desc="ZTA Lab Administrators"
+      register: zta_group
+      changed_when: zta_group.rc == 0
+      failed_when: false
+      tags: [phase2, idm-users]
+
+    - name: "Phase 2 | Add ztauser to zta-admins group"
+      command: ipa group-add-member zta-admins --users=ztauser
+      register: group_member
+      changed_when: group_member.rc == 0
+      failed_when: false
+      tags: [phase2, idm-users]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — Configure Keycloak realm and LDAP federation with IdM
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 3 | Get Keycloak admin token"
+      uri:
+        url: "{{ keycloak_base_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+        validate_certs: false
+        status_code: 200
+      register: kc_token
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Check if ZTA realm exists"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: realm_check
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Create ZTA realm"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          realm: "{{ keycloak_realm }}"
+          enabled: true
+          displayName: "ZTA Lab"
+          sslRequired: "none"
+          registrationAllowed: false
+          loginWithEmailAllowed: true
+          duplicateEmailsAllowed: false
+          resetPasswordAllowed: true
+          bruteForceProtected: true
+          accessTokenLifespan: 300
+        validate_certs: false
+        status_code: [201, 409]
+      when: realm_check.status == 404
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Refresh admin token for ZTA realm operations"
+      uri:
+        url: "{{ keycloak_base_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+        validate_certs: false
+        status_code: 200
+      register: kc_token
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Check existing LDAP federation"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.UserStorageProvider"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+      register: ldap_federations
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Set LDAP federation existence flag"
+      set_fact:
+        ldap_exists: "{{ ldap_federations.json | selectattr('name', 'equalto', 'idm-ldap') | list | length > 0 }}"
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Read IdM CA certificate for LDAPS trust"
+      slurp:
+        src: /etc/ipa/ca.crt
+      register: idm_ca_cert
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Create LDAP user federation (IdM)"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "idm-ldap"
+          providerId: "ldap"
+          providerType: "org.keycloak.storage.UserStorageProvider"
+          config:
+            vendor: ["rhds"]
+            connectionUrl: ["{{ idm_ldap_url }}"]
+            bindDn: ["uid=keycloak-svc,cn=users,cn=accounts,{{ idm_base_dn }}"]
+            bindCredential: ["{{ idm_admin_password }}"]
+            editMode: ["READ_ONLY"]
+            usersDn: ["{{ idm_users_dn }}"]
+            usernameLDAPAttribute: ["uid"]
+            rdnLDAPAttribute: ["uid"]
+            uuidLDAPAttribute: ["ipaUniqueID"]
+            userObjectClasses: ["inetOrgPerson, organizationalPerson, person"]
+            searchScope: ["1"]
+            pagination: ["true"]
+            importEnabled: ["true"]
+            syncRegistrations: ["false"]
+            trustEmail: ["true"]
+            useTruststoreSpi: ["ldapsOnly"]
+            connectionPooling: ["true"]
+            startTls: ["false"]
+            fullSyncPeriod: ["604800"]
+            changedSyncPeriod: ["86400"]
+        validate_certs: false
+        status_code: [201, 409]
+      when: not ldap_exists
+      register: ldap_component
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Get LDAP federation component ID"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.UserStorageProvider"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+      register: ldap_components
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Extract LDAP component ID"
+      set_fact:
+        ldap_component_id: "{{ (ldap_components.json | selectattr('name', 'equalto', 'idm-ldap') | first).id }}"
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Check existing group mapper"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?parent={{ ldap_component_id }}&type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+      register: existing_mappers
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Set group mapper existence flag"
+      set_fact:
+        group_mapper_exists: "{{ existing_mappers.json | selectattr('name', 'equalto', 'idm-groups') | list | length > 0 }}"
+      tags: [phase3, keycloak-ldap]
+
+    - name: "Phase 3 | Create LDAP group mapper"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "idm-groups"
+          providerId: "group-ldap-mapper"
+          providerType: "org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
+          parentId: "{{ ldap_component_id }}"
+          config:
+            "groups.dn": ["{{ idm_groups_dn }}"]
+            "group.name.ldap.attribute": ["cn"]
+            "group.object.classes": ["groupOfNames, nestedGroup, ipausergroup"]
+            "preserve.group.inheritance": ["true"]
+            "membership.ldap.attribute": ["member"]
+            "membership.attribute.type": ["DN"]
+            "membership.user.ldap.attribute": ["uid"]
+            "groups.ldap.filter": []
+            "mode": ["READ_ONLY"]
+            "user.roles.retrieve.strategy": ["LOAD_GROUPS_BY_MEMBER_ATTRIBUTE"]
+            "memberof.ldap.attribute": ["memberOf"]
+            "drop.non.existing.groups.during.sync": ["false"]
+        validate_certs: false
+        status_code: [201, 409]
+      when: not group_mapper_exists
+      tags: [phase3, keycloak-ldap]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Create OIDC client and trigger LDAP sync
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 4 | Check if zta-app client exists"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ keycloak_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+      register: client_check
+      tags: [phase4, keycloak-client]
+
+    - name: "Phase 4 | Create zta-app OIDC client"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          clientId: "{{ keycloak_client_id }}"
+          name: "ZTA Application"
+          enabled: true
+          protocol: "openid-connect"
+          publicClient: false
+          secret: "{{ keycloak_client_secret }}"
+          standardFlowEnabled: true
+          directAccessGrantsEnabled: true
+          serviceAccountsEnabled: true
+          authorizationServicesEnabled: false
+          redirectUris:
+            - "https://{{ keycloak_hostname }}:{{ keycloak_https_port }}/*"
+            - "https://wazuh.{{ idm_domain }}/*"
+            - "https://aap.{{ idm_domain }}/*"
+            - "http://localhost:*/*"
+          webOrigins:
+            - "+"
+          attributes:
+            "access.token.lifespan": "300"
+        validate_certs: false
+        status_code: [201, 409]
+      when: client_check.json | length == 0
+      tags: [phase4, keycloak-client]
+
+    - name: "Phase 4 | Wait for LDAP federation to initialise"
+      pause:
+        seconds: 10
+      tags: [phase4, keycloak-client]
+
+    - name: "Phase 4 | Refresh token before sync"
+      uri:
+        url: "{{ keycloak_base_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+        validate_certs: false
+        status_code: 200
+      register: kc_token
+      tags: [phase4, keycloak-client]
+
+    - name: "Phase 4 | Test LDAP connection before sync"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/testLDAPConnection"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          action: testConnection
+          connectionUrl: "{{ idm_ldap_url }}"
+          bindDn: "uid=keycloak-svc,cn=users,cn=accounts,{{ idm_base_dn }}"
+          bindCredential: "{{ idm_admin_password }}"
+          useTruststoreSpi: "ldapsOnly"
+          connectionTimeout: ""
+          startTls: ""
+        validate_certs: false
+        status_code: [200, 204]
+      register: ldap_test
+      retries: 5
+      delay: 5
+      until: ldap_test.status in [200, 204]
+      tags: [phase4, keycloak-client]
+
+    - name: "Phase 4 | Trigger LDAP full sync"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/user-storage/{{ ldap_component_id }}/sync?action=triggerFullSync"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+        status_code: [200]
+      register: sync_result
+      retries: 3
+      delay: 10
+      until: sync_result.status == 200
+      tags: [phase4, keycloak-client]
+
+    - name: "Phase 4 | Display sync result"
+      debug:
+        msg: "LDAP sync: {{ sync_result.json.status }} — added={{ sync_result.json.added }}, updated={{ sync_result.json.updated }}, failed={{ sync_result.json.failed }}"
+      tags: [phase4, keycloak-client]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — Deploy JWT-aware OPA policies for Keycloak token validation
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 5 | Fetch Keycloak realm public key"
+      uri:
+        url: "{{ keycloak_base_url }}/realms/{{ keycloak_realm }}"
+        method: GET
+        validate_certs: false
+      register: realm_info
+      tags: [phase5, opa-jwt]
+
+    - name: "Phase 5 | Deploy JWT-aware OPA policy"
+      copy:
+        dest: "{{ opa_policy_dir }}/zta_authz.rego"
+        content: |
+          package zta.authz
+
+          import rego.v1
+
+          default allow := false
+
+          jwks_url := "{{ keycloak_base_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/certs"
+          expected_issuer := "{{ keycloak_base_url }}/realms/{{ keycloak_realm }}"
+
+          allow if {
+            token_is_valid
+            not token_expired
+          }
+
+          allow if {
+            token_is_valid
+            "zta-admins" in token_groups
+          }
+
+          token_payload := payload if {
+            [_, payload, _] := io.jwt.decode(input.token)
+          }
+
+          token_is_valid if {
+            token_payload
+            token_payload.iss == expected_issuer
+          }
+
+          token_expired if {
+            token_payload.exp < time.now_ns() / 1000000000
+          }
+
+          token_groups contains group if {
+            some group in token_payload.groups
+          }
+
+          token_realm_roles contains role if {
+            some role in token_payload.realm_access.roles
+          }
+
+          token_client_roles contains role if {
+            some role in token_payload.resource_access["{{ keycloak_client_id }}"].roles
+          }
+
+          decision := {
+            "allow": allow,
+            "user": user,
+            "groups": token_groups,
+            "realm_roles": token_realm_roles,
+          } if {
+            token_payload
+            user := token_payload.preferred_username
+          }
+
+          decision := {
+            "allow": false,
+            "reason": "invalid or missing token",
+          } if {
+            not token_payload
+          }
+        owner: root
+        group: root
+        mode: '0644'
+      register: opa_policy_updated
+      tags: [phase5, opa-jwt]
+
+    - name: "Phase 5 | Deploy health check policy"
+      copy:
+        dest: "{{ opa_policy_dir }}/health.rego"
+        content: |
+          package system
+
+          import rego.v1
+
+          main := {
+            "status": "healthy",
+            "version": "1.0",
+            "services": ["idm", "keycloak", "opa"],
+          }
+        owner: root
+        group: root
+        mode: '0644'
+      tags: [phase5, opa-jwt]
+
+    - name: "Phase 5 | Restart OPA to load new policies"
+      command: podman restart {{ opa_container_name }}
+      when: opa_policy_updated.changed
+      tags: [phase5, opa-jwt]
+
+    - name: "Phase 5 | Wait for OPA to come back"
+      uri:
+        url: "http://localhost:{{ opa_http_port }}/health"
+        method: GET
+      register: opa_health
+      until: opa_health.status == 200
+      retries: 10
+      delay: 3
+      when: opa_policy_updated.changed
+      tags: [phase5, opa-jwt]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6 — Add protocol mapper so IdM groups appear in JWT tokens
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 6 | Refresh admin token"
+      uri:
+        url: "{{ keycloak_base_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+        validate_certs: false
+        status_code: 200
+      register: kc_token
+      tags: [phase6, token-mapper]
+
+    - name: "Phase 6 | Get zta-app client UUID"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ keycloak_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+      register: client_info
+      tags: [phase6, token-mapper]
+
+    - name: "Phase 6 | Extract client UUID"
+      set_fact:
+        zta_client_uuid: "{{ client_info.json[0].id }}"
+      when: client_info.json | length > 0
+      tags: [phase6, token-mapper]
+
+    - name: "Phase 6 | Check existing protocol mappers"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ zta_client_uuid }}/protocol-mappers/models"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+        validate_certs: false
+      register: proto_mappers
+      tags: [phase6, token-mapper]
+
+    - name: "Phase 6 | Set group-mapper existence flag"
+      set_fact:
+        groups_mapper_exists: "{{ proto_mappers.json | selectattr('name', 'equalto', 'group-membership') | list | length > 0 }}"
+      tags: [phase6, token-mapper]
+
+    - name: "Phase 6 | Add groups-to-token protocol mapper"
+      uri:
+        url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ zta_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "group-membership"
+          protocol: "openid-connect"
+          protocolMapper: "oidc-group-membership-mapper"
+          config:
+            "full.path": "false"
+            "id.token.claim": "true"
+            "access.token.claim": "true"
+            "claim.name": "groups"
+            "userinfo.token.claim": "true"
+        validate_certs: false
+        status_code: [201, 409]
+      when: not groups_mapper_exists
+      tags: [phase6, token-mapper]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Request IdM-signed certificates for external services
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 7 | Create certificate directories"
+      file:
+        path: "{{ item.cert_dir }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ idm_service_certs }}"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Add DNS entries for external services"
+      command: >
+        ipa dnsrecord-add {{ idm_domain }} {{ item.hostname.split('.')[0] }}
+        --a-rec={{ idm_server_ip }}
+      loop: "{{ idm_service_certs }}"
+      register: dns_add
+      changed_when: dns_add.rc == 0
+      failed_when: false
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Register hosts in IdM"
+      command: "ipa host-add {{ item.hostname }} --force"
+      loop: "{{ idm_service_certs }}"
+      register: host_add
+      changed_when: host_add.rc == 0
+      failed_when:
+        - host_add.rc != 0
+        - "'already exists' not in host_add.stderr"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Create Kerberos service principals"
+      command: "ipa service-add HTTP/{{ item.hostname }}@{{ idm_realm }}"
+      loop: "{{ idm_service_certs }}"
+      register: svc_add
+      changed_when: svc_add.rc == 0
+      failed_when:
+        - svc_add.rc != 0
+        - "'already exists' not in svc_add.stderr"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Grant central host permission to manage service certs"
+      command: "ipa service-add-host HTTP/{{ item.hostname }}@{{ idm_realm }} --hosts={{ inventory_hostname ~ '.' ~ idm_domain }}"
+      loop: "{{ idm_service_certs }}"
+      register: svc_host
+      changed_when: svc_host.rc == 0
+      failed_when:
+        - svc_host.rc != 0
+        - "'already a member' not in svc_host.stdout"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Clean up any stuck/rejected certificate requests"
+      shell: |
+        if ipa-getcert list -f {{ item.cert_dir }}/server.crt 2>/dev/null | grep -q 'status:'; then
+          status=$(ipa-getcert list -f {{ item.cert_dir }}/server.crt | grep 'status:' | head -1)
+          if echo "$status" | grep -qE 'CA_REJECTED|CA_UNREACHABLE|NEED_GUIDANCE'; then
+            ipa-getcert stop-tracking -f {{ item.cert_dir }}/server.crt 2>/dev/null || true
+            rm -f {{ item.cert_dir }}/server.crt {{ item.cert_dir }}/server.key
+            echo "CLEANED"
+          else
+            echo "OK"
+          fi
+        else
+          echo "NONE"
+        fi
+      loop: "{{ idm_service_certs }}"
+      register: cert_cleanup
+      changed_when: "'CLEANED' in cert_cleanup.stdout"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Request certificates from IdM CA"
+      command: >
+        ipa-getcert request
+        -f {{ item.cert_dir }}/server.crt
+        -k {{ item.cert_dir }}/server.key
+        -N CN={{ item.hostname }}
+        -D {{ item.hostname }}
+        -K HTTP/{{ item.hostname }}@{{ idm_realm }}
+      loop: "{{ idm_service_certs }}"
+      register: cert_request
+      changed_when: "'New signing request' in cert_request.stdout"
+      failed_when: false
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Wait for certificate issuance"
+      shell: |
+        for i in $(seq 1 30); do
+          status=$(ipa-getcert list -f {{ item.cert_dir }}/server.crt 2>/dev/null | grep 'status:' | head -1)
+          if echo "$status" | grep -q 'MONITORING'; then
+            echo "ISSUED"
+            exit 0
+          fi
+          if echo "$status" | grep -qE 'CA_REJECTED|NEED_GUIDANCE'; then
+            ipa-getcert list -f {{ item.cert_dir }}/server.crt 2>&1
+            echo "REJECTED"
+            exit 1
+          fi
+          sleep 2
+        done
+        ipa-getcert list -f {{ item.cert_dir }}/server.crt 2>&1
+        echo "TIMEOUT"
+      loop: "{{ idm_service_certs }}"
+      register: cert_wait
+      changed_when: false
+      failed_when: "'TIMEOUT' in cert_wait.stdout or 'REJECTED' in cert_wait.stdout"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Set certificate permissions"
+      file:
+        path: "{{ item.0.cert_dir }}/{{ item.1 }}"
+        mode: '0644'
+      loop: "{{ idm_service_certs | product(['server.crt', 'server.key']) | list }}"
+      loop_control:
+        label: "{{ item.0.cert_dir }}/{{ item.1 }}"
+      tags: [phase7, certificates]
+
+    - name: "Phase 7 | Copy IdM CA root cert alongside each service cert"
+      copy:
+        src: /etc/ipa/ca.crt
+        dest: "{{ item.cert_dir }}/ca.crt"
+        remote_src: true
+        mode: '0644'
+      loop: "{{ idm_service_certs }}"
+      tags: [phase7, certificates]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 8 — End-to-end validation and summary
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 8 | Test OIDC token acquisition (ztauser)"
+      uri:
+        url: "{{ keycloak_base_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: "{{ keycloak_client_id }}"
+          client_secret: "{{ keycloak_client_secret }}"
+          username: ztauser
+          password: "{{ idm_admin_password }}"
+          scope: openid
+        validate_certs: false
+        status_code: [200, 400, 401]
+      register: token_test
+      tags: [phase8, validation]
+
+    - name: "Phase 8 | Display token test result"
+      debug:
+        msg: >-
+          {% if token_test.status == 200 %}
+          Token acquired successfully for ztauser.
+          Access token (first 50 chars): {{ token_test.json.access_token[:50] }}...
+          {% else %}
+          Token request returned {{ token_test.status }}.
+          Note: ztauser may need to change password on first login via the Keycloak UI.
+          Login at {{ keycloak_base_url }}/realms/{{ keycloak_realm }}/account
+          {% endif %}
+      tags: [phase8, validation]
+
+    - name: "Phase 8 | Test OPA decision (with token if available)"
+      uri:
+        url: "http://localhost:{{ opa_http_port }}/v1/data/zta/authz/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            token: "{{ token_test.json.access_token | default('invalid') }}"
+        status_code: [200]
+      register: opa_decision
+      when: token_test.status == 200
+      tags: [phase8, validation]
+
+    - name: "Phase 8 | Display OPA decision"
+      debug:
+        msg: "OPA decision: {{ opa_decision.json.result }}"
+      when: opa_decision is defined and opa_decision.json is defined
+      tags: [phase8, validation]
+
+    - name: "Phase 8 | List issued certificates"
+      command: ipa-getcert list
+      register: cert_list
+      changed_when: false
+      tags: [phase8, validation]
+
+    - name: "Phase 8 | Summary"
+      debug:
+        msg:
+          - "=========================================================="
+          - "         ZTA Lab Integration Complete (with Keycloak)"
+          - "=========================================================="
+          - ""
+          - "  Keycloak <-> IdM LDAP Federation"
+          - "    Realm:     {{ keycloak_realm }}"
+          - "    Client:    {{ keycloak_client_id }}"
+          - "    LDAP bind: keycloak-svc"
+          - "    Groups synced to JWT tokens"
+          - ""
+          - "  OPA JWT Authorization"
+          - "    Policy:  zta.authz validates Keycloak tokens"
+          - "    Groups claim mapped for OPA decisions"
+          - ""
+          - "  IdM-Signed Certificates"
+          - "{% for svc in idm_service_certs %}    {{ svc.hostname }}: {{ svc.cert_dir }}/\n{% endfor %}"
+          - ""
+          - "  Test User"
+          - "    Username: ztauser"
+          - "    Password: {{ idm_admin_password }}"
+          - "    Groups:   zta-admins"
+          - ""
+          - "  Token Flow:"
+          - "    User -> Keycloak (OIDC) -> JWT with groups -> OPA"
+          - "=========================================================="
+      tags: [phase8, validation]

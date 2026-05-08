@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GTP | Global Telemetry Platform</title>
+<style>
+  :root {
+    --bg-primary: #0a0e17;
+    --bg-card: #111827;
+    --bg-card-hover: #1a2235;
+    --border: #1e293b;
+    --border-accent: #334155;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent-blue: #3b82f6;
+    --accent-green: #10b981;
+    --accent-amber: #f59e0b;
+    --accent-red: #ef4444;
+    --accent-purple: #8b5cf6;
+    --accent-cyan: #06b6d4;
+    --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  header {
+    background: linear-gradient(180deg, #111827 0%, var(--bg-primary) 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 1.25rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .header-left { display: flex; align-items: center; gap: 1rem; }
+
+  .logo {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--accent-blue);
+    border: 1px solid var(--accent-blue);
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+  }
+
+  .header-title {
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    letter-spacing: 0.05em;
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: 6px;
+    animation: pulse-dot 2s ease-in-out infinite;
+  }
+
+  .status-dot.green { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
+  .status-dot.red { background: var(--accent-red); box-shadow: 0 0 6px var(--accent-red); }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .subheader {
+    background: rgba(17, 24, 39, 0.5);
+    border-bottom: 1px solid var(--border);
+    padding: 0.6rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .subheader-tags { display: flex; gap: 1.5rem; }
+
+  .subheader-tag {
+    padding: 0.15rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: rgba(30, 41, 59, 0.4);
+  }
+
+  main { padding: 2rem; max-width: 1440px; margin: 0 auto; }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 2rem 0 1rem 0;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .section-header:first-child { margin-top: 0; }
+
+  .section-icon { font-size: 1rem; }
+
+  .section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--text-secondary);
+  }
+
+  .section-count {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    margin-left: auto;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+    gap: 1rem;
+  }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    transition: all 0.2s ease;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .card:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--border-accent);
+  }
+
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+  }
+
+  .card[data-color="blue"]::before { background: var(--accent-blue); }
+  .card[data-color="green"]::before { background: var(--accent-green); }
+  .card[data-color="amber"]::before { background: var(--accent-amber); }
+  .card[data-color="purple"]::before { background: var(--accent-purple); }
+  .card[data-color="cyan"]::before { background: var(--accent-cyan); }
+  .card[data-color="red"]::before { background: var(--accent-red); }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 1rem;
+  }
+
+  .card-name {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    max-width: 80%;
+  }
+
+  .card-confidence {
+    font-size: 0.6rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    padding: 0.15rem 0.45rem;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .card-value {
+    font-size: 2.4rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    line-height: 1;
+    margin-bottom: 0.25rem;
+    letter-spacing: -0.02em;
+  }
+
+  .card[data-color="blue"] .card-value { color: var(--accent-blue); }
+  .card[data-color="green"] .card-value { color: var(--accent-green); }
+  .card[data-color="amber"] .card-value { color: var(--accent-amber); }
+  .card[data-color="purple"] .card-value { color: var(--accent-purple); }
+  .card[data-color="cyan"] .card-value { color: var(--accent-cyan); }
+  .card[data-color="red"] .card-value { color: var(--accent-red); }
+
+  .card-unit {
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    margin-bottom: 1rem;
+  }
+
+  .card-rate-bar {
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    margin-bottom: 0.75rem;
+    overflow: hidden;
+  }
+
+  .card-rate-fill {
+    height: 100%;
+    border-radius: 2px;
+    animation: rate-pulse 3s ease-in-out infinite;
+  }
+
+  .card[data-color="blue"] .card-rate-fill { background: var(--accent-blue); }
+  .card[data-color="green"] .card-rate-fill { background: var(--accent-green); }
+  .card[data-color="amber"] .card-rate-fill { background: var(--accent-amber); }
+  .card[data-color="purple"] .card-rate-fill { background: var(--accent-purple); }
+  .card[data-color="cyan"] .card-rate-fill { background: var(--accent-cyan); }
+  .card[data-color="red"] .card-rate-fill { background: var(--accent-red); }
+
+  @keyframes rate-pulse {
+    0%, 100% { width: 60%; opacity: 0.6; }
+    50% { width: 95%; opacity: 1; }
+  }
+
+  .card-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    font-size: 0.6rem;
+    color: var(--text-muted);
+  }
+
+  .card-source {
+    max-width: 75%;
+    line-height: 1.4;
+    font-style: italic;
+  }
+
+  .card-rate-label {
+    font-family: var(--font-mono);
+    white-space: nowrap;
+  }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 1.5rem 2rem;
+    text-align: center;
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .db-banner {
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    border-radius: 6px;
+    padding: 1rem 1.5rem;
+    margin-bottom: 2rem;
+    font-size: 0.8rem;
+    color: var(--accent-red);
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .db-banner-icon { font-size: 1.2rem; }
+
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+    header { flex-direction: column; gap: 0.75rem; }
+    .header-right { flex-wrap: wrap; justify-content: center; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <span class="logo">GTP</span>
+    <span class="header-title">Global Telemetry Platform</span>
+  </div>
+  <div class="header-right">
+    <span>
+      <span class="status-dot {{ 'green' if db_ok else 'red' }}"></span>
+      {{ 'FEED ACTIVE' if db_ok else 'DB OFFLINE' }}
+    </span>
+    <span id="utc-clock"></span>
+    <span>v3.1.7-prod</span>
+  </div>
+</header>
+
+<div class="subheader">
+  <div class="subheader-tags">
+    <span class="subheader-tag">REGION: ALL</span>
+    <span class="subheader-tag">RESOLUTION: REAL-TIME</span>
+    <span class="subheader-tag">PIPELINE: STREAMING</span>
+  </div>
+  <span id="uptime"></span>
+</div>
+
+<main>
+  {% if not db_ok %}
+  <div class="db-banner">
+    <span class="db-banner-icon">&#x26A0;</span>
+    <div>
+      <strong>Database connection unavailable.</strong>
+      Telemetry feed is offline. Verify database credentials and connectivity.
+      This application uses Vault-issued dynamic credentials &mdash; ensure the
+      lease has not expired.
+    </div>
+  </div>
+  {% endif %}
+
+  {% set ns = namespace(current_cat='') %}
+  {% set colors = ['blue', 'green', 'amber', 'cyan', 'purple', 'red'] %}
+
+  {% for metric in metrics %}
+    {% if metric.category_slug != ns.current_cat %}
+      {% if ns.current_cat != '' %}</div>{% endif %}
+      {% set ns.current_cat = metric.category_slug %}
+      {% set cat_metrics = metrics | selectattr('category_slug', 'equalto', metric.category_slug) | list %}
+      <div class="section-header">
+        <span class="section-icon">{{ metric.category_icon | safe }}</span>
+        <span class="section-title">{{ metric.category_name }}</span>
+        <span class="section-count">{{ cat_metrics | length }} metrics</span>
+      </div>
+      <div class="grid">
+    {% endif %}
+
+    <div class="card"
+         data-color="{{ colors[loop.index0 % colors | length] }}"
+         data-rate="{{ metric.rate_per_second }}"
+         data-total="{{ metric.current_total }}"
+         data-epoch="{{ metric.baseline_epoch }}">
+      <div class="card-header">
+        <span class="card-name">{{ metric.name }}</span>
+        <span class="card-confidence">{{ '%.0f' | format(metric.confidence * 100) }}% CI</span>
+      </div>
+      <div class="card-value" data-counter>
+        {{ '{:,}'.format(metric.current_total) }}
+      </div>
+      <div class="card-unit">{{ metric.unit }}</div>
+      <div class="card-rate-bar"><div class="card-rate-fill"></div></div>
+      <div class="card-footer">
+        <span class="card-source">{{ metric.source }}</span>
+        <span class="card-rate-label">{{ '%.4f' | format(metric.rate_per_second) }}/s</span>
+      </div>
+    </div>
+  {% endfor %}
+  {% if metrics %}</div>{% endif %}
+</main>
+
+<footer>
+  Global Telemetry Platform &copy; 2026 &middot;
+  Data Classification: UNCLASSIFIED // FOR WORKSHOP USE &middot;
+  Feeds: {{ metrics | length }} active &middot;
+  Refresh: 100ms
+</footer>
+
+<script>
+(function () {
+  const cards = document.querySelectorAll('.card[data-rate]');
+  const startTime = Date.now();
+
+  function formatNumber(n) {
+    if (n >= 1e12) return (n / 1e12).toFixed(2) + 'T';
+    if (n >= 1e9)  return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6)  return (n / 1e6).toFixed(2) + 'M';
+    return n.toLocaleString('en-US');
+  }
+
+  function tick() {
+    const nowSec = Date.now() / 1000;
+    cards.forEach(card => {
+      const rate  = parseFloat(card.dataset.rate);
+      const base  = parseInt(card.dataset.total, 10);
+      const epoch = parseInt(card.dataset.epoch, 10);
+      const pageLoadEpoch = startTime / 1000;
+      const elapsed = nowSec - pageLoadEpoch;
+      const current = base + Math.floor(rate * elapsed);
+      card.querySelector('[data-counter]').textContent = formatNumber(current);
+    });
+    requestAnimationFrame(tick);
+  }
+
+  function updateClock() {
+    const now = new Date();
+    document.getElementById('utc-clock').textContent =
+      now.toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+  }
+
+  function updateUptime() {
+    const sec = Math.floor((Date.now() - startTime) / 1000);
+    const h = String(Math.floor(sec / 3600)).padStart(2, '0');
+    const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    const el = document.getElementById('uptime');
+    if (el) el.textContent = 'SESSION ' + h + ':' + m + ':' + s;
+  }
+
+  requestAnimationFrame(tick);
+  setInterval(updateClock, 1000);
+  setInterval(updateUptime, 1000);
+  updateClock();
+  updateUptime();
+})();
+</script>
+
+</body>
+</html>

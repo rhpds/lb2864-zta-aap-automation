@@ -1,0 +1,3 @@
+FROM localhost/ceos-lab-import:4.35.3F
+
+RUN grep -rl 'StandardOutput=tty' /etc/systemd/system/ | xargs sed -i 's/StandardOutput=tty/StandardOutput=journal/g'

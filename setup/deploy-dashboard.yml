@@ -1,0 +1,172 @@
+---
+# Deploy ZTA Workshop Live Topology Dashboard on central
+#
+# Serves a real-time status page showing the health of every component.
+#
+# Services exposed:
+#   - Web UI:  http://central.zta.lab:5050  (also http://dashboard.zta.lab:5050)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-dashboard.yml
+
+- name: Deploy ZTA Live Topology Dashboard
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    dashboard_dir: /opt/zta-dashboard
+    dashboard_port: 5050
+    dashboard_service: zta-dashboard
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 1 — Prerequisites
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Install Python3 pip
+      ansible.builtin.dnf:
+        name:
+          - python3-pip
+          - python3-devel
+        state: present
+
+    - name: Create dashboard directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ dashboard_dir }}"
+        - "{{ dashboard_dir }}/templates"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 2 — Deploy application files
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Deploy dashboard application
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../dashboard/app.py"
+        dest: "{{ dashboard_dir }}/app.py"
+        mode: '0644'
+      register: app_file
+
+    - name: Deploy dashboard HTML template
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../dashboard/templates/index.html"
+        dest: "{{ dashboard_dir }}/templates/index.html"
+        mode: '0644'
+      register: html_file
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 3 — Python virtual environment and dependencies
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv {{ dashboard_dir }}/venv
+        creates: "{{ dashboard_dir }}/venv/bin/python3"
+
+    - name: Install Flask in virtual environment
+      ansible.builtin.pip:
+        name: flask
+        virtualenv: "{{ dashboard_dir }}/venv"
+        state: present
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 4 — Systemd service
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Deploy systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/{{ dashboard_service }}.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=ZTA Workshop Live Topology Dashboard
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory={{ dashboard_dir }}
+          ExecStart={{ dashboard_dir }}/venv/bin/python3 {{ dashboard_dir }}/app.py
+          Restart=always
+          RestartSec=5
+          Environment=PYTHONUNBUFFERED=1
+
+          [Install]
+          WantedBy=multi-user.target
+      register: systemd_file
+
+    - name: Enable and start dashboard service
+      ansible.builtin.systemd:
+        name: "{{ dashboard_service }}"
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      when: app_file.changed or html_file.changed or systemd_file.changed
+
+    - name: Ensure dashboard service is running
+      ansible.builtin.systemd:
+        name: "{{ dashboard_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 5 — DNS record
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Add dashboard DNS record in IdM
+      community.general.ipa_dnsrecord:
+        ipa_host: "{{ idm_hostname }}"
+        ipa_user: admin
+        ipa_pass: "{{ idm_admin_password }}"
+        zone_name: "{{ idm_domain }}"
+        record_name: dashboard
+        record_type: A
+        record_value: "{{ ansible_host }}"
+        state: present
+        validate_certs: false
+      failed_when: false
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 6 — Verify
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Wait for dashboard to be ready
+      ansible.builtin.uri:
+        url: "http://localhost:{{ dashboard_port }}"
+        method: GET
+        status_code: [200]
+      register: dashboard_health
+      until: dashboard_health.status == 200
+      retries: 12
+      delay: 5
+
+    - name: Verify API endpoint
+      ansible.builtin.uri:
+        url: "http://localhost:{{ dashboard_port }}/api/status"
+        method: GET
+        status_code: [200]
+      register: api_check
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║     ZTA Live Topology Dashboard — Deployed                   ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  URL:       http://{{ ansible_host }}:{{ dashboard_port }}{{ ' ' * (28 - ansible_host | length) }}║
+          ║  DNS:       http://dashboard.zta.lab:{{ dashboard_port }}                ║
+          ║  API:       http://dashboard.zta.lab:{{ dashboard_port }}/api/status     ║
+          ║                                                              ║
+          ║  Service:   systemctl status {{ dashboard_service }}              ║
+          ║  Logs:      journalctl -u {{ dashboard_service }} -f             ║
+          ║  Restart:   systemctl restart {{ dashboard_service }}             ║
+          ║                                                              ║
+          ║  Auto-refreshes every 10 seconds                             ║
+          ║  Monitors {{ (api_check.json | length) - 1 }} components with live health checks       ║
+          ╚════════════════════════════════════════════════════════════════╝

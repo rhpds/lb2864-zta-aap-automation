@@ -1,0 +1,87 @@
+---
+# Section 6 Solve: SSH Lockdown & Break-Glass Recovery
+#
+# Applies all 4 SSH lockdown layers:
+#   1. Firewall lockdown — restrict SSH source IPs
+#   2. IdM HBAC lockdown — restrict which users can log in
+#   3. Vault policy lockdown — restrict credential generation to AppRole
+#   4. Wazuh bypass detection — alert on SSH bypass attempts
+#
+# Also verifies the break-glass path is functional.
+#
+# Prerequisites: Sections 1-5 must be complete, console access available
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section6.yml
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section6.yml --tags firewall
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section6.yml --tags hbac
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section6.yml --tags vault
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section6.yml --tags wazuh
+
+- name: "Section 6 Solve | Layer 1 — Firewall Lockdown"
+  ansible.builtin.import_playbook: ../ssh_lockdown/lockdown-firewall.yml
+  tags: [section6, firewall]
+
+- name: "Section 6 Solve | Layer 2 — IdM HBAC Lockdown"
+  ansible.builtin.import_playbook: ../ssh_lockdown/lockdown-idm-hbac.yml
+  tags: [section6, hbac]
+
+- name: "Section 6 Solve | Layer 3 — Vault Policy Lockdown"
+  ansible.builtin.import_playbook: ../ssh_lockdown/lockdown-vault-policies.yml
+  tags: [section6, vault]
+
+- name: "Section 6 Solve | Layer 4 — Wazuh Bypass Detection"
+  ansible.builtin.import_playbook: ../ssh_lockdown/lockdown-wazuh-bypass.yml
+  tags: [section6, wazuh]
+
+- name: "Section 6 Solve | Verify Break-Glass Path"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  tags: [section6, verify]
+
+  tasks:
+    - name: Authenticate to IdM
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+
+    - name: Verify aap-service passes HBAC
+      command: ipa hbactest --user=aap-service --host=app.zta.lab --service=sshd
+      register: s6_hbac_aap
+      changed_when: false
+      failed_when: false
+
+    - name: Verify breakglass user passes HBAC
+      command: ipa hbactest --user=ztauser --host=app.zta.lab --service=sshd
+      register: s6_hbac_breakglass
+      changed_when: false
+      failed_when: false
+
+    - name: Verify neteng is denied by HBAC
+      command: ipa hbactest --user=neteng --host=app.zta.lab --service=sshd
+      register: s6_hbac_neteng
+      changed_when: false
+      failed_when: false
+
+    - name: Display lockdown summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 6 Solve — SSH Lockdown Applied                        ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  Layers applied:                                               ║
+          ║    ✓ Layer 1: Firewall lockdown (SSH source IP restriction)    ║
+          ║    ✓ Layer 2: IdM HBAC lockdown (user-to-host access control) ║
+          ║    ✓ Layer 3: Vault policy lockdown (AppRole-only signing)     ║
+          ║    ✓ Layer 4: Wazuh bypass detection (alert on SSH bypasses)   ║
+          ║                                                                ║
+          ║  Break-glass path:                                             ║
+          ║    aap-service HBAC: {{ 'PASS' if 'granted' in (s6_hbac_aap.stdout | default('') | lower) else 'FAIL' }}
+          ║    ztauser HBAC:     {{ 'PASS' if 'granted' in (s6_hbac_breakglass.stdout | default('') | lower) else 'FAIL' }}
+          ║    neteng HBAC:      {{ 'DENIED' if 'denied' in (s6_hbac_neteng.stdout | default('') | lower) else 'CHECK' }}
+          ║                                                                ║
+          ║  Run check-section6.yml to verify all layers.                  ║
+          ╚══════════════════════════════════════════════════════════════════╝

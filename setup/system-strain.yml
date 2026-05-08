@@ -1,0 +1,331 @@
+---
+# system-strain.yml — Diagnose resource pressure across all workshop VMs.
+#
+# Central carries the heaviest load (IdM, OPA, Keycloak, Splunk, NetBox,
+# 3× cEOS, DB, App, SPIRE) so it gets the deepest inspection.
+#
+# Collects:
+#   - CPU load vs core count, memory (RAM + swap), disk usage
+#   - Pressure Stall Information (PSI) for CPU / memory / I/O
+#   - Per-container resource usage on central (podman stats)
+#   - Top processes by CPU and memory on every VM
+#
+# Prerequisites:
+#   - SSH access to all VMs (ansible_user / ansible_password in inventory)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/system-strain.yml
+#   ansible-playbook -i inventory/hosts.ini setup/system-strain.yml --tags central
+#   ansible-playbook -i inventory/hosts.ini setup/system-strain.yml --tags vms
+#   ansible-playbook -i inventory/hosts.ini setup/system-strain.yml --tags summary
+#
+# Tags:
+#   central   — Central VM deep-dive (containers, PSI, top processes)
+#   vms       — Other workshop VMs (vault, netbox, control, wazuh)
+#   summary   — Summary dashboard only (requires prior plays to have run)
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Play 1 — Gather system metrics from every workshop VM
+# ═════════════════════════════════════════════════════════════════════════
+
+- name: "Gather system metrics — all workshop VMs"
+  hosts: zta_services,vault_servers,netbox_servers,automation,wazuh_servers
+  become: true
+  gather_facts: true
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [central, vms]
+
+  tasks:
+
+    # ── Load average ────────────────────────────────────────────────────
+
+    - name: Read load averages
+      slurp:
+        src: /proc/loadavg
+      register: raw_loadavg
+      failed_when: false
+
+    - name: Parse load averages
+      set_fact:
+        sys_load_1m: "{{ (raw_loadavg.content | b64decode).split()[0] }}"
+        sys_load_5m: "{{ (raw_loadavg.content | b64decode).split()[1] }}"
+        sys_load_15m: "{{ (raw_loadavg.content | b64decode).split()[2] }}"
+        sys_cpu_count: "{{ ansible_processor_vcpus }}"
+      when: raw_loadavg is succeeded
+      failed_when: false
+
+    # ── Memory ──────────────────────────────────────────────────────────
+
+    - name: Read memory info
+      command: free -m
+      register: raw_free
+      changed_when: false
+      failed_when: false
+
+    - name: Parse memory values
+      set_fact:
+        sys_mem_total_mb: "{{ (raw_free.stdout_lines[1].split()[1]) }}"
+        sys_mem_used_mb: "{{ (raw_free.stdout_lines[1].split()[2]) }}"
+        sys_mem_available_mb: "{{ (raw_free.stdout_lines[1].split()[6]) }}"
+        sys_swap_total_mb: "{{ (raw_free.stdout_lines[2].split()[1]) }}"
+        sys_swap_used_mb: "{{ (raw_free.stdout_lines[2].split()[2]) }}"
+      when: raw_free is succeeded
+      failed_when: false
+
+    # ── Disk usage ──────────────────────────────────────────────────────
+
+    - name: Check disk usage on key mount points
+      shell: |
+        df -h / /var /var/lib/containers 2>/dev/null \
+          | awk 'NR>1 && !seen[$1]++ {printf "%s %s %s %s\n", $6, $3, $2, $5}'
+      register: raw_disk
+      changed_when: false
+      failed_when: false
+
+    - name: Store disk usage
+      set_fact:
+        sys_disk_lines: "{{ raw_disk.stdout_lines | default([]) }}"
+      when: raw_disk is succeeded
+      failed_when: false
+
+    # ── Pressure Stall Information (RHEL 9 / kernel 4.20+) ─────────────
+
+    - name: Read PSI — CPU
+      slurp:
+        src: /proc/pressure/cpu
+      register: raw_psi_cpu
+      failed_when: false
+
+    - name: Read PSI — Memory
+      slurp:
+        src: /proc/pressure/memory
+      register: raw_psi_mem
+      failed_when: false
+
+    - name: Read PSI — I/O
+      slurp:
+        src: /proc/pressure/io
+      register: raw_psi_io
+      failed_when: false
+
+    - name: Parse PSI values
+      set_fact:
+        psi_cpu: "{{ (raw_psi_cpu.content | b64decode).split('\n') | select('match', '^some') | first | default('unavailable') }}"
+        psi_mem: "{{ (raw_psi_mem.content | b64decode).split('\n') | select('match', '^some') | first | default('unavailable') }}"
+        psi_io: "{{ (raw_psi_io.content | b64decode).split('\n') | select('match', '^some') | first | default('unavailable') }}"
+      when: raw_psi_cpu is succeeded
+      failed_when: false
+
+    # ── Top processes ───────────────────────────────────────────────────
+
+    - name: Top 5 processes by CPU
+      shell: ps -eo pid,pcpu,pmem,rss:10,comm --sort=-%cpu --no-headers | head -5
+      register: raw_top_cpu
+      changed_when: false
+      failed_when: false
+
+    - name: Top 5 processes by memory
+      shell: ps -eo pid,pcpu,pmem,rss:10,comm --sort=-%mem --no-headers | head -5
+      register: raw_top_mem
+      changed_when: false
+      failed_when: false
+
+    - name: Store top processes
+      set_fact:
+        sys_top_cpu: "{{ raw_top_cpu.stdout_lines | default([]) }}"
+        sys_top_mem: "{{ raw_top_mem.stdout_lines | default([]) }}"
+      failed_when: false
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Play 2 — Central deep-dive: container resource usage
+# ═════════════════════════════════════════════════════════════════════════
+
+- name: "Central deep-dive — container resource usage"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [central]
+
+  tasks:
+
+    - name: Get container stats (single snapshot)
+      shell: >
+        podman stats --no-stream
+        --format '{{ "{{" }}.Name{{ "}}" }}|{{ "{{" }}.CPUPerc{{ "}}" }}|{{ "{{" }}.MemUsage{{ "}}" }}|{{ "{{" }}.MemPerc{{ "}}" }}|{{ "{{" }}.NetIO{{ "}}" }}|{{ "{{" }}.BlockIO{{ "}}" }}|{{ "{{" }}.PIDs{{ "}}" }}'
+        2>/dev/null || true
+      register: raw_podman_stats
+      changed_when: false
+      failed_when: false
+
+    - name: Store container stats
+      set_fact:
+        container_stats: "{{ raw_podman_stats.stdout_lines | default([]) }}"
+      failed_when: false
+
+    - name: Count running containers
+      command: podman ps -q
+      register: raw_container_count
+      changed_when: false
+      failed_when: false
+
+    - name: Store container count
+      set_fact:
+        container_count: "{{ raw_container_count.stdout_lines | default([]) | length }}"
+      failed_when: false
+
+    - name: Get container overlay disk usage
+      shell: du -sh /var/lib/containers 2>/dev/null | awk '{print $1}'
+      register: raw_overlay_size
+      changed_when: false
+      failed_when: false
+
+    - name: Store overlay size
+      set_fact:
+        overlay_size: "{{ raw_overlay_size.stdout | default('unknown') }}"
+      failed_when: false
+
+    - name: Check systemd failed units
+      command: systemctl --failed --no-legend --no-pager
+      register: raw_failed_units
+      changed_when: false
+      failed_when: false
+
+    - name: Store failed units
+      set_fact:
+        failed_units: "{{ raw_failed_units.stdout_lines | default([]) }}"
+      failed_when: false
+
+    - name: Get system uptime
+      command: uptime -p
+      register: raw_uptime
+      changed_when: false
+      failed_when: false
+
+    - name: Store uptime
+      set_fact:
+        sys_uptime: "{{ raw_uptime.stdout | default('unknown') }}"
+      failed_when: false
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Play 3 — Summary dashboard
+# ═════════════════════════════════════════════════════════════════════════
+
+- name: "System Strain — Summary Dashboard"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [summary, always]
+
+  vars:
+    all_hosts:
+      - central
+      - vault
+      - netbox
+      - control
+      - wazuh
+
+    strain_thresholds:
+      load_ratio_warn: 1.0
+      load_ratio_crit: 2.0
+      mem_pct_warn: 80
+      mem_pct_crit: 95
+      swap_warn_mb: 100
+
+  tasks:
+
+    - name: Build per-host health summary
+      set_fact:
+        host_health: >-
+          {{
+            host_health | default([]) + [{
+              'name': item,
+              'reachable': hostvars[item].sys_cpu_count is defined,
+              'cpus': hostvars[item].sys_cpu_count | default('?'),
+              'load_1m': hostvars[item].sys_load_1m | default('?'),
+              'load_5m': hostvars[item].sys_load_5m | default('?'),
+              'load_15m': hostvars[item].sys_load_15m | default('?'),
+              'mem_total': hostvars[item].sys_mem_total_mb | default('?'),
+              'mem_used': hostvars[item].sys_mem_used_mb | default('?'),
+              'mem_avail': hostvars[item].sys_mem_available_mb | default('?'),
+              'swap_total': hostvars[item].sys_swap_total_mb | default('0'),
+              'swap_used': hostvars[item].sys_swap_used_mb | default('0'),
+              'disk': hostvars[item].sys_disk_lines | default([]),
+              'psi_cpu': hostvars[item].psi_cpu | default('unavailable'),
+              'psi_mem': hostvars[item].psi_mem | default('unavailable'),
+              'psi_io': hostvars[item].psi_io | default('unavailable'),
+              'top_cpu': hostvars[item].sys_top_cpu | default([]),
+              'top_mem': hostvars[item].sys_top_mem | default([])
+            }]
+          }}
+      loop: "{{ all_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # ── Central-specific data ──────────────────────────────────────────
+
+    - name: Extract central container data
+      set_fact:
+        c_stats: "{{ hostvars['central'].container_stats | default([]) }}"
+        c_count: "{{ hostvars['central'].container_count | default('?') }}"
+        c_overlay: "{{ hostvars['central'].overlay_size | default('?') }}"
+        c_failed: "{{ hostvars['central'].failed_units | default([]) }}"
+        c_uptime: "{{ hostvars['central'].sys_uptime | default('unknown') }}"
+
+    # ── Display report ─────────────────────────────────────────────────
+
+    - name: Display strain report
+      debug:
+        msg: |
+          ZTA Workshop — System Strain Report
+
+          {% for h in host_health %}
+          --- {{ h.name | upper }} ---
+          {% if not h.reachable %}
+          UNREACHABLE
+          {% else %}
+          CPU cores: {{ h.cpus }}  Load 1/5/15m: {{ h.load_1m }} {{ h.load_5m }} {{ h.load_15m }}
+          RAM: {{ h.mem_used }}M / {{ h.mem_total }}M  Available: {{ h.mem_avail }}M
+          Swap: {{ h.swap_used }}M / {{ h.swap_total }}M{% if h.swap_used | int > 100 %} (high swap use){% endif %}
+
+          Disk:
+          {% for d in h.disk %}
+            {{ d }}
+          {% endfor %}
+
+          Pressure (PSI some — avg10/avg60/avg300):
+            CPU: {{ h.psi_cpu | replace('some ', '') | truncate(80, true, '…') }}
+            Mem: {{ h.psi_mem | replace('some ', '') | truncate(80, true, '…') }}
+            I/O: {{ h.psi_io | replace('some ', '') | truncate(80, true, '…') }}
+
+          Top by CPU:
+          {% for p in h.top_cpu[:3] %}
+            {{ p | truncate(80, true, '…') }}
+          {% endfor %}
+          Top by memory:
+          {% for p in h.top_mem[:3] %}
+            {{ p | truncate(80, true, '…') }}
+          {% endfor %}
+          {% endif %}
+
+          {% endfor %}
+
+          --- CENTRAL — container details ---
+          Uptime: {{ c_uptime | truncate(80, true, '…') }}
+          Container count: {{ c_count }}
+          Overlay size: {{ c_overlay }}
+          {% for line in c_stats %}
+          {{ line }}
+          {% endfor %}
+          {% if c_failed | length > 0 %}
+          Failed systemd units:
+          {% for u in c_failed %}
+            {{ u | truncate(80, true, '…') }}
+          {% endfor %}
+          {% endif %}
+
+          Thresholds: load warn/crit = {{ strain_thresholds.load_ratio_warn }}x / {{ strain_thresholds.load_ratio_crit }}x CPU count; RAM warn/crit = {{ strain_thresholds.mem_pct_warn }}% / {{ strain_thresholds.mem_pct_crit }}%; swap pressure if used > {{ strain_thresholds.swap_warn_mb }}M; PSI avg10 > 10% contention, > 25% severe.

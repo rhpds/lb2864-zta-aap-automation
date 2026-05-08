@@ -1,0 +1,111 @@
+---
+# Redeploy Keycloak container with a new external hostname.
+#
+# The RHDP sandbox gives each workshop instance a unique route hostname.
+# This playbook tears down the existing Keycloak container and recreates
+# it with the correct KC_HOSTNAME so OIDC issuer URLs match the route.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/redeploy-keycloak.yml \
+#     -e keycloak_external_hostname=keycloak-https-XXXXX.apps.ocpvdev01.rhdp.net
+#
+# After this succeeds, re-run setup/configure-keycloak.yml to reconfigure the
+# realm, LDAP federation, and OPA policies with the new issuer URL.
+
+- name: Redeploy Keycloak container with updated hostname
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    keycloak_container_name: keycloak
+    keycloak_image: registry.redhat.io/rhbk/keycloak-rhel9:24
+    keycloak_admin_user: admin
+    keycloak_admin_password: "{{ idm_admin_password }}"
+    keycloak_http_port: 8180
+    keycloak_https_port: 8543
+    keycloak_certs_dir: /opt/keycloak/certs
+
+  pre_tasks:
+    - name: Validate keycloak_external_hostname is provided
+      assert:
+        that:
+          - keycloak_external_hostname is defined
+          - keycloak_external_hostname | length > 0
+        fail_msg: >-
+          You must supply -e keycloak_external_hostname=<route>.
+          Example: -e keycloak_external_hostname=keycloak-https-4594n.apps.ocpvdev01.rhdp.net
+
+  tasks:
+    # ── Tear down ──────────────────────────────────────────────────────
+    - name: Stop Keycloak systemd service
+      systemd:
+        name: "container-{{ keycloak_container_name }}"
+        state: stopped
+      failed_when: false
+
+    - name: Force-remove existing Keycloak container
+      command: podman rm -f {{ keycloak_container_name }}
+      register: rm_result
+      changed_when: rm_result.rc == 0
+      failed_when: false
+
+    # ── Recreate ───────────────────────────────────────────────────────
+    - name: Create Keycloak container with new hostname
+      command: >-
+        podman create
+          --name {{ keycloak_container_name }}
+          -p {{ keycloak_http_port }}:8080
+          -p {{ keycloak_https_port }}:8443
+          -e KEYCLOAK_ADMIN={{ keycloak_admin_user }}
+          -e KEYCLOAK_ADMIN_PASSWORD={{ keycloak_admin_password }}
+          -e KC_HOSTNAME={{ keycloak_external_hostname }}
+          -e KC_HTTPS_CERTIFICATE_FILE=/opt/certs/server.crt
+          -e KC_HTTPS_CERTIFICATE_KEY_FILE=/opt/certs/server.key
+          -e KC_HTTP_ENABLED=true
+          -v {{ keycloak_certs_dir }}:/opt/certs:Z
+          {{ keycloak_image }}
+          start
+            --hostname={{ keycloak_external_hostname }}
+            --https-port=8443
+            --http-enabled=true
+            --proxy-headers=forwarded
+
+    # ── Regenerate systemd unit ────────────────────────────────────────
+    - name: Regenerate systemd unit for new container
+      shell: podman generate systemd --name {{ keycloak_container_name }} > /etc/systemd/system/container-{{ keycloak_container_name }}.service
+      changed_when: true
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Start and enable Keycloak service
+      systemd:
+        name: "container-{{ keycloak_container_name }}"
+        state: started
+        enabled: true
+
+    # ── Health check ───────────────────────────────────────────────────
+    - name: Wait for Keycloak to become healthy
+      uri:
+        url: "https://localhost:{{ keycloak_https_port }}/health/ready"
+        validate_certs: false
+        status_code: [200]
+      register: kc_health
+      until: kc_health.status == 200
+      retries: 20
+      delay: 5
+
+    - name: Summary
+      debug:
+        msg:
+          - "Keycloak redeployed successfully."
+          - ""
+          - "  Hostname:  {{ keycloak_external_hostname }}"
+          - "  HTTPS:     https://{{ keycloak_external_hostname }}:{{ keycloak_https_port }}"
+          - "  HTTP:      http://{{ keycloak_external_hostname }}:{{ keycloak_http_port }}"
+          - "  Admin:     {{ keycloak_admin_user }}"
+          - ""
+          - "  Next step: re-run setup/configure-keycloak.yml to update realm/LDAP/OPA:"
+          - "    ansible-playbook -i inventory/hosts.ini setup/configure-keycloak.yml"

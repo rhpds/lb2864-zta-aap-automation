@@ -1,0 +1,46 @@
+---
+# Utility: List all policies currently loaded in OPA
+- name: List OPA Policies
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Fetch loaded policies from OPA
+      uri:
+        url: "{{ opa_url }}/v1/policies"
+        method: GET
+        return_content: true
+      register: opa_policies
+
+    - name: Display policy summary
+      debug:
+        msg: |
+          OPA policy inventory — server {{ opa_url }}, policies loaded: {{ opa_policies.json.result | length }}
+          {% for policy in opa_policies.json.result %}
+          - {{ policy.id }}{% if policy.ast.package.path is defined %} (package: {{ policy.ast.package.path | map(attribute='value') | join('.') }}){% endif %}{% if policy.raw is defined %} [{{ policy.raw | length }} bytes]{% endif %}
+          {% endfor %}
+
+    - name: Show detailed rules per policy
+      debug:
+        msg: |
+          Policy: {{ item.id }}
+          {% if item.ast.rules is defined %}
+          Rules:
+          {% for rule in item.ast.rules %}
+            - {{ rule.head.name | default('(default)') }}
+          {% endfor %}
+          {% endif %}
+      loop: "{{ opa_policies.json.result }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: OPA health check
+      uri:
+        url: "{{ opa_url }}/health"
+        method: GET
+      register: opa_health
+
+    - name: Display health status
+      debug:
+        msg: "OPA health: {{ 'HEALTHY' if opa_health.status == 200 else 'UNHEALTHY' }}"

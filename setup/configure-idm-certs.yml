@@ -1,0 +1,251 @@
+---
+# configure-idm-certs.yml — Request IdM CA-signed TLS certificates for
+# workshop services that need trusted HTTPS endpoints.
+#
+# Creates:
+#   - DNS A records for each service hostname
+#   - IdM host entries and Kerberos service principals
+#   - TLS certificates signed by the IdM CA via ipa-getcert
+#
+# Prerequisites:
+#   - IdM is running on central (Phase 1 of upstream project)
+#   - Hosts are enrolled as IdM clients (enroll-idm-clients.yml)
+
+- name: Request IdM-Signed TLS Certificates for Workshop Services
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    idm_base_dn: "dc={{ idm_domain.split('.') | join(',dc=') }}"
+    idm_server_ip: "{{ ansible_host }}"
+    idm_service_certs:
+      - hostname: "wazuh.{{ idm_domain }}"
+        cert_dir: /opt/certs/wazuh
+      - hostname: "control.{{ idm_domain }}"
+        cert_dir: /opt/certs/control
+      - hostname: "splunk.{{ idm_domain }}"
+        cert_dir: /opt/certs/splunk
+
+  tasks:
+
+    - name: Verify IdM is running
+      command: ipactl status
+      register: idm_status
+      changed_when: false
+      failed_when: "'RUNNING' not in idm_status.stdout"
+
+    - name: Check RA agent certificate validity
+      shell: |
+        if [ -f /var/lib/ipa/ra-agent.pem ]; then
+          openssl x509 -in /var/lib/ipa/ra-agent.pem -noout -checkend 86400 2>/dev/null \
+            && echo "VALID" || echo "EXPIRED"
+        else
+          echo "MISSING"
+        fi
+      register: ra_agent_status
+      changed_when: false
+
+    - name: Display RA agent certificate status
+      debug:
+        msg: "RA agent certificate: {{ ra_agent_status.stdout }}"
+
+    - name: Renew IPA certificates (fixes RA agent auth issues)
+      command: ipa-certupdate
+      when: ra_agent_status.stdout != 'VALID'
+
+    - name: Restart IPA CA to pick up renewed certificates
+      shell: |
+        ipactl restart
+        sleep 10
+      when: ra_agent_status.stdout != 'VALID'
+
+    - name: Obtain Kerberos admin ticket
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+
+    - name: Verify CA can issue certificates
+      shell: |
+        ipa ca-show ipa 2>&1
+      register: ca_health
+      changed_when: false
+      failed_when: false
+
+    - name: Display CA health
+      debug:
+        msg: "{{ ca_health.stdout_lines | default(['CA check failed: ' + ca_health.stderr | default('unknown')]) }}"
+
+    - name: Force CA restart if CA check failed
+      shell: |
+        systemctl restart pki-tomcatd@pki-tomcat
+        sleep 15
+        ipactl restart
+        sleep 10
+      when: ca_health.rc != 0
+
+    - name: Re-obtain Kerberos ticket after restart
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+      when: ca_health.rc != 0 or ra_agent_status.stdout != 'VALID'
+
+    - name: Create certificate directories
+      file:
+        path: "{{ item.cert_dir }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.cert_dir }}"
+
+    - name: Add DNS A records for service hostnames
+      redhat.rhel_idm.ipadnsrecord:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        zone_name: "{{ idm_domain }}"
+        name: "{{ item.hostname.split('.')[0] }}"
+        record_type: A
+        record_value: "{{ idm_server_ip }}"
+        state: present
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+
+    - name: Register hosts in IdM
+      redhat.rhel_idm.ipahost:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ item.hostname }}"
+        force: true
+        state: present
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+
+    - name: Create Kerberos service principals
+      redhat.rhel_idm.ipaservice:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "HTTP/{{ item.hostname }}@{{ idm_realm }}"
+        host: "{{ item.hostname }}"
+        state: present
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "HTTP/{{ item.hostname }}"
+      register: svc_create
+      failed_when:
+        - svc_create is failed
+        - "'already a member' not in (svc_create.msg | default(''))"
+
+    - name: Grant central host permission to manage service certs
+      redhat.rhel_idm.ipaservice:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "HTTP/{{ item.hostname }}@{{ idm_realm }}"
+        host:
+          - "{{ item.hostname }}"
+          - "{{ inventory_hostname ~ '.' ~ idm_domain }}"
+        action: member
+        state: present
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "HTTP/{{ item.hostname }}"
+      register: svc_member
+      failed_when:
+        - svc_member is failed
+        - "'already a member' not in (svc_member.msg | default(''))"
+
+    - name: Stop tracking any stuck certmonger requests
+      shell: |
+        ipa-getcert stop-tracking -f {{ item.cert_dir }}/server.crt 2>/dev/null || true
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      changed_when: false
+
+    - name: Check for existing valid certificates
+      shell: |
+        if [ -f {{ item.cert_dir }}/server.crt ]; then
+          openssl x509 -in {{ item.cert_dir }}/server.crt -noout -checkend 3600 2>/dev/null && echo "VALID" || echo "EXPIRED"
+        else
+          echo "MISSING"
+        fi
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      register: cert_check
+      changed_when: false
+
+    - name: Generate RSA private key
+      command: >
+        openssl genrsa -out {{ item.item.cert_dir }}/server.key 4096
+      loop: "{{ cert_check.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }}"
+      when: item.stdout != 'VALID'
+
+    - name: Generate certificate signing request
+      command: >
+        openssl req -new
+        -key {{ item.item.cert_dir }}/server.key
+        -out {{ item.item.cert_dir }}/server.csr
+        -subj "/CN={{ item.item.hostname }}"
+      loop: "{{ cert_check.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }}"
+      when: item.stdout != 'VALID'
+
+    - name: Request certificate from IdM CA via ipa cert-request
+      shell: |
+        ipa cert-request {{ item.item.cert_dir }}/server.csr \
+          --principal=HTTP/{{ item.item.hostname }}@{{ idm_realm }} \
+          --certificate-out={{ item.item.cert_dir }}/server.crt
+      loop: "{{ cert_check.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }}"
+      when: item.stdout != 'VALID'
+      register: cert_request
+
+    - name: Clean up CSR files
+      file:
+        path: "{{ item.cert_dir }}/server.csr"
+        state: absent
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+
+    - name: Start certmonger tracking for auto-renewal
+      command: >
+        ipa-getcert start-tracking
+        -f {{ item.cert_dir }}/server.crt
+        -k {{ item.cert_dir }}/server.key
+        -K HTTP/{{ item.hostname }}@{{ idm_realm }}
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      register: tracking
+      failed_when: false
+      changed_when: "'already' not in (tracking.stderr | default(''))"
+
+    - name: Set certificate file permissions
+      file:
+        path: "{{ item.0.cert_dir }}/{{ item.1 }}"
+        mode: '0644'
+      loop: "{{ idm_service_certs | product(['server.crt', 'server.key']) | list }}"
+      loop_control:
+        label: "{{ item.0.cert_dir }}/{{ item.1 }}"
+
+    - name: Copy IdM CA root cert alongside each service cert
+      copy:
+        src: /etc/ipa/ca.crt
+        dest: "{{ item.cert_dir }}/ca.crt"
+        remote_src: true
+        mode: '0644'
+      loop: "{{ idm_service_certs }}"
+      loop_control:
+        label: "{{ item.cert_dir }}/ca.crt"
+
+    - name: Display certificate summary
+      debug:
+        msg: |
+          IdM CA Certificates Issued:
+          {% for cert in idm_service_certs %}
+            {{ cert.hostname }} → {{ cert.cert_dir }}/server.crt
+          {% endfor %}

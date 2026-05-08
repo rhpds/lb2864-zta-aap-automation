@@ -1,0 +1,327 @@
+---
+# site.yml — Deploy the entire ZTA Workshop lab in one run
+#
+# Structure:
+#   Phase 0 — Bootstrap Central (IdM, OPA, Podman networks, cEOS, firewall)
+#   Phase 1 — Prerequisites (DNS + IdM enrollment — must resolve before anything)
+#   Phase 2 — Deploy (stand up all infrastructure)
+#   Phase 3 — Configure (wire services together on running infra)
+#   Phase 4 — AAP Bootstrap (credentials, inventory — skip if students do Section 1)
+#   Phase 5 — Verify
+#
+# Error handling:
+#   Every step is followed by a host-error reset (_reset-errors.yml) so a
+#   failure in one playbook does NOT prevent subsequent playbooks from running.
+#   The final verify play will report what actually succeeded.
+#
+# Usage:
+#   ansible-playbook setup/site.yml                                # full deploy
+#   ansible-playbook setup/site.yml --tags deploy                  # only deploy infrastructure
+#   ansible-playbook setup/site.yml --tags configure               # only configure services
+#   ansible-playbook setup/site.yml --tags aap-bootstrap           # also pre-configure AAP
+#   ansible-playbook setup/site.yml --tags vault-ssh               # just Vault SSH CA trust
+#   ansible-playbook setup/site.yml --tags security                # Splunk + SPIRE
+#   ansible-playbook setup/site.yml --tags verify                  # verification only
+#   ansible-playbook setup/site.yml --skip-tags verify             # deploy without verify
+#
+# Every playbook has a unique tag (e.g. wazuh-server, wazuh-agents, vault-engines,
+# vault-ssh) so you can target any single step independently.
+#
+# Tag reference:
+#   ── Phase tags ──
+#   bootstrap       — Central host setup (IdM, OPA, cEOS, firewall) — run once
+#   prereq          — DNS, IdM client enrollment (must run first)
+#   deploy          — All infrastructure deployment tasks
+#   configure       — All service configuration tasks
+#   aap-bootstrap   — Pre-configure AAP credentials + inventory (skip for Section 1)
+#   verify          — Full lab verification
+#
+#   ── Component tags (unique per playbook) ──
+#   deploy-central  — IdM server, OPA, Podman networks, cEOS switches
+#   firewall        — Enable firewalld + open all workshop ports on central
+#   dns             — Register workshop VMs in IdM DNS + container resolv.conf
+#   idm-enroll      — Enroll Linux hosts as IdM clients
+#   arista          — Arista cEOS switch fabric
+#   containers      — RHEL containers (DB + App)
+#   db-app          — PostgreSQL database + Flask application
+#   netbox-deploy   — Deploy Netbox CMDB
+#   splunk-deploy   — Deploy Splunk log aggregation
+#   spire           — SPIFFE/SPIRE server and agents
+#   (wazuh-server   — Optional: Wazuh SIEM — only for Section 7)
+#   (wazuh-agents   — Optional: Wazuh agents — only for Section 7)
+#   dashboard       — ZTA Live Topology Dashboard
+#   idm-users       — IdM users and groups
+#   idm-certs       — IdM CA-signed TLS certificates
+#   vault-engines   — HashiCorp Vault engines and policies
+#   vault-ssh       — Vault SSH CA trust on RHEL hosts
+#   netbox-seed     — Seed Netbox with workshop data
+#   opa             — OPA base policies
+#   aap-policy      — AAP Policy as Code gateway
+#   aap-ldap        — AAP LDAP authentication
+#   aap-netbox      — AAP NetBox CMDB integration
+#   splunk-ship     — Splunk centralized log shipping
+#   (aap-eda        — Optional: Wazuh → EDA webhook — only for Section 7)
+#   keycloak        — Keycloak realm, LDAP federation, OIDC client, JWT OPA policies
+#   aap-project     — AAP project + execution environment
+#   aap-creds       — AAP credentials (Vault-sourced)
+#   aap-eda-setup   — EDA event stream + activation + Splunk webhook (run after aap-bootstrap)
+#   aap-inventory   — AAP static inventory
+#
+#   ── Group tags (span multiple playbooks) ──
+#   identity        — DNS, IdM enrollment, IdM users, certs, AAP LDAP, Keycloak
+#   secrets         — Vault engines + SSH CA
+#   network         — Arista + RHEL containers
+#   app             — DB + App deployment
+#   cmdb            — Netbox deploy + seed + AAP integration
+#   logging         — Splunk deploy + log shipping
+#   policy          — OPA + AAP Policy as Code
+#   security        — logging + spire (convenience group)
+#   aap             — All AAP-related configuration
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  PHASE 0 — Bootstrap Central
+#  IdM, OPA, Podman networks, cEOS switches, firewall
+# ═════════════════════════════════════════════════════════════════════
+
+- name: "Bootstrap 1: Deploy central — IdM, OPA, Podman networks, cEOS switches"
+  ansible.builtin.import_playbook: deploy-central.yml
+  tags: [bootstrap, deploy-central]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Bootstrap 2: Enable firewalld and open all workshop ports on central"
+  ansible.builtin.import_playbook: configure-firewall.yml
+  tags: [bootstrap, prereq, firewall]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  PHASE 1 — Prerequisites
+#  DNS + IdM enrollment so all hosts can resolve and authenticate
+# ═════════════════════════════════════════════════════════════════════
+
+- name: "Prereq 1: Register workshop VMs in IdM DNS"
+  ansible.builtin.import_playbook: configure-dns.yml
+  tags: [prereq, identity, dns]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Prereq 2: Enroll Linux hosts as IdM clients"
+  ansible.builtin.import_playbook: enroll-idm-clients.yml
+  tags: [prereq, identity, idm-enroll]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  PHASE 2 — Deploy
+#  Stand up all infrastructure — nothing is wired together yet
+# ═════════════════════════════════════════════════════════════════════
+
+- name: "Deploy 1: RHEL containers (DB + App)"
+  ansible.builtin.import_playbook: deploy-rhel-containers.yml
+  tags: [deploy, network, containers]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Deploy 3: PostgreSQL and Global Telemetry Platform"
+  ansible.builtin.import_playbook: deploy-db-app.yml
+  tags: [deploy, app, db-app]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Deploy 4: Netbox CMDB"
+  ansible.builtin.import_playbook: deploy-netbox.yml
+  tags: [deploy, cmdb, netbox-deploy]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Deploy 5: Splunk log aggregation"
+  ansible.builtin.import_playbook: deploy-splunk.yml
+  tags: [deploy, logging, splunk-deploy, security]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+# ── Wazuh (Optional — only needed for Section 7) ──────────────────
+# Uncomment if running the optional Wazuh-based incident response section.
+#
+# - name: "Deploy 6: Wazuh SIEM stack"
+#   ansible.builtin.import_playbook: deploy-wazuh.yml
+#   tags: [deploy, siem, wazuh, wazuh-server, security]
+#
+# - ansible.builtin.import_playbook: _reset-errors.yml
+#   tags: [always]
+#
+# - name: "Deploy 7: Wazuh agents on managed hosts"
+#   ansible.builtin.import_playbook: deploy-wazuh-agents.yml
+#   tags: [deploy, siem, wazuh, wazuh-agents, security]
+#
+# - ansible.builtin.import_playbook: _reset-errors.yml
+#   tags: [always]
+
+- name: "Deploy 8: SPIFFE/SPIRE server and agents"
+  ansible.builtin.import_playbook: deploy-spire.yml
+  tags: [deploy, spire, security]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Deploy 9: ZTA Live Topology Dashboard"
+  ansible.builtin.import_playbook: deploy-dashboard.yml
+  tags: [deploy, dashboard]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  PHASE 3 — Configure
+#  Wire services together — all infrastructure is running
+# ═════════════════════════════════════════════════════════════════════
+
+- name: "Configure 1: IdM users and groups"
+  ansible.builtin.import_playbook: configure-idm-users.yml
+  tags: [configure, identity, idm-users]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 2: IdM CA-signed TLS certificates for services"
+  ansible.builtin.import_playbook: configure-idm-certs.yml
+  tags: [configure, identity, idm-certs]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 3: HashiCorp Vault engines and policies"
+  ansible.builtin.import_playbook: configure-vault.yml
+  tags: [configure, secrets, vault-engines]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 4: Vault SSH CA trust on all RHEL hosts"
+  ansible.builtin.import_playbook: configure-vault-ssh.yml
+  tags: [configure, secrets, vault-ssh]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 5: Seed Netbox with workshop infrastructure"
+  ansible.builtin.import_playbook: configure-netbox.yml
+  tags: [configure, cmdb, netbox-seed]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 6: OPA base policies"
+  ansible.builtin.import_playbook: configure-opa-base.yml
+  tags: [configure, policy, opa]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 7: AAP Policy as Code gateway"
+  ansible.builtin.import_playbook: configure-aap-policy.yml
+  tags: [configure, policy, aap, aap-policy]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 8: AAP LDAP authentication"
+  ansible.builtin.import_playbook: configure-aap-ldap.yml
+  tags: [configure, identity, aap, aap-ldap]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 9: AAP NetBox CMDB integration"
+  ansible.builtin.import_playbook: configure-aap-netbox.yml
+  tags: [configure, cmdb, aap, aap-netbox]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+# ── Wazuh EDA (Optional — only needed for Section 7) ──────────────
+# - name: "Configure 10: Wazuh → EDA webhook integration"
+#   ansible.builtin.import_playbook: configure-wazuh-eda.yml
+#   tags: [configure, siem, aap-eda, security]
+#
+# - ansible.builtin.import_playbook: _reset-errors.yml
+#   tags: [always]
+
+- name: "Configure 11: Splunk centralized log shipping"
+  ansible.builtin.import_playbook: integrate-splunk.yml
+  tags: [configure, logging, splunk-ship]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "Configure 12: Keycloak realm, IdM LDAP federation, OIDC + JWT policies"
+  ansible.builtin.import_playbook: configure-keycloak.yml
+  tags: [configure, identity, keycloak]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  PHASE 4 — AAP Bootstrap (optional — skip if students do Section 1)
+#  Pre-creates AAP credentials + inventory so you can jump to Section 2
+#  Only runs when explicitly requested: --tags aap-bootstrap
+# ═════════════════════════════════════════════════════════════════════
+
+- name: "AAP Bootstrap 1: Create AAP project and execution environment"
+  ansible.builtin.import_playbook: configure-aap-project.yml
+  tags: [aap-bootstrap, aap, aap-project]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "AAP Bootstrap 2: Create all AAP credentials (Vault-sourced)"
+  ansible.builtin.import_playbook: configure-aap-credentials.yml
+  tags: [aap-bootstrap, aap, aap-creds]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "AAP Bootstrap 3: Create AAP static inventory"
+  ansible.builtin.import_playbook: configure-aap-inventory.yml
+  tags: [aap-bootstrap, aap, aap-inventory]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+
+- name: "AAP Bootstrap 4: Configure EDA event stream and activation"
+  ansible.builtin.import_playbook: configure-aap-project.yml
+  tags: [aap-eda-setup, eda]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+- name: "AAP Bootstrap 5: Configure Splunk → EDA webhook"
+  ansible.builtin.import_playbook: configure-splunk-eda.yml
+  tags: [aap-eda-setup, splunk-eda]
+
+- ansible.builtin.import_playbook: _reset-errors.yml
+  tags: [always]
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  PHASE 5 — Verify
+# ═════════════════════════════════════════════════════════════════════
+
+- name: "Verify: Full lab deployment"
+  ansible.builtin.import_playbook: verify-lab.yml
+  tags: [verify]

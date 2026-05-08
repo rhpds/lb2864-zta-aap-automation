@@ -1,0 +1,266 @@
+= Section 3 -- AAP Policy as Code: platform-gated patching
+:toc: left
+:toclevels: 3
+:icons: font
+:idprefix:
+:idseparator: -
+
+Companion to `section3/README.md`. Demonstrates **AAP -> OPA gateway** blocking launches before playbooks run.
+
+include::../../docs/lab/common-environment.adoc[]
+
+[IMPORTANT]
+.Prerequisites -- verify these before starting
+====
+Section 3 depends on several services and configurations from earlier sections.
+Run the checklist below from `central` or `control` before starting the exercises.
+
+*1. LDAP authentication on the controller*
+
+Students must be able to log into AAP as IdM users (`ztauser`, `neteng`, `appdev`, etc.) with their group memberships visible. If you have not completed **Exercise 1.2** (LDAP via **Access Management -> Authentication Methods**) the gateway policy cannot evaluate group membership and every launch will be denied.
+
+*2. OPA policies loaded on central*
+
+The gateway policy (`aap.gateway`) and patching policy (`zta.patching`) must be loaded:
+
+[source,bash]
+----
+# Both should return JSON with a "result" key
+curl -s http://central.zta.lab:8181/v1/data/aap/gateway | python3 -m json.tool | head -3
+curl -s http://central.zta.lab:8181/v1/data/zta/patching | python3 -m json.tool | head -3
+----
+
+If either returns empty or errors, load them:
+
+[source,bash]
+----
+ansible-playbook -i inventory/hosts.ini setup/configure-opa-base.yml
+----
+
+*3. AAP Policy as Code integration*
+
+The controller must call OPA before every job launch (decision path `v1/data/aap/gateway/decision`). Verify under *Settings -> Policy as Code* in the controller UI, or deploy it:
+
+[source,bash]
+----
+ansible-playbook -i inventory/hosts.ini setup/configure-aap-policy.yml
+----
+
+*4. Section 3 job templates and RBAC*
+
+The **Apply Security Patch** template (and others) must exist in AAP with team RBAC grants so LDAP users can see them:
+
+[source,bash]
+----
+ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags section3,rbac
+----
+
+*5. Quick smoke test*
+
+[source,bash]
+----
+# AAP gateway policy responds
+curl -sk -u admin:ansible123! \
+  "https://control.zta.lab/api/controller/v2/settings/opa/" | python3 -m json.tool | head -5
+
+# Section 3 templates exist
+curl -sk -u admin:ansible123! \
+  "https://control.zta.lab/api/controller/v2/job_templates/?name__icontains=patch" \
+  | python3 -m json.tool | grep '"name"'
+----
+
+If all five checks pass you are ready for Section 3.
+====
+
+== Overview
+
+_ZTA concept: *Platform-level enforcement* -- the automation platform itself enforces policy before any playbook runs, so even a playbook with no internal checks cannot bypass authorisation._
+
+Template name contains **Patch** -> `aap.gateway` requires the **Infrastructure** or **Security** AAP team. Wrong users never start the playbook.
+
+[IMPORTANT]
+.AAP Policy as Code: enforcement moves to the platform
+====
+In Section 2, OPA ran **inside** the workflow. Here, **AAP itself** asks OPA before starting the job. That is **Policy as Code on the automation platform**: even a playbook with *no* internal `uri` call to OPA cannot bypass the gate, because the **PEP (AAP)** refuses to enqueue the run. This is the key Ansible advantage -- enforcement is **built into the platform**, not bolted onto individual playbooks. It models **separation of duties** -- only the right **team** may even *attempt* patching templates -- and shrinks the "I'll run ansible by hand" insider risk if your production design wires the same gateway for all changes.
+
+AAP 2.6 sends the full job context to OPA, including `created_by.teams` (the user's AAP team memberships, populated via LDAP). The policy checks these teams -- not raw IdM groups -- for its decisions.
+====
+
+|===
+| Template pattern | Required AAP team (gateway)
+| Patch | Infrastructure or Security
+| VLAN / Network | Infrastructure
+| Deploy, Credential, Application | Applications or DevOps
+| Everything else | Any authenticated user
+|===
+
+[TIP]
+.Ansible + OPA: risk classification at scale
+====
+The gateway policy uses **resource metadata** (here, template name substrings) as a coarse **risk classifier**. AAP makes this practical at scale -- every template launch, whether from the UI, API, or scheduled job, passes through the same OPA gate. Production policies often add **inventory tags, execution environments, survey variables, or SAML claims** -- the idea is the same: **encode risk in attributes** the PDP can evaluate consistently, not in tribal knowledge about "who is allowed to click what."
+====
+
+== Exercise 3.1 -- Job template
+
+_ZTA concept: *Controlled change channels* -- high-risk operations like patching must flow through gated automation, not ad-hoc SSH sessions._
+
+|===
+| Name | Apply Security Patch
+| Playbook | `section3/playbooks/apply-security-patch.yml`
+| Inventory | ZTA Lab Inventory
+| Credential | ZTA Machine Credential
+| Survey | `target_host` (default `app`)
+|===
+
+**Important:** name must include "Patch" for the lab gateway rule.
+
+[TIP]
+.Ansible audit trail: every launch leaves evidence
+====
+Denied launches still generate **AAP audit events** -- useful when investigating "who tried to patch during the freeze window?" In ZTA, **every decision should leave evidence**, whether allow or deny. AAP captures the user, timestamp, template, survey inputs, and the OPA decision -- a complete forensic record that CLI-based patching can never provide.
+====
+
+== Exercise 3.2 -- Blocked launch
+
+_ZTA concept: *Deny by default at the platform* -- unauthorised users are blocked before the playbook even starts, not after it runs and potentially causes damage._
+
+As `neteng`, launch template -> AAP denies at platform level (playbook never runs).
+
+[TIP]
+.AAP Policy as Code: stronger than hiding buttons
+====
+Traditional RBAC might hide templates or rely on operator discipline. **AAP's Policy as Code** makes denial **explicit and uniform** -- the same OPA decision applies to UI clicks, API calls, and scheduled jobs. This eliminates **policy drift** between teams, makes exceptions visible in Git-tracked Rego, and ensures the gate cannot be bypassed by switching to the API or CLI. The playbook **never executes** -- no partial changes, no rollback needed.
+====
+
+== Exercise 3.3 -- Fix access
+
+_ZTA concept: *Continuous authorisation* -- access is granted by identity attributes in the directory, not static platform configuration. Revoking group membership closes the gate instantly._
+
+* Use `ztauser` (already in the **Infrastructure** AAP team via LDAP), or
+* Add `neteng` to the `team-infrastructure` IdM group so LDAP maps them into the Infrastructure team: `ipa group-add-member team-infrastructure --users=neteng`
+
+[TIP]
+.Ansible + IdM: identity changes flow to AAP automatically
+====
+Granting `team-infrastructure` in IdM is how the organisation says "this identity may initiate high-risk automation." The next time `neteng` logs into AAP, LDAP syncs the new group membership and AAP team assignment. Revoking the group later **closes the gate** without redeploying AAP or editing templates. This is **continuous authorisation** tied to the directory -- Ansible and AAP just consume the identity attributes; the identity provider is the source of truth.
+====
+
+== Exercise 3.4 -- Successful patch
+
+_ZTA concept: *Security hardening as code* -- defensive configuration (banner, SSH hardening, password policy, audit rules) is delivered through the same controlled automation channel as operational changes._
+
+As `ztauser`, patch `app`. Expect banner, SSH hardening, password policy, audit rules (playbook output).
+
+[TIP]
+.Ansible: consistent hardening across every host
+====
+Once launch is authorised, the playbook applies **defensive configuration** (banner, `sshd`, password quality, audit). Ansible ensures these settings are **identical across every target host** -- no drift from manual edits, no forgotten servers. ZTA is not only gates at the edge -- it includes **measurable security posture** on endpoints, delivered and enforced *through* the same controlled automation channel that required authorisation to use in the first place.
+====
+
+== Exercise 3.5 -- Verify on host
+
+_ZTA concept: *Observable state* -- trust is based on what the host actually enforces, not on whether the job reported success._
+
+[source,bash]
+----
+ssh -p 2023 rhel@central.zta.lab
+sudo sshd -T | grep -E 'permitrootlogin|maxauthtries|permitemptypasswords'
+----
+
+[TIP]
+.Ansible: verify outcomes, not just intentions
+====
+Spot-checking `sshd -T` and audit rules proves **the control landed**. In production, Ansible can automate this verification as a follow-up job -- AAP schedules a compliance scan after every patch run to confirm the intended state matches reality. Zero Trust operations depend on **observable state** (what the host actually enforces), not only on "the job was green."
+====
+
+== Exercise 3.6 -- Other scenarios
+
+_ZTA concept: *Separation of duties* -- different risk classes of automation require different team memberships, enforced by policy, not convention._
+
+* `appdev` cannot launch patch template (not in Infrastructure or Security team).
+* If you added `neteng` to `team-infrastructure` in Exercise 3.3, remove them now and confirm deny again: `ipa group-remove-member team-infrastructure --users=neteng`
+
+[TIP]
+.Ansible + OPA: machine-enforced separation of duties
+====
+`appdev` can deploy (Section 2) but must **not** silently patch servers -- that is a different risk class. AAP + OPA enforce this **in the platform**, not in documentation. Mapping **different AAP teams** (via IdM groups and LDAP) to **different template families** encodes **SoD** in machine-readable, Git-tracked Rego policy. If an auditor asks "can the app team patch servers?" -- the answer is in the policy, not in someone's memory.
+====
+
+== Hands-on: Write a Rego data classification policy
+
+_ZTA concept: *Policy as code* -- security policies are version-controlled, testable code, not tribal knowledge or spreadsheet rules._
+
+This exercise gives you a **skeleton Rego file** with the helper function and decision object already done. Your job is to write the four `allow` rules that implement the data classification tiers.
+
+[IMPORTANT]
+.What to do
+====
+. Open `opa-policies/data_classification_student.rego` in a text editor (or view it in Gitea).
+. Read the classification levels at the top:
+  * `public` -- any authenticated user (non-empty username)
+  * `internal` -- `app-deployers` OR `db-admins`
+  * `confidential` -- `db-admins` only
+  * `pii` -- `security-ops` AND `db-admins` (both required)
+. Uncomment each `allow` rule and replace the `FILL_IN` placeholders.
+. Deploy your policy to OPA on central:
++
+[source,bash]
+----
+# Copy your file to central (replacing the existing policy)
+scp opa-policies/data_classification_student.rego \
+  rhel@central.zta.lab:/tmp/data_classification.rego
+ssh rhel@central.zta.lab \
+  "sudo cp /tmp/data_classification.rego /opt/opa/policies/data_classification.rego && sudo podman restart opa"
+----
+. Test with `curl` (examples are in the skeleton file comments):
++
+[source,bash]
+----
+# Public -- should allow
+curl -s -X POST http://central.zta.lab:8181/v1/data/zta/data_classification/decision \
+  -d '{"input":{"user":"appdev","user_groups":["app-deployers"],"data_classification":"public"}}' \
+  | python3 -m json.tool
+
+# PII -- should DENY security-ops alone
+curl -s -X POST http://central.zta.lab:8181/v1/data/zta/data_classification/decision \
+  -d '{"input":{"user":"spatel","user_groups":["security-ops"],"data_classification":"pii"}}' \
+  | python3 -m json.tool
+
+# PII -- should ALLOW dual-group user
+curl -s -X POST http://central.zta.lab:8181/v1/data/zta/data_classification/decision \
+  -d '{"input":{"user":"nobrien","user_groups":["db-admins","security-ops"],"data_classification":"pii"}}' \
+  | python3 -m json.tool
+----
+====
+
+[cols="1,2,2",options="header"]
+|===
+| Rule | Classification | Key logic
+| 1 | `public` | Check `input.user != ""`
+| 2 | `internal` | Two separate rules for OR (one per group)
+| 3 | `confidential` | Single group check
+| 4 | `pii` | Both groups in ONE rule body (AND, not OR)
+|===
+
+[WARNING]
+.The OR vs AND trap
+====
+Rego's `allow if { ... }` rules combine via **OR** -- if ANY rule body is true, `allow` is true. To require **AND** (both groups), both checks must be in the **same** rule body. Putting them in separate rules creates OR logic -- this is the most common Rego bug and is exactly what the "buggy" version in Section 3B gets wrong.
+====
+
+[TIP]
+.Why write policy by hand?
+====
+AAP, OPA, and Vault are tools -- but the **policy logic** (who may access what, under which conditions) is your organisation's security posture expressed in code. A typo in Rego can **over-allow** PII access while every dashboard looks green. Writing and testing policy rules -- with negative tests -- is as important as writing the playbooks that enforce them.
+====
+
+== Validation checklist
+
+* [ ] Platform deny for unauthorised user (e.g. `neteng` blocked at gateway)
+* [ ] Success for user in Infrastructure or Security team (e.g. `ztauser`)
+* [ ] Banner and hardening visible on target
+* [ ] Student Rego policy deployed and tested: public allows, PII denies single-group, PII allows dual-group
+
+== Extended: Section 3B -- OPA Rego break/fix (instructor-led)
+
+include::includes/section-3b-rego.adoc[]

@@ -1,0 +1,660 @@
+---
+# deploy-central.yml — Bootstrap central as the workshop infrastructure host
+#
+# Installs and configures:
+#   - Base packages (podman, git, jq, python modules, etc.)
+#   - Podman container networks for the switch fabric and services
+#   - FreeIPA (IdM) server with integrated DNS
+#   - OPA (Open Policy Agent) container
+#   - Keycloak (Red Hat Build of Keycloak) OIDC provider
+#   - Arista cEOS switch containers (ceos1, ceos2, ceos3)
+#
+# This playbook is idempotent: it detects existing installations and skips
+# steps that have already been completed.
+#
+# Prerequisites:
+#   - central.zta.lab has a RHEL 9.x base install
+#   - central has at least 16 GB RAM and 50 GB disk
+#   - /etc/hostname is set to central.zta.lab
+#   - The management interface has a static IP (192.168.1.11/24)
+#
+# Services exposed after completion:
+#   - IdM web UI:     https://central.zta.lab/ipa
+#   - IdM Kerberos:   central.zta.lab:88
+#   - IdM LDAP/S:     central.zta.lab:389/636
+#   - OPA API:        http://central.zta.lab:8181
+#   - Keycloak:       https://central.zta.lab:8543
+#   - cEOS SSH:       central.zta.lab:2001-2003
+#   - cEOS eAPI:      central.zta.lab:6031-6033
+#
+# Tags (one per phase, combinable):
+#   base        — Phase 1: SELinux, sysrq, packages, collections
+#   networking  — Phase 2: hostname, /etc/hosts
+#   idm         — Phase 3: FreeIPA server install & DNS
+#   podman      — Phase 4: container networks
+#   opa         — Phase 5 + systemd: Open Policy Agent
+#   keycloak    — Phase 6 + systemd: Red Hat Build of Keycloak
+#   arista      — Phase 7 + systemd: cEOS switches & DNAT fix
+#   systemd     — Phase 8: all systemd unit generation/enablement
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml --skip-tags arista
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml --skip-tags keycloak,arista
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml --skip-tags idm
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml --tags arista
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml --tags keycloak
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-central.yml --tags opa,podman
+#
+# Red Hat registry credentials (needed for Keycloak RHBK image pull):
+#   -e rh_registry_username=<your-rh-user> -e rh_registry_password=<your-rh-token>
+#   Or pre-login on the host: podman login registry.redhat.io
+
+- name: Deploy Central — Workshop Infrastructure Host
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    central_fqdn: "{{ idm_hostname }}"
+    central_ip: "{{ ansible_host | default('192.168.1.11') }}"
+    upstream_dns: "{{ upstream_dns_server | default('8.8.8.8') }}"
+
+    rh_registry: registry.redhat.io
+    rh_registry_user: "{{ rh_registry_username | default('') }}"
+    rh_registry_pass: "{{ rh_registry_password | default('') }}"
+
+    keycloak_image: "{{ rh_registry }}/rhbk/keycloak-rhel9:24"
+    keycloak_container_name: keycloak
+    keycloak_admin_user: admin
+    keycloak_admin_password: "{{ idm_admin_password }}"
+    keycloak_http_port: 8180
+    keycloak_https_port: 8543
+    keycloak_certs_dir: /opt/keycloak/certs
+
+    ceos_image: quay.io/nmartins/ceoslab-rh
+    ceos_memory: 4g
+    switch_config_dir: "{{ playbook_dir }}/switch-configs"
+
+    podman_networks:
+      - management
+      - net1
+      - net2
+      - net3
+
+    ceos_switches:
+      - name: ceos1
+        config: sw01
+        ssh_port: 2001
+        eapi_port: 6031
+        networks: [net1, net3]
+      - name: ceos2
+        config: sw02
+        ssh_port: 2002
+        eapi_port: 6032
+        networks: [net1, net2]
+      - name: ceos3
+        config: sw03
+        ssh_port: 2003
+        eapi_port: 6033
+        networks: [net2, net3]
+
+  tasks:
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Base Packages
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 1 | Set SELinux to permissive (required for cEOS containers)"
+      tags: [base]
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+
+    - name: "Phase 1 | Disable SysRq to prevent cEOS from remounting host filesystem read-only"
+      tags: [base]
+      ansible.posix.sysctl:
+        name: kernel.sysrq
+        value: '0'
+        sysctl_file: /etc/sysctl.d/99-no-sysrq.conf
+        reload: true
+        state: present
+      failed_when: false
+
+    - name: "Phase 1 | Install base packages"
+      tags: [base]
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - python3-podman
+          - python3-pip
+          - python3-dns
+          - python3-netaddr
+          - git
+          - jq
+          - curl
+          - openssl
+          - firewalld
+          - sshpass
+        state: present
+
+    - name: "Phase 1 | Install required Ansible collections"
+      tags: [base]
+      ansible.builtin.command:
+        cmd: "ansible-galaxy collection install {{ item }} --force"
+      loop:
+        - community.general
+        - ansible.posix
+        - ansible.netcommon
+        - arista.eos
+        - redhat.rhel_idm
+        - containers.podman
+      changed_when: false
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Hostname & Networking
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 2 | Set hostname"
+      tags: [networking]
+      ansible.builtin.hostname:
+        name: "{{ central_fqdn }}"
+
+    - name: "Phase 2 | Ensure /etc/hosts has central entry"
+      tags: [networking]
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '.*central\.zta\.lab.*'
+        line: "{{ central_ip }}  {{ central_fqdn }} central"
+        state: present
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — FreeIPA (IdM) Server
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 3 | Check if IdM is already installed"
+      tags: [idm]
+      ansible.builtin.stat:
+        path: /etc/ipa/default.conf
+      register: ipa_installed
+
+    - name: "Phase 3 | Install IdM server packages"
+      tags: [idm]
+      ansible.builtin.dnf:
+        name:
+          - ipa-server
+          - ipa-server-dns
+          - ipa-server-trust-ad
+        state: present
+      when: not ipa_installed.stat.exists
+
+    - name: "Phase 3 | Install IdM server (unattended)"
+      tags: [idm]
+      ansible.builtin.command:
+        cmd: >
+          ipa-server-install
+            --realm={{ idm_realm }}
+            --domain={{ idm_domain }}
+            --ds-password='{{ idm_dm_password }}'
+            --admin-password='{{ idm_admin_password }}'
+            --hostname={{ central_fqdn }}
+            --setup-dns
+            --forwarder={{ upstream_dns }}
+            --no-ntp
+            --unattended
+      when: not ipa_installed.stat.exists
+      register: ipa_install
+      changed_when: ipa_install.rc == 0
+
+    - name: "Phase 3 | Verify IdM services are running"
+      tags: [idm]
+      ansible.builtin.command: ipactl status
+      register: ipa_status
+      changed_when: false
+      failed_when: "'RUNNING' not in ipa_status.stdout"
+
+    - name: "Phase 3 | Obtain Kerberos admin ticket"
+      tags: [idm]
+      ansible.builtin.shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+
+    - name: "Phase 3 | Restrict IdM DNS (named) to host IP only"
+      tags: [idm]
+      ansible.builtin.lineinfile:
+        path: /etc/named/ipa-options-ext.conf
+        line: '{{ item }}'
+        create: true
+        mode: '0640'
+        owner: root
+        group: named
+      loop:
+        - "listen-on { 127.0.0.1; {{ central_ip }}; };"
+        - "listen-on-v6 { ::1; };"
+      register: named_listen
+
+    - name: "Phase 3 | Restart named after listen address change"
+      tags: [idm]
+      ansible.builtin.service:
+        name: named
+        state: restarted
+      when: named_listen.changed
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Podman Container Networks
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 4 | Check existing Podman networks"
+      tags: [podman]
+      ansible.builtin.command: podman network ls --format '{{ '{{' }}.Name{{ '}}' }}'
+      register: existing_networks
+      changed_when: false
+
+    - name: "Phase 4 | Create Podman networks"
+      tags: [podman]
+      ansible.builtin.command: "podman network create {{ item }}"
+      loop: "{{ podman_networks }}"
+      when: item not in existing_networks.stdout_lines
+      register: network_create
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — OPA (Open Policy Agent)
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 5 | Check if OPA container exists"
+      tags: [opa]
+      ansible.builtin.command: podman inspect --format '{% raw %}{{.State.Status}}{% endraw %}' {{ opa_container_name }}
+      register: opa_state
+      failed_when: false
+      changed_when: false
+
+    - name: "Phase 5 | Create OPA policy directory"
+      tags: [opa]
+      ansible.builtin.file:
+        path: "{{ opa_policy_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: "Phase 5 | Deploy OPA container"
+      tags: [opa]
+      ansible.builtin.command: >
+        podman run -d
+          --name={{ opa_container_name }}
+          --restart=always
+          -p 8181:8181
+          -v {{ opa_policy_dir }}:/policies:z
+          docker.io/openpolicyagent/opa:latest
+          run --server --addr=0.0.0.0:8181 /policies
+      when: opa_state.rc != 0
+
+    - name: "Phase 5 | Ensure OPA container is running"
+      tags: [opa]
+      ansible.builtin.command: podman start {{ opa_container_name }}
+      when: opa_state.rc == 0 and 'running' not in opa_state.stdout
+      register: opa_start
+      changed_when: opa_start.rc == 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6 — Keycloak (Red Hat Build of Keycloak)
+    #   Tag: keycloak — skip with --skip-tags keycloak
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 6 | Deploy Keycloak (RHBK)"
+      tags: [keycloak]
+      block:
+        - name: "Phase 6 | Create Keycloak certificate directory"
+          ansible.builtin.file:
+            path: "{{ keycloak_certs_dir }}"
+            state: directory
+            mode: '0755'
+
+        - name: "Phase 6 | Check for existing Keycloak TLS certificate"
+          ansible.builtin.stat:
+            path: "{{ keycloak_certs_dir }}/server.crt"
+          register: keycloak_cert
+
+        - name: "Phase 6 | Generate self-signed TLS certificate for Keycloak"
+          ansible.builtin.command: >
+            openssl req -x509 -newkey rsa:4096
+              -keyout {{ keycloak_certs_dir }}/server.key
+              -out {{ keycloak_certs_dir }}/server.crt
+              -sha256 -days 365 -nodes
+              -subj '/CN={{ central_fqdn }}'
+              -addext 'subjectAltName=DNS:{{ central_fqdn }}'
+          when: not keycloak_cert.stat.exists
+
+        - name: "Phase 6 | Set Keycloak certificate permissions"
+          ansible.builtin.file:
+            path: "{{ keycloak_certs_dir }}/{{ item }}"
+            mode: '0644'
+          loop:
+            - server.crt
+            - server.key
+          when: not keycloak_cert.stat.exists
+
+        - name: "Phase 6 | Check if RHBK image is already present"
+          ansible.builtin.command: podman image exists {{ keycloak_image }}
+          register: keycloak_image_check
+          failed_when: false
+          changed_when: false
+
+        - name: "Phase 6 | Check for existing {{ rh_registry }} auth"
+          ansible.builtin.command: podman login --get-login {{ rh_registry }}
+          register: rh_registry_auth_check
+          failed_when: false
+          changed_when: false
+          when: keycloak_image_check.rc != 0
+
+        - name: "Phase 6 | Login to {{ rh_registry }}"
+          ansible.builtin.command: >
+            podman login {{ rh_registry }}
+              --username={{ rh_registry_user }}
+              --password={{ rh_registry_pass }}
+          no_log: true
+          when:
+            - keycloak_image_check.rc != 0
+            - rh_registry_auth_check.rc != 0
+            - rh_registry_user | length > 0
+
+        - name: "Phase 6 | Fail if {{ rh_registry }} auth is unavailable"
+          ansible.builtin.fail:
+            msg: >-
+              RHBK image not cached and no {{ rh_registry }} credentials available.
+              Either pre-login on the host (podman login {{ rh_registry }}) or pass
+              -e rh_registry_username=<user> -e rh_registry_password=<token>
+          when:
+            - keycloak_image_check.rc != 0
+            - rh_registry_auth_check.rc != 0
+            - rh_registry_user | length == 0
+
+        - name: "Phase 6 | Pull RHBK image"
+          ansible.builtin.command: podman pull {{ keycloak_image }}
+          register: keycloak_pull
+          changed_when: "'Copying' in keycloak_pull.stderr or 'Copying' in keycloak_pull.stdout"
+          when: keycloak_image_check.rc != 0
+
+        - name: "Phase 6 | Check if Keycloak container exists"
+          ansible.builtin.command: podman inspect --format '{% raw %}{{.State.Status}}{% endraw %}' {{ keycloak_container_name }}
+          register: keycloak_state
+          failed_when: false
+          changed_when: false
+
+        - name: "Phase 6 | Deploy Keycloak container"
+          ansible.builtin.command: >
+            podman run -d
+              --name={{ keycloak_container_name }}
+              -p {{ keycloak_http_port }}:8080
+              -p {{ keycloak_https_port }}:8443
+              -e KEYCLOAK_ADMIN={{ keycloak_admin_user }}
+              -e KEYCLOAK_ADMIN_PASSWORD={{ keycloak_admin_password }}
+              -e KC_HOSTNAME={{ central_fqdn }}
+              -e KC_HTTPS_CERTIFICATE_FILE=/opt/certs/server.crt
+              -e KC_HTTPS_CERTIFICATE_KEY_FILE=/opt/certs/server.key
+              -e KC_HTTP_ENABLED=true
+              -v {{ keycloak_certs_dir }}:/opt/certs:Z
+              {{ keycloak_image }}
+              start
+                --hostname={{ central_fqdn }}
+                --https-port=8443
+                --http-enabled=true
+                --health-enabled=true
+          when: keycloak_state.rc != 0
+
+        - name: "Phase 6 | Ensure Keycloak container is running"
+          ansible.builtin.command: podman start {{ keycloak_container_name }}
+          when: keycloak_state.rc == 0 and 'running' not in keycloak_state.stdout
+          register: keycloak_start
+          changed_when: keycloak_start.rc == 0
+
+        - name: "Phase 6 | Wait for Keycloak to become healthy (up to 90s)"
+          ansible.builtin.uri:
+            url: "https://localhost:{{ keycloak_https_port }}/health/ready"
+            validate_certs: false
+            status_code: [200]
+          register: keycloak_health
+          until: keycloak_health.status == 200
+          retries: 18
+          delay: 5
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Arista cEOS Switches
+    #   Tag: arista — skip with --skip-tags arista
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 7 | Deploy Arista cEOS switches"
+      tags: [arista]
+      block:
+        - name: "Phase 7 | Pull cEOS image"
+          ansible.builtin.command: podman pull {{ ceos_image }}
+          register: pull_result
+          changed_when: "'Copying' in pull_result.stderr or 'Copying' in pull_result.stdout"
+
+        - name: "Phase 7 | Check if switch containers exist"
+          ansible.builtin.command: "podman inspect --format '{% raw %}{{.State.Status}}{% endraw %}' {{ item.name }}"
+          loop: "{{ ceos_switches }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: switch_states
+          failed_when: false
+          changed_when: false
+
+        - name: "Phase 7 | Deploy cEOS containers"
+          ansible.builtin.command: >
+            podman run -d
+              --privileged
+              --restart=always
+              --network management
+              --memory={{ ceos_memory }}
+              --name={{ item.item.name }}
+              -v {{ switch_config_dir }}/{{ item.item.config }}/{{ item.item.config }}:/mnt/flash/startup-config
+              -e INTFTYPE=eth
+              -e ETBA=1
+              -e SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1
+              -e CEOS=1
+              -e EOS_PLATFORM=ceoslab
+              -e container=podman
+              -p {{ item.item.ssh_port }}:22/tcp
+              -p {{ item.item.eapi_port }}:6030
+              {{ ceos_image }}
+              /sbin/init
+              systemd.setenv=INTFTYPE=eth
+              systemd.setenv=ETBA=1
+              systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1
+              systemd.setenv=CEOS=1
+              systemd.setenv=EOS_PLATFORM=ceoslab
+              systemd.setenv=container=podman
+          loop: "{{ switch_states.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          when: item.rc != 0
+
+        - name: "Phase 7 | Attach additional networks to switches"
+          ansible.builtin.command: "podman network connect {{ net }} {{ item.0.name }}"
+          loop: "{{ ceos_switches | subelements('networks') }}"
+          loop_control:
+            label: "{{ item.0.name }} → {{ net }}"
+          vars:
+            net: "{{ item.1 }}"
+          register: net_connect
+          failed_when:
+            - net_connect.rc != 0
+            - "'already connected' not in (net_connect.stderr | default(''))"
+          changed_when: net_connect.rc == 0
+
+        - name: "Phase 7 | Fix DNAT rules — keep only management network port forwarding"
+          ansible.builtin.shell: |
+            MGMT_IP=$(podman inspect {{ item.name }} \
+              --format '{%raw%}{{(index .NetworkSettings.Networks "management").IPAddress}}{%endraw%}')
+            for port in {{ item.ssh_port }} {{ item.eapi_port }}; do
+              iptables -t nat -S | grep -E "dport ${port}\b.*DNAT" | grep -v "${MGMT_IP}" | \
+                sed 's/^-A/-D/' | while IFS= read -r rule; do
+                  eval iptables -t nat "$rule" 2>/dev/null || true
+                done
+            done
+          loop: "{{ ceos_switches }}"
+          loop_control:
+            label: "{{ item.name }}"
+          changed_when: true
+
+        - name: "Phase 7 | Ensure switch containers are running"
+          ansible.builtin.command: "podman start {{ item.name }}"
+          loop: "{{ ceos_switches }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: switch_start
+          changed_when: switch_start.rc == 0
+
+        - name: "Phase 7 | Wait for switches to initialise (60s)"
+          ansible.builtin.pause:
+            seconds: 60
+            prompt: "Waiting for cEOS switches to load startup-config..."
+          when: switch_states.results | selectattr('rc', 'ne', 0) | list | length > 0
+
+        - name: "Phase 7 | Verify SSH is reachable on each switch"
+          ansible.builtin.wait_for:
+            host: localhost
+            port: "{{ item.ssh_port }}"
+            timeout: 30
+          loop: "{{ ceos_switches }}"
+          loop_control:
+            label: "{{ item.name }} (port {{ item.ssh_port }})"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 8 — Systemd Services (auto-start on reboot)
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: "Phase 8 | Generate systemd service for OPA"
+      tags: [opa, systemd]
+      containers.podman.podman_generate_systemd:
+        name: "{{ opa_container_name }}"
+        dest: /etc/systemd/system/
+        restart_policy: always
+        new: false
+
+    - name: "Phase 8 | Enable OPA systemd service"
+      tags: [opa, systemd]
+      ansible.builtin.systemd:
+        name: "container-{{ opa_container_name }}"
+        enabled: true
+        daemon_reload: true
+
+    - name: "Phase 8 | Keycloak systemd service"
+      tags: [keycloak, systemd]
+      block:
+        - name: "Phase 8 | Generate systemd service for Keycloak"
+          containers.podman.podman_generate_systemd:
+            name: "{{ keycloak_container_name }}"
+            dest: /etc/systemd/system/
+            restart_policy: always
+            new: false
+
+        - name: "Phase 8 | Enable Keycloak systemd service"
+          ansible.builtin.systemd:
+            name: "container-{{ keycloak_container_name }}"
+            enabled: true
+            daemon_reload: true
+
+    - name: "Phase 8 | cEOS systemd services and DNAT fix"
+      tags: [arista, systemd]
+      block:
+        - name: "Phase 8 | Generate systemd services for cEOS switches"
+          containers.podman.podman_generate_systemd:
+            name: "{{ item.name }}"
+            dest: /etc/systemd/system/
+            restart_policy: always
+            new: false
+          loop: "{{ ceos_switches }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "Phase 8 | Enable cEOS systemd services"
+          ansible.builtin.systemd:
+            name: "container-{{ item.name }}"
+            enabled: true
+            daemon_reload: true
+          loop: "{{ ceos_switches }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "Phase 8 | Deploy cEOS DNAT fix service (runs after reboot)"
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/ceos-dnat-fix.service
+            mode: '0644'
+            content: |
+              [Unit]
+              Description=Fix Podman DNAT rules for cEOS switches
+              After=network.target container-ceos1.service container-ceos2.service container-ceos3.service
+              Requires=container-ceos1.service container-ceos2.service container-ceos3.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStartPre=/bin/sleep 10
+              ExecStart=/bin/bash -c '\
+                for sw in ceos1:{{ ceos_switches[0].ssh_port }}:{{ ceos_switches[0].eapi_port }} \
+                          ceos2:{{ ceos_switches[1].ssh_port }}:{{ ceos_switches[1].eapi_port }} \
+                          ceos3:{{ ceos_switches[2].ssh_port }}:{{ ceos_switches[2].eapi_port }}; do \
+                  NAME=${sw%%:*}; PORTS=${sw#*:}; \
+                  SSH_PORT=${PORTS%%:*}; EAPI_PORT=${PORTS##*:}; \
+                  MGMT_IP=$(podman inspect "$NAME" \
+                    --format "{{ mgmt_fmt }}" 2>/dev/null) || continue; \
+                  for port in $SSH_PORT $EAPI_PORT; do \
+                    iptables -t nat -S 2>/dev/null | \
+                      grep -E "dport ${port}\\b.*DNAT" | grep -v "$MGMT_IP" | \
+                      sed "s/^-A/-D/" | while IFS= read -r rule; do \
+                        eval iptables -t nat "$rule" 2>/dev/null || true; \
+                      done; \
+                  done; \
+                done'
+
+              [Install]
+              WantedBy=multi-user.target
+          vars:
+            mgmt_fmt: '{{.NetworkSettings.Networks.management.IPAddress}}'
+
+        - name: "Phase 8 | Enable cEOS DNAT fix service"
+          ansible.builtin.systemd:
+            name: ceos-dnat-fix
+            enabled: true
+            daemon_reload: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Summary
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Display deployment summary
+      tags: always
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║       Central Host — Deployment Complete                     ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  IdM (FreeIPA):                                              ║
+          ║    Web UI:   https://{{ central_fqdn }}/ipa{{ ' ' * (30 - central_fqdn | length) }}║
+          ║    Realm:    {{ idm_realm }}{{ ' ' * (46 - idm_realm | length) }}║
+          ║    Domain:   {{ idm_domain }}{{ ' ' * (46 - idm_domain | length) }}║
+          ║    Admin:    admin / {{ idm_admin_password }}{{ ' ' * (34 - idm_admin_password | length) }}║
+          ║                                                              ║
+          ║  OPA (Open Policy Agent):                                    ║
+          ║    API:      http://{{ central_fqdn }}:8181{{ ' ' * (25 - central_fqdn | length) }}║
+          ║                                                              ║
+          ║  Keycloak (RHBK):                                           ║
+          ║    Console:  https://{{ central_fqdn }}:{{ keycloak_https_port }}{{ ' ' * (24 - central_fqdn | length) }}║
+          ║    HTTP:     http://{{ central_fqdn }}:{{ keycloak_http_port }}{{ ' ' * (25 - central_fqdn | length) }}║
+          ║    Admin:    {{ keycloak_admin_user }} / {{ keycloak_admin_password }}{{ ' ' * (34 - keycloak_admin_user | length - keycloak_admin_password | length) }}║
+          ║                                                              ║
+          ║  Arista cEOS Switches:                                       ║
+          ║    ceos1 (spine):      SSH :2001  eAPI :6031                 ║
+          ║    ceos2 (leaf/data):  SSH :2002  eAPI :6032                 ║
+          ║    ceos3 (leaf/app):   SSH :2003  eAPI :6033                 ║
+          ║    Credentials:        admin / admin                         ║
+          ║                                                              ║
+          ║  Podman Networks:                                            ║
+          ║    management, net1, net2, net3                               ║
+          ║                                                              ║
+          ║  Systemd services (auto-start on reboot):                    ║
+          ║    container-opa, container-keycloak,                        ║
+          ║    container-ceos1, container-ceos2, container-ceos3         ║
+          ║                                                              ║
+          ║  Next: run configure-firewall.yml → then site.yml            ║
+          ╚════════════════════════════════════════════════════════════════╝

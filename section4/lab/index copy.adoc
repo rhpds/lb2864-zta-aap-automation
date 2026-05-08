@@ -1,0 +1,223 @@
+= Section 4 -- SPIFFE-verified network VLAN management
+:toc: left
+:toclevels: 3
+:icons: font
+:idprefix:
+:idseparator: -
+
+[NOTE]
+====
+Sections 1–3 answered **"is the right person asking?"** but not **"is the right platform executing?"**. A stolen AAP credential replayed from an attacker's laptop would pass every check so far — OPA sees valid groups, Vault issues credentials, switches accept changes. Section 4 closes that gap with **SPIFFE/SPIRE**: the playbook must present a *cryptographic proof of workload identity* from a locally attested SPIRE agent before any network change proceeds.
+
+**AAP** remains the *Policy Enforcement Point (PEP)*, but now enforcement runs through **two independent rings**. The **outer ring** (AAP Policy as Code) gates *who* can launch the job — the same platform-level OPA check from Section 3. The **inner ring** (in-playbook OPA call) adds *what workload is executing* (SPIFFE ID), *what is being requested* (VLAN ID in range), and *which IdM groups* the launcher holds. **OPA** evaluates both rings independently; **SPIRE** provides the workload identity that makes the inner ring meaningful.
+
+**Why that matters:** An attacker now needs to compromise *both* a valid user session *and* a trusted execution environment to change the network fabric. Neither identity alone is sufficient — this is **defence in depth** with independent verification at each layer, not a single trust decision repeated twice.
+====
+
+
+== Architecture summary
+
+_ZTA concept: *Defence in depth* -- two independent policy rings evaluate both the human (outer) and the workload (inner) before any network change proceeds. An attacker needs to compromise both layers._
+
+* **Outer ring:** user must be in the **Infrastructure** AAP team to launch VLAN/Network templates (`aap.gateway` policy, evaluated by the controller before launch).
+* **Inner ring:** trusted SPIFFE ID, IdM `network-admins` group, VLAN 100--999, allowed action (`zta.network` policy, evaluated inside the playbook).
+
+
+[IMPORTANT]
+.Why two rings? Ansible makes defence in depth practical
+====
+**Humans** can be phished; **scripts** can be stolen. The **outer ring** (AAP Policy as Code) ensures only the right *people* can press "go" on high-risk network automation. The **inner ring** (in-playbook OPA call) adds **workload identity**: the job proves it runs on **the attested automation platform** (SPIRE SVID), not someone's laptop running a copy of the playbook. Ansible makes this practical -- the outer ring is **built into AAP** (zero playbook changes needed), and the inner ring is a **simple `uri` task** in the playbook. Together they implement defence in depth -- an attacker needs both a valid user session *and* a trusted execution environment to change the fabric.
+====
+
+== What is SPIFFE / SPIRE and why does it matter?
+
+Sections 1--3 established **user identity** (IdM) and **policy enforcement** (OPA) as trust gates. But every playbook so far ran with an implicit assumption: _the automation platform itself is trustworthy_. Section 4 makes that assumption explicit and cryptographically verifiable using **SPIFFE** and **SPIRE**.
+
+.The problem SPIFFE solves
+[%collapsible]
+====
+Traditional infrastructure automation trusts the _machine_ running the playbook because it sits on a trusted network or holds an SSH key. In a Zero Trust model, network location is not trust and static keys are a liability. An attacker who copies your playbooks and SSH key to a rogue VM has everything needed to make changes -- nothing proves the _workload_ is running on a legitimate, attested platform.
+
+SPIFFE solves this by giving every workload a **cryptographic identity** -- an X.509 certificate -- that is:
+
+* **Short-lived** -- automatically rotated (typically every hour), so a stolen certificate expires quickly.
+* **Attested** -- issued only after the SPIRE agent proves the workload's environment (kernel, process, node token) to the SPIRE server. A rogue VM that cannot pass attestation gets no identity.
+* **Platform-agnostic** -- works the same way on bare metal, VMs, containers, and Kubernetes. The identity follows the workload, not the infrastructure.
+====
+
+.SPIFFE concepts
+[%collapsible]
+====
+[cols="2,5",options="header"]
+|===
+| Concept | What it means
+
+| **SPIFFE ID**
+| A URI like `spiffe://zta.lab/workload/network-automation` that uniquely identifies a workload within a **trust domain** (`zta.lab`). It says nothing about _where_ the workload runs -- only _what_ it is.
+
+| **SVID** (SPIFFE Verifiable Identity Document)
+| The proof. An X.509 certificate containing the SPIFFE ID as the Subject Alternative Name (SAN). Any party can verify it against the trust domain's root CA without contacting the SPIRE server at runtime.
+
+| **SPIRE Server**
+| The certificate authority (CA) for the trust domain. Runs on `central` in this lab. It validates attestation evidence from agents and signs SVIDs.
+
+| **SPIRE Agent**
+| Runs on every node that hosts workloads (`control` in this lab -- where AAP executes playbooks). The agent attests the node to the server, then serves SVIDs to local workloads via a Unix domain socket.
+
+| **Workload registration**
+| An admin (or automation) registers which SPIFFE IDs are valid for which workloads. In this lab, the network-automation workload is registered to the AAP execution node.
+
+| **Trust domain**
+| The scope of identity authority -- `zta.lab` in our case, matching the IdM domain. Workloads in the same trust domain can verify each other's SVIDs without external PKI.
+|===
+====
+
+.How SPIFFE fits Zero Trust Architecture
+[%collapsible]
+====
+In NIST SP 800-207 terms, SPIFFE/SPIRE provides **workload identity** -- one of the three pillars alongside user identity and device posture:
+
+[cols="1,2,2",options="header"]
+|===
+| ZTA pillar | What answers it | This lab
+
+| **User identity**
+| "Which human initiated this action?"
+| IdM (FreeIPA) -- `netadmin` is in `network-admins`
+
+| **Workload identity**
+| "Is the software making the change running on a legitimate, attested platform?"
+| SPIFFE/SPIRE -- the playbook fetches an SVID proving it runs on the registered AAP node
+
+| **Device posture / context**
+| "Is the request reasonable given the parameters?"
+| OPA -- VLAN in range, action allowed, both identities verified
+|===
+
+Without SPIFFE, Sections 1--3 answered _"is the right person asking?"_ but not _"is the right platform executing?"_. A stolen AAP credential replayed from an attacker's laptop would pass every check -- OPA sees valid groups, Vault issues credentials, switches accept changes. SPIFFE closes that gap: the playbook must present a valid SVID from the SPIRE agent, which only runs on the attested AAP node.
+====
+
+.How Ansible integrates with SPIFFE
+[%collapsible]
+====
+The playbook's first play runs on the `automation` host (the AAP controller node) and calls the local SPIRE agent:
+
+[source,yaml]
+----
+- name: Fetch X.509 SVID from SPIRE Agent
+  command: >
+    /opt/spire/bin/spire-agent api fetch x509
+    -socketPath /run/spire/agent/api.sock
+  register: svid_result
+
+- name: Parse SPIFFE ID from SVID
+  set_fact:
+    workload_spiffe_id: "{{ svid_result.stdout | regex_search('SPIFFE ID:\\s+(spiffe://\\S+)', '\\1') | first }}"
+----
+
+
+The key insight for Ansible practitioners: **SPIFFE integration is a few tasks, not a framework change**. Any existing playbook can add workload identity verification by prepending a play that fetches and validates the SVID. The playbook fails closed if the SVID is missing or untrusted -- no partial changes reach the switches.
+====
+
+.What happens without SPIFFE?
+[%collapsible]
+====
+Consider the attack scenario: an insider copies the `configure-vlan.yml` playbook, the Arista credentials, and a valid AAP user token to their laptop. Without SPIFFE:
+
+* **Outer ring (AAP gateway):** bypassed entirely -- the attacker runs `ansible-playbook` directly, not through AAP.
+* **Inner ring (OPA user check):** passes -- the attacker supplies `netadmin` and `network-admins` in the OPA input (there is no server-side verification of user claims in a direct playbook run).
+* **Result:** the attacker creates arbitrary VLANs on the production fabric.
+
+With SPIFFE:
+
+* The playbook's first task calls `spire-agent api fetch x509` on the local node.
+* The attacker's laptop has no SPIRE agent (or has one that is not attested by the lab's SPIRE server).
+* The task fails -- **no SVID, no OPA query, no switch changes**.
+
+This is the difference between _"the right person asked"_ (user identity alone) and _"the right person asked from the right place"_ (user identity + workload identity). SPIFFE provides the second half.
+====
+
+[TIP]
+.SPIFFE and the automation supply chain
+====
+SPIFFE is not just about blocking rogue laptops. In production, workload identity can be extended to verify the **execution environment** (container image hash), the **Git commit** that produced the playbook, and the **CI/CD pipeline** that built the EE. SPIRE's pluggable attestation model supports all of these. The pattern this lab teaches -- fetch SVID, pass to PDP, fail closed -- is the foundation for a full automation supply chain verification strategy.
+====
+
+== Exercise 4.1
+
+_ZTA concept: *Layered deny-by-default* -- an unauthorised user is blocked at the first available gate. If the outer ring is bypassed, the inner ring still catches them._
+
+.Step-by-step
+[%collapsible]
+====
+. Time to log into AAP as `appdev` and launch the **Configure VLAN** template with VLAN 200 / DMZ.
+. Look at the output of the template:
+
+[source]
+----
+This job cannot be executed due to a policy violation or error. See the following details:
+{'Violations': {'Organization': ["user 'appdev' is not in an authorised team "
+'for network templates (requires: '
+'{"Infrastructure"}, has: {"Applications"})']}}
+----
+
+**Path A -- Outer ring blocks (expected with correct LDAP maps):** `neteng` has no AAP team membership, so the `aap.gateway` policy denies the launch at the platform level. The playbook never starts and no SPIFFE check occurs. This is the same pattern as Section 3.
+
+**Path B -- Inner ring blocks (if LDAP maps place all users in Infrastructure):** The outer ring passes, the playbook starts, SPIFFE verification **succeeds** (the platform is legitimate), but OPA's inner ring denies because `neteng` is not in the IdM `network-admins` group. This is a deliberate teaching point: **trust the platform** and **authorise the person** are separate questions.
+
+Either path demonstrates deny-by-default. Discuss which ring caught the request and why.
+====
+
+== Exercise 4.2 
+
+_ZTA concept: *Verified identity + verified workload = authorised change* -- both the human and the automation platform must prove their identity before the network is touched._
+
+.Step-by-step
+[%collapsible]
+====
+
+. Now login as netadmin and re-run the Configure VLAN template, create VLAN 200.
+. Navigate to the Netbox tab, and login with the credetnials admin/netbox.
+. Click on IPAM, Select VLANS and you should see VLAN 200 now that has been created.
+
+image::
+
+[TIP]
+.Ansible: end-to-end network change in one job
+=====
+A single AAP job verifies the workload identity (SPIFFE), checks policy (OPA), configures the switches (Arista `eos_vlans`), and updates the CMDB (NetBox). VLANs are a building block of **micro-segmentation**. Creating them only through Ansible's gated automation reduces **untracked lateral movement** helpers (shadow VLANs) and ties every network change to **identity + workload proof** -- all in one auditable, repeatable job.
+=====
+====
+
+== Hands-on: Write the NetBox CMDB update
+
+_ZTA concept: *CMDB as source of truth* -- any infrastructure change not recorded in the CMDB is invisible to compliance, monitoring, and policy engines. An unregistered VLAN is indistinguishable from a rogue one._
+
+The full `configure-vlan.yml` playbook updates NetBox automatically. This exercise isolates the CMDB step so you write it yourself using the NetBox REST API.
+
+.Lets go!
+[%collapsible]
+====
+. Navigate to Gitea and open `section4/playbooks/update-netbox-vlan-student.yml` in the text editor.
+. The playbook has three commented-out tasks marked `YOUR CODE STARTS HERE`. Each has hints and `FILL_IN` placeholders.
+. Uncomment each task and replace the placeholders:
++
+[cols="1,3",options="header"]
+!===
+! Task ! What you write
+! 1. Check if VLAN exists ! `uri` GET to `{{ netbox_url }}/api/ipam/vlans/?vid={{ new_vlan_id }}` with auth header. Register result to check `.json.count`.
+! 2. Create VLAN ! `uri` POST to `{{ netbox_url }}/api/ipam/vlans/` with `vid` (int!), `name`, `status`, `description`. Only run when count is 0.
+! 3. Display summary ! `debug` showing the VLAN ID, name, whether it was created or already existed, and the user.
+!===
++
+. In AAP, create a job template called **Update NetBox VLAN (Student)** pointing to your skeleton playbook. Use the same inventory, credentials, and EE.
+. Run **Configure VLAN** as `netadmin` to create the VLAN on the switches first, then run your template to update NetBox.
+. Verify in the NetBox UI (`http://netbox.zta.lab:8880`, navigate to IPAM -> VLANs) that the VLAN appears.
+. Run your template again -- it should report "Already exists" instead of creating a duplicate.
+====
+
+[TIP]
+.Why automate the CMDB update?
+====
+If the switch change and the CMDB update are separate manual steps, they **will** drift. Someone will create a VLAN and forget to update NetBox, or update NetBox but fat-finger the VLAN ID. Ansible keeps both in the same job, so either both succeed or neither does. In a ZTA architecture, the CMDB feeds downstream policy decisions -- an unregistered VLAN might trigger alerts, block traffic, or cause compliance violations. **Automation is the glue between infrastructure state and the trust decisions that depend on it.**
+====

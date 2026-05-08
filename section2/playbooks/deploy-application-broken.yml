@@ -1,0 +1,97 @@
+---
+# Section 2 — Student Exercise: Fix the Broken Deployment Playbook
+#
+# This playbook deploys the ZTA application with dynamic Vault credentials,
+# but it has FOUR security and reliability bugs that violate Zero Trust
+# principles. Your job is to find and fix them all.
+#
+# Run this playbook from AAP after the credential workflow completes.
+# It will FAIL. Read the error, compare against the working Section 2
+# deployment pattern, and fix the bugs one at a time.
+#
+# BUGS TO FIND:
+#   1. One bug makes credentials visible in the AAP job log
+#   2. One bug leaves the env file world-readable (violations: least privilege)
+#   3. One bug hardcodes a credential instead of using the dynamic one
+#   4. One bug means the health check never actually validates the deployment
+#
+# After fixing all four, the playbook should deploy cleanly and the health
+# check should return status 200 with valid database connectivity.
+
+- name: Deploy Application with Vault Credentials (BROKEN — fix me)
+  hosts: app_servers
+  become: true
+  gather_facts: false
+
+  vars:
+    db_user: "{{ db_dynamic_user | default(lookup('ansible.builtin.env', 'DB_USER', default=''), true) }}"
+    db_password: "{{ db_dynamic_password | default(lookup('ansible.builtin.env', 'DB_PASSWORD', default=''), true) }}"
+
+  tasks:
+    - name: Require database credentials
+      ansible.builtin.assert:
+        that:
+          - db_user | length > 0
+          - db_password | length > 0
+        fail_msg: >-
+          Missing DB credentials. Run this job after "Create DB Credential" in the
+          workflow, or pass -e db_dynamic_user=... -e db_dynamic_password=...
+
+    # BUG 1: no_log is missing — credentials will appear in the AAP job log.
+    # In a ZTA environment, ephemeral credentials must NEVER be logged.
+    - name: Write application environment file with dynamic credentials
+      ansible.builtin.copy:
+        dest: "{{ app_deploy_dir }}/env"
+        content: |
+          DB_HOST={{ db_data_ip }}
+          DB_PORT={{ db_port }}
+          DB_NAME={{ db_name }}
+          DB_USER={{ db_user }}
+          DB_PASSWORD={{ db_password }}
+          APP_PORT={{ app_port }}
+        # BUG 2: mode 0644 means any user on the container can read the
+        # database credentials. What should this be?
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: Ensure systemd unit references environment file
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system/ztaapp.service
+        regexp: "^EnvironmentFile="
+        line: "EnvironmentFile={{ app_deploy_dir }}/env"
+
+    # BUG 3: This line OVERRIDES the dynamic Vault credentials with a
+    # hardcoded password. The systemd Environment= directive takes precedence
+    # over EnvironmentFile= for the same variable.
+    - name: Set database password in systemd unit
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system/ztaapp.service
+        line: "Environment=DB_PASSWORD=static_password_123"
+        insertafter: "^EnvironmentFile="
+
+    - name: Reload systemd and restart application
+      ansible.builtin.systemd:
+        name: ztaapp
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    # BUG 4: The health check URL uses the wrong port — it checks port 80
+    # instead of {{ app_port }}. The app listens on {{ app_port }} (8081).
+    - name: Wait for application to be healthy
+      uri:
+        url: "http://{{ app_host }}:80/health"
+        method: GET
+      register: app_health
+      until: app_health.status == 200
+      retries: 10
+      delay: 3
+
+    - name: Display deployment result
+      debug:
+        msg: |
+          Application deployed:
+            URL:      http://{{ app_host }}:{{ app_port }}
+            Health:   {{ app_health.json.status | default('unknown') }}
+            DB User:  {{ db_user }} (dynamic, short-lived)

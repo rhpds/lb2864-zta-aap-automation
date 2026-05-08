@@ -1,0 +1,51 @@
+---
+# Section 4 Extension: Replace the micro-segmentation ACL with an overly
+# permissive rule that allows ANY host to reach the database.
+#
+# Participants must identify the security gap and fix it via the switch CLI.
+#
+# Usage (instructor only):
+#   ansible-playbook section4/playbooks/break-acl.yml
+
+- name: "Section 4 | Break ACL — Make DB Access Overly Permissive"
+  hosts: network
+  gather_facts: false
+
+  vars:
+    ansible_network_os: arista.eos.eos
+
+  tasks:
+    - name: Replace ACL with overly permissive rule
+      arista.eos.eos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: ZTA-APP-TO-DB
+                aces:
+                  - sequence: 10
+                    grant: permit
+                    protocol: ip
+                    source:
+                      any: true
+                    destination:
+                      host: "{{ db_data_ip }}"
+        state: overridden
+      when: inventory_hostname == 'ceos2'
+
+    - name: Display breakage confirmation (instructor only)
+      debug:
+        msg: |
+          ACL BREAKAGE APPLIED ON ceos2
+          ==============================
+
+          Changed: ZTA-APP-TO-DB ACL
+            FROM: permit tcp host 10.20.0.10 host 10.30.0.10 eq 5432
+                  deny ip any host 10.30.0.10
+            TO:   permit ip any host 10.30.0.10
+
+          Effect: ANY host can reach the database on ANY port
+                  Micro-segmentation is broken
+
+          Instructor fix:
+            ansible-playbook section4/playbooks/fix-acl.yml
+      when: inventory_hostname == 'ceos2'

@@ -1,0 +1,23 @@
+=== Exercise 4.6 — Arista ACL hands-on (extended)
+
+[TIP]
+.Least privilege on the wire
+====
+Secrets and identity mean little if **any IP** can reach PostgreSQL. The fabric ACL is a **network-layer PEP** complementing host firewalls and DB auth. ZTA architectures **stack** these controls so no single miss grants full path access.
+====
+
+*Instructor:* `ansible-playbook section4/playbooks/break-acl.yml`
+
+Overly permissive ACL (`permit ip any host 10.30.0.10`) defeats least privilege.
+
+. SSH to ceos leaf (example from README: `ssh -p 2002 admin@central.zta.lab`).
+. `show access-lists ZTA-APP-TO-DB` — observe broad permit.
+. Replace with tight rules: permit TCP `10.20.0.10` → `10.30.0.10` eq `5432`; deny other access to DB IP.
+. Confirm `curl http://app.zta.lab:8081/health` healthy.
+. Discuss **configuration drift** vs desired state in Git/AAP.
+
+[TIP]
+.Drift is a trust problem
+====
+Manual CLI fixes restore service but **break the contract** that Git/AAP is the source of truth—your **actual** security posture is now unknown to automation. ZTA-minded ops **reconcile** drift (re-run desired-state playbooks, detect out-of-band changes) instead of letting “quick fixes” accumulate invisibly.
+====

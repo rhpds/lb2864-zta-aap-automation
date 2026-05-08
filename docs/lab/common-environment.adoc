@@ -1,0 +1,112 @@
+// Shared lab reference — include from section labs: include::../../docs/lab/common-environment.adoc[]
+// Path from sectionN/lab/index.adoc is ../../docs/lab/common-environment.adoc
+
+[NOTE]
+.How to read these labs (Zero Trust)
+====
+In NIST SP 800-207 terms, **Ansible Automation Platform (AAP)** is the *Policy Enforcement Point (PEP)*: operational change flows *through* it. **Open Policy Agent (OPA)** is a *Policy Decision Point (PDP)*: it answers allow/deny from **identity** (IdM), **state** (NetBox), and **context** encoded in Rego. **Vault** supplies *short-lived, least-privilege* secrets instead of long-lived passwords in CMDBs or disks. **SPIFFE/SPIRE** (later sections) binds actions to a *verified workload*, not only a human username.
+
+**Why that matters:** Zero Trust assumes breach and removes implicit trust. You will repeatedly see *verify then act*, *deny by default*, *least privilege*, and *auditability*—not as buzzwords but as concrete gates in the automation path.
+====
+
+[NOTE]
+.Platform version (Red Hat Ansible Automation Platform 2.6)
+====
+These labs target **Red Hat Ansible Automation Platform 2.6**: the **automation controller** (job and workflow templates, credentials, inventories, projects) and the **Event-Driven Ansible controller** (rulebook activations, decision environments, projects, credentials). See the https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/[AAP 2.6 documentation] and https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/using_automation_decisions/[Using automation decisions] for EDA.
+
+Menu groupings vary by **role and organization** (for example **Access** vs **Automation Execution**). Steps that mention *Resources → Credentials* mean **Credentials** in the automation controller; use **Projects**, **Inventories**, **Templates**, and **Workflows** in the same UI. EDA steps use the **Event-Driven Ansible controller** (rulebook activations, decision environments).
+====
+
+[#lab-common-environment]
+== Lab environment reference
+
+These hostnames assume workshop DNS (`*.zta.lab`) is configured. Replace with instructor-provided values if different.
+
+.Access information
+[cols="2,2,3",options="header"]
+|===
+| System | URL / address | Credentials
+
+| Automation controller (AAP 2.6)
+| `https://control.zta.lab`
+| As provided by instructor
+
+| Event-Driven Ansible controller (AAP 2.6)
+| Same platform as automation controller (EDA UI / route per deployment)
+| As provided by instructor
+
+| IdM (FreeIPA)
+| `https://central.zta.lab`
+| `admin` / `ansible123!`
+
+| OPA
+| `http://central.zta.lab:8181`
+| No auth (lab)
+
+| Vault
+| `http://vault.zta.lab:8200`
+| `admin` / `ansible123!` (or userpass as documented)
+
+| NetBox
+| `http://netbox.zta.lab:8880`
+| API token as documented / instructor
+
+| Gitea
+| `http://gitea.zta.lab:3000`
+| As provided by instructor
+
+| Splunk
+| `http://splunk.zta.lab:8000` or `http://central.zta.lab:8000`
+| As configured during setup
+
+| Wazuh Dashboard
+| `http://wazuh.zta.lab:5601`
+| As provided by instructor
+
+| Application (Global Telemetry Platform)
+| `http://app.zta.lab:8081`
+| No auth (dashboard)
+|===
+
+.Primary scenario accounts (IdM)
+[cols="2,2,3",options="header"]
+|===
+| Username | Groups | Role in exercises
+
+| `ztauser`
+| `zta-admins`, `patch-admins`, `app-deployers`
+| General admin — can patch and deploy
+
+| `netadmin`
+| `zta-admins`, `network-admins`
+| Network admin — VLAN exercises
+
+| `appdev`
+| `app-deployers`
+| App developer — deployment pipeline
+
+| `neteng`
+| _(none)_
+| Often denied (wrong user scenarios)
+|===
+
+All IdM user passwords for workshop accounts: `ansible123!`
+
+For full org charts (infrastructure, DevOps, security, applications teams) see `docs/exercise-guide.md` or the repository root `README.md`.
+
+[#lab-aap-workshop-defaults]
+=== Automation controller — workshop defaults (Section 1)
+
+When the instructor runs `setup/configure-aap-project.yml` and `setup/configure-aap-inventory.yml`, these names are typical. Use them in labs unless your environment differs.
+
+[cols="2,3",options="header"]
+|===
+| Resource | Default name / note
+| Organization | `Default`
+| Execution environment | `ZTA Workshop EE` (custom image from project setup; includes Arista/RHEL-oriented collections)
+| Project | `ZTA Workshop` (Git URL to Gitea workshop repo)
+| Inventory | `ZTA Lab Inventory` (static from setup, or NetBox-sourced per lab)
+| Job templates (Section 1) | Verify ZTA Services; Test Vault Integration; Test Vault SSH Certificates; Test OPA Policy
+|===
+
+**Credentials on jobs (Section 1):** attach **ZTA Machine Credential** to all four templates; add **ZTA Arista Credential** only to **Verify ZTA Services** (EOS facts play). **ZTA Vault Credential** is never attached directly—it backs Machine/Network lookups. **ZTA Gitea Credential** is for **project** sync only. Details: link:../../section1/lab/index.adoc#exercise-1-4-job-templates[Section 1 lab — Job templates].

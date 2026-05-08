@@ -1,0 +1,43 @@
+---
+# Section 2 Extension: Remove the PostgreSQL firewall port on the DB container
+# to simulate a micro-segmentation misconfiguration.
+#
+# The application will lose database connectivity and the health check will fail.
+# Participants must diagnose the firewall issue and fix it manually.
+#
+# Usage (instructor only):
+#   ansible-playbook section2/playbooks/break-firewall.yml
+
+- name: "Section 2 | Break Firewall — Remove DB Port"
+  hosts: db_servers
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Remove PostgreSQL port from firewall
+      firewalld:
+        port: "{{ db_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: disabled
+
+    - name: Verify port is removed
+      command: firewall-cmd --list-ports
+      register: ports_after
+      changed_when: false
+
+    - name: Display breakage confirmation (instructor only)
+      debug:
+        msg: |
+          FIREWALL BREAKAGE APPLIED
+          =========================
+
+          Removed port {{ db_port }}/tcp from firewalld on DB host
+          Current open ports: {{ ports_after.stdout | default('none') }}
+
+          Effect:
+            App cannot reach PostgreSQL on port {{ db_port }}
+            curl http://app.zta.lab:8081/health → unhealthy
+
+          Instructor fix:
+            ansible-playbook section2/playbooks/fix-firewall.yml

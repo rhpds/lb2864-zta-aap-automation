@@ -1,0 +1,188 @@
+---
+# deploy-wazuh-agents.yml — Install and register Wazuh agents on
+# monitored hosts so they report security events to the Wazuh manager.
+#
+# Usage:
+#   ansible-playbook setup/deploy-wazuh-agents.yml
+#
+# Limit to specific hosts:
+#   ansible-playbook setup/deploy-wazuh-agents.yml --limit app_servers,db_servers
+#
+# Prerequisites:
+#   - Wazuh manager is installed and running on wazuh.zta.lab
+#   - DNS resolves wazuh.zta.lab (run setup/configure-dns.yml first)
+
+- name: Deploy Wazuh agents
+  hosts: app_servers,db_servers,vault_servers,netbox_servers,automation
+  become: true
+  gather_facts: true
+
+  vars:
+    wazuh_manager: "{{ wazuh_manager_host | default('wazuh.zta.lab') }}"
+    wazuh_agent_version: "4.14.3"
+    wazuh_agent_rpm: "wazuh-agent-{{ wazuh_agent_version }}-1.x86_64.rpm"
+    wazuh_agent_url: "https://packages.wazuh.com/4.x/yum/{{ wazuh_agent_rpm }}"
+    wazuh_agent_name: "{{ inventory_hostname }}"
+    wazuh_agent_group: "default"
+
+  pre_tasks:
+    - name: Create staging directory on controller
+      file:
+        path: /tmp/wazuh
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Check if Wazuh agent RPM already on controller
+      stat:
+        path: "/tmp/wazuh/{{ wazuh_agent_rpm }}"
+      delegate_to: localhost
+      run_once: true
+      register: rpm_local
+
+    - name: Download Wazuh agent RPM to controller
+      get_url:
+        url: "{{ wazuh_agent_url }}"
+        dest: "/tmp/wazuh/{{ wazuh_agent_rpm }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      when: not rpm_local.stat.exists
+
+  tasks:
+
+    # ── Check if agent is already installed ──────────────────────────
+
+    - name: Check if Wazuh agent is already installed
+      stat:
+        path: /var/ossec/bin/wazuh-control
+      register: wazuh_installed
+
+    - name: Check if agent is already running
+      command: /var/ossec/bin/wazuh-control status
+      register: wazuh_running
+      changed_when: false
+      failed_when: false
+      when: wazuh_installed.stat.exists
+
+    # ── Install Wazuh agent ─────────────────────────────────────────
+
+    - name: Copy Wazuh agent RPM to target
+      copy:
+        src: "/tmp/wazuh/{{ wazuh_agent_rpm }}"
+        dest: "/tmp/{{ wazuh_agent_rpm }}"
+        mode: '0644'
+      when: not wazuh_installed.stat.exists
+
+    - name: Install Wazuh agent with per-host identity
+      command: >
+        rpm -ihv /tmp/{{ wazuh_agent_rpm }}
+      environment:
+        WAZUH_MANAGER: "{{ wazuh_manager }}"
+        WAZUH_AGENT_GROUP: "{{ wazuh_agent_group }}"
+        WAZUH_AGENT_NAME: "{{ wazuh_agent_name }}"
+      register: rpm_install
+      changed_when: rpm_install.rc == 0
+      failed_when:
+        - rpm_install.rc != 0
+        - "'already installed' not in rpm_install.stderr"
+      when: not wazuh_installed.stat.exists
+
+    # ── Configure agent ──────────────────────────────────────────────
+
+    - name: Configure Wazuh manager address
+      lineinfile:
+        path: /var/ossec/etc/ossec.conf
+        regexp: '<address>.*</address>'
+        line: "      <address>{{ wazuh_manager }}</address>"
+        backrefs: false
+      notify: restart wazuh-agent
+
+    # ── Enable vulnerability detection module ────────────────────────
+
+    - name: Check if vulnerability-detection is configured
+      command: grep -c 'vulnerability-detection' /var/ossec/etc/ossec.conf
+      register: vuln_configured
+      changed_when: false
+      failed_when: false
+
+    # ── Enable SCA (Security Configuration Assessment) ───────────────
+
+    - name: Ensure SCA is enabled
+      command: grep -c '<sca>' /var/ossec/etc/ossec.conf
+      register: sca_configured
+      changed_when: false
+      failed_when: false
+
+    # ── Start and register agent ─────────────────────────────────────
+
+    - name: Enable and start Wazuh agent
+      systemd:
+        name: wazuh-agent
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for agent to connect to manager
+      command: /var/ossec/bin/agent_control -l
+      register: agent_status
+      until: "'is connected' in agent_status.stdout or agent_status.rc == 0"
+      retries: 12
+      delay: 10
+      changed_when: false
+      failed_when: false
+      delegate_to: "{{ wazuh_manager }}"
+
+    # ── Verification ─────────────────────────────────────────────────
+
+    - name: Check agent status
+      command: /var/ossec/bin/wazuh-control status
+      register: final_status
+      changed_when: false
+
+    - name: Display agent status
+      debug:
+        msg: >-
+          {{ inventory_hostname }}: Wazuh agent {{ 'RUNNING' if 'is running' in final_status.stdout else 'NOT RUNNING' }},
+          manager={{ wazuh_manager }}
+
+  handlers:
+    - name: restart wazuh-agent
+      systemd:
+        name: wazuh-agent
+        state: restarted
+
+
+# ── Summary play ─────────────────────────────────────────────────────
+
+- name: Wazuh Agent Deployment Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════╗
+          ║       Wazuh Agent Deployment Complete                   ║
+          ╠══════════════════════════════════════════════════════════╣
+          ║                                                        ║
+          ║  Manager: wazuh.zta.lab:1514                           ║
+          ║  API:     https://wazuh.zta.lab:55000                  ║
+          ║                                                        ║
+          ║  Agents deployed to:                                   ║
+          ║    - app.zta.lab     (application server)              ║
+          ║    - db.zta.lab      (database server)                 ║
+          ║    - vault.zta.lab   (secrets management)              ║
+          ║    - netbox.zta.lab  (CMDB)                            ║
+          ║    - control.zta.lab (automation controller)           ║
+          ║                                                        ║
+          ║  Verify in Wazuh Dashboard:                            ║
+          ║    https://wazuh.zta.lab → Agents                      ║
+          ║                                                        ║
+          ║  These agents feed into Section 3:                     ║
+          ║    AAP queries Wazuh API before allowing patching      ║
+          ║                                                        ║
+          ╚══════════════════════════════════════════════════════════╝

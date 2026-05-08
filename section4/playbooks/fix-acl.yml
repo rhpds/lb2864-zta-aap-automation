@@ -1,0 +1,36 @@
+---
+# Section 4 Extension: Restore the correct micro-segmentation ACL.
+#
+# Usage:
+#   ansible-playbook section4/playbooks/fix-acl.yml
+
+- name: "Section 4 | Fix ACL — Restore Micro-segmentation"
+  hosts: network
+  gather_facts: false
+
+  vars:
+    ansible_network_os: arista.eos.eos
+
+  tasks:
+    # eos_acls maps 5432 → "postgres" in CLI; cEOS rejects that. Use numeric eq via eos_config.
+    - name: Restore correct ACL on ceos2
+      arista.eos.eos_config:
+        replace: block
+        parents: ip access-list ZTA-APP-TO-DB
+        lines:
+          - "10 permit tcp host {{ app_data_ip }} host {{ db_data_ip }} eq {{ db_port }}"
+          - "20 deny ip any host {{ db_data_ip }}"
+      when: inventory_hostname == 'ceos2'
+
+    - name: Display fix confirmation
+      debug:
+        msg: |
+          ACL FIX APPLIED ON ceos2
+          =========================
+
+          Restored: ZTA-APP-TO-DB ACL
+            10 permit tcp host {{ app_data_ip }} host {{ db_data_ip }} eq {{ db_port }}
+            20 deny ip any host {{ db_data_ip }}
+
+          Only the app server can reach the database on port {{ db_port }}.
+      when: inventory_hostname == 'ceos2'

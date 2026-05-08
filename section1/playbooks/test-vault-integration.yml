@@ -1,0 +1,88 @@
+---
+# Section 1: Test Vault integration — retrieve secrets and generate dynamic DB creds
+- name: Test HashiCorp Vault Integration
+  hosts: vault_servers
+  become: true
+  gather_facts: false
+  # AAP often uses a tiny inventory under /runner/inventory — that skips project inventory/group_vars.
+  # Load the same defaults as a full checkout so idm_admin_password, vault_addr, and paths exist.
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+
+  # When group_vars were already merged from inventory, set_fact only applies env overrides / gaps.
+  vars:
+    vault_username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+    # vars lookup avoids templating undefined idm_admin_password (minimal AAP inventory has no group_vars).
+    vault_password: "{{ lookup('env', 'VAULT_PASSWORD') | default(lookup('vars', 'idm_admin_password', default='ansible123!'), true) }}"
+
+  pre_tasks:
+    - name: Default Vault API variables when inventory has no group_vars
+      ansible.builtin.set_fact:
+        vault_addr: "{{ vault_addr | default(lookup('env', 'VAULT_ADDR') | default('http://vault.zta.lab:8200', true), true) }}"
+        vault_skip_verify: "{{ vault_skip_verify | default(true) | bool }}"
+        vault_kv_secrets_path: "{{ vault_kv_secrets_path | default('secret') }}"
+        vault_db_secrets_path: "{{ vault_db_secrets_path | default('database') }}"
+        vault_db_role_name: "{{ vault_db_role_name | default('ztaapp-short-lived') }}"
+      delegate_to: localhost
+
+    - name: Authenticate to Vault with userpass
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/{{ vault_username }}"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ vault_password }}"
+        validate_certs: false
+      register: vault_login
+      delegate_to: localhost
+
+    - name: Set Vault token from login
+      set_fact:
+        vault_env:
+          VAULT_ADDR: "{{ vault_addr }}"
+          VAULT_SKIP_VERIFY: "{{ vault_skip_verify | string }}"
+          VAULT_TOKEN: "{{ vault_login.json.auth.client_token }}"
+
+  tasks:
+    - name: Read a KV secret (network credentials)
+      command: vault kv get -format=json {{ vault_kv_secrets_path }}/network/arista
+      environment: "{{ vault_env }}"
+      register: vault_kv_test
+      changed_when: false
+      no_log: true
+
+    - name: Confirm KV secret was retrieved
+      assert:
+        that:
+          - vault_kv_test.rc == 0
+        success_msg: "KV secret retrieved successfully from {{ vault_kv_secrets_path }}/network/arista"
+        fail_msg: "Failed to read KV secret — check Vault configuration"
+
+    - name: Generate dynamic database credentials
+      command: vault read -format=json {{ vault_db_secrets_path }}/creds/{{ vault_db_role_name }}
+      environment: "{{ vault_env }}"
+      register: vault_db_creds
+      changed_when: false
+      no_log: true
+
+    - name: Parse dynamic credentials
+      set_fact:
+        dynamic_db_user: "{{ (vault_db_creds.stdout | from_json).data.username }}"
+        dynamic_db_ttl: "{{ (vault_db_creds.stdout | from_json).lease_duration }}"
+        dynamic_db_lease: "{{ (vault_db_creds.stdout | from_json).lease_id }}"
+      no_log: true
+
+    - name: Display Vault integration results
+      debug:
+        msg:
+          - "Vault integration test — results"
+          - "KV secret read: PASS ({{ vault_kv_secrets_path }}/network/arista)"
+          - "Dynamic DB username: {{ dynamic_db_user }}"
+          - "Dynamic DB TTL: {{ dynamic_db_ttl }}s"
+          - "Lease ID: {{ dynamic_db_lease }}"
+          - "Short-lived DB user expires after TTL (Zero Trust / least privilege)."
+
+    - name: Revoke the test credentials
+      command: vault lease revoke {{ dynamic_db_lease }}
+      environment: "{{ vault_env }}"
+      changed_when: true

@@ -1,0 +1,12 @@
+plugin: netbox.netbox.nb_inventory
+config_context: true
+validate_certs: False
+group_by:
+  - platforms
+  - device_roles
+  - sites
+
+compose:
+  ansible_network_os: platform.name
+  ansible_host: custom_fields.host
+  ansible_port: custom_fields.port

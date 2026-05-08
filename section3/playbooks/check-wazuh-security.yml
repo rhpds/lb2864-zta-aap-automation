@@ -1,0 +1,228 @@
+---
+# check-wazuh-security.yml — Query Wazuh API to verify a host's
+# security posture before allowing operations (patching, deployment).
+#
+# Designed to be called from AAP as a pre-check step in a workflow
+# template, before the patch-server.yml job template runs.
+#
+# Returns:
+#   wazuh_security_ok:  true/false  — set as a stat for AAP workflows
+#   wazuh_agent_status: active/disconnected/never_connected
+#   wazuh_critical_vulns: count of critical vulnerabilities
+#
+# Usage (standalone):
+#   ansible-playbook section3/playbooks/check-wazuh-security.yml \
+#     -e target_host=app
+#
+# Usage (in AAP workflow):
+#   Create as a Job Template. Pass target_host as a survey variable.
+#   Wire it before patch-server.yml in a workflow template.
+
+- name: "Wazuh Security Posture Check"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    target_host: "{{ target_host | default('app') }}"
+    target_fqdn: "{{ target_host }}.{{ idm_domain | default('zta.lab') }}"
+    wazuh_api: "{{ wazuh_api_url | default('https://wazuh.zta.lab:55000') }}"
+    wazuh_user: "{{ wazuh_api_user | default('wazuh') }}"
+    wazuh_pass: "{{ wazuh_api_password | default('wazuh') }}"
+    max_critical_vulns: 0
+    max_high_vulns: 5
+
+  tasks:
+
+    # ── Authenticate to Wazuh API ────────────────────────────────────
+
+    - name: Authenticate to Wazuh API
+      uri:
+        url: "{{ wazuh_api }}/security/user/authenticate"
+        method: POST
+        url_username: "{{ wazuh_user }}"
+        url_password: "{{ wazuh_pass }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: wazuh_auth
+
+    - name: Store Wazuh JWT token
+      set_fact:
+        wazuh_token: "{{ wazuh_auth.json.data.token }}"
+
+    # ── Look up the agent for the target host ────────────────────────
+
+    - name: Look up Wazuh agent for {{ target_fqdn }}
+      uri:
+        url: "{{ wazuh_api }}/agents?name={{ target_fqdn }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ wazuh_token }}"
+        validate_certs: false
+        status_code: 200
+      register: agent_lookup
+
+    - name: Try short hostname if FQDN not found
+      uri:
+        url: "{{ wazuh_api }}/agents?name={{ target_host }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ wazuh_token }}"
+        validate_certs: false
+        status_code: 200
+      register: agent_lookup_short
+      when: agent_lookup.json.data.total_affected_items == 0
+
+    - name: Set agent info
+      set_fact:
+        wazuh_agent: >-
+          {{
+            agent_lookup.json.data.affected_items[0]
+            if agent_lookup.json.data.total_affected_items > 0
+            else (
+              agent_lookup_short.json.data.affected_items[0]
+              if (agent_lookup_short is defined and agent_lookup_short.json.data.total_affected_items > 0)
+              else none
+            )
+          }}
+
+    - name: Fail if agent not found
+      fail:
+        msg: >-
+          No Wazuh agent found for '{{ target_fqdn }}' or '{{ target_host }}'.
+          Ensure the Wazuh agent is installed and registered.
+          Run: ansible-playbook setup/deploy-wazuh-agents.yml --limit {{ target_host }}
+      when: wazuh_agent is none
+
+    - name: Extract agent details
+      set_fact:
+        agent_id: "{{ wazuh_agent.id }}"
+        agent_status: "{{ wazuh_agent.status }}"
+        agent_version: "{{ wazuh_agent.version | default('unknown') }}"
+        agent_last_keepalive: "{{ wazuh_agent.lastKeepAlive | default('never') }}"
+
+    # ── Check agent connectivity ─────────────────────────────────────
+
+    - name: Verify agent is active
+      set_fact:
+        agent_connected: "{{ agent_status == 'active' }}"
+
+    # ── Query vulnerability data ─────────────────────────────────────
+
+    - name: Get vulnerability summary for agent
+      uri:
+        url: "{{ wazuh_api }}/vulnerability/{{ agent_id }}/summary/cvss"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ wazuh_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: vuln_summary
+      ignore_errors: true
+
+    - name: Get critical vulnerabilities
+      uri:
+        url: "{{ wazuh_api }}/vulnerability/{{ agent_id }}?severity=Critical&limit=50"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ wazuh_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: critical_vulns
+      ignore_errors: true
+
+    - name: Get high-severity vulnerabilities
+      uri:
+        url: "{{ wazuh_api }}/vulnerability/{{ agent_id }}?severity=High&limit=50"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ wazuh_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: high_vulns
+      ignore_errors: true
+
+    # ── Query SCA (Security Configuration Assessment) ────────────────
+
+    - name: Get SCA results for agent
+      uri:
+        url: "{{ wazuh_api }}/sca/{{ agent_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ wazuh_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: sca_results
+      ignore_errors: true
+
+    # ── Evaluate security posture ────────────────────────────────────
+
+    - name: Calculate vulnerability counts
+      set_fact:
+        critical_count: "{{ critical_vulns.json.data.total_affected_items | default(0) | int }}"
+        high_count: "{{ high_vulns.json.data.total_affected_items | default(0) | int }}"
+        sca_pass_pct: >-
+          {{
+            ((sca_results.json.data.affected_items[0].pass | default(0) | int) * 100 /
+             (sca_results.json.data.affected_items[0].total_checks | default(1) | int))
+            | round(1)
+            if (sca_results is defined and sca_results.json.data.total_affected_items | default(0) > 0)
+            else 'N/A'
+          }}
+
+    - name: Determine security posture
+      set_fact:
+        wazuh_security_ok: >-
+          {{
+            agent_connected | bool
+            and (critical_count | int <= max_critical_vulns | int)
+            and (high_count | int <= max_high_vulns | int)
+          }}
+
+    # ── Display results ──────────────────────────────────────────────
+
+    - name: Display Wazuh security check results
+      debug:
+        msg: |
+          Wazuh security posture check
+          Target: {{ target_fqdn }}
+          Agent: ID {{ agent_id }} ({{ agent_status }}), version {{ agent_version }}
+          Vulnerabilities — critical: {{ critical_count }} (max {{ max_critical_vulns }}), high: {{ high_count }} (max {{ max_high_vulns }})
+          SCA compliance: {{ sca_pass_pct }}%
+          Overall: {{ 'PASS' if wazuh_security_ok | bool else 'FAIL' }}
+          {% if not wazuh_security_ok | bool %}
+          Actions before patching:
+          {% if not agent_connected | bool %}
+          - Agent disconnected — check wazuh-agent
+          {% endif %}
+          {% if critical_count | int > max_critical_vulns | int %}
+          - {{ critical_count }} critical CVEs exceed threshold
+          {% endif %}
+          {% if high_count | int > max_high_vulns | int %}
+          - High CVE count {{ high_count }} exceeds threshold
+          {% endif %}
+          {% endif %}
+
+    # ── Publish stats for AAP workflow ───────────────────────────────
+
+    - name: Set stats for AAP workflow
+      set_stats:
+        data:
+          wazuh_security_ok: "{{ wazuh_security_ok | bool }}"
+          wazuh_agent_status: "{{ agent_status }}"
+          wazuh_critical_vulns: "{{ critical_count | int }}"
+          wazuh_high_vulns: "{{ high_count | int }}"
+          wazuh_sca_pass_pct: "{{ sca_pass_pct }}"
+
+    - name: Enforce security posture
+      assert:
+        that:
+          - wazuh_security_ok | bool
+        fail_msg: >-
+          SECURITY CHECK FAILED for {{ target_fqdn }}.
+          Agent connected: {{ agent_connected }},
+          Critical vulns: {{ critical_count }} (max {{ max_critical_vulns }}),
+          High vulns: {{ high_count }} (max {{ max_high_vulns }}).
+          Resolve issues before patching.
+        success_msg: "Security posture check PASSED for {{ target_fqdn }}"

@@ -1,0 +1,211 @@
+---
+# Section 4 Validation: SPIFFE-Verified Network VLAN Management
+#
+# Checks:
+#   - Configure VLAN template exists in AAP
+#   - SPIRE Agent running on control
+#   - OPA zta.network policy loaded and responding
+#   - VLAN 200 exists on ceos1, ceos2, ceos3
+#   - NetBox has VLAN 200 record
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section4.yml
+
+- name: "Section 4 Check | AAP Template"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section4, aap]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check Configure VLAN template
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ 'Configure VLAN' | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s4_template_check
+      failed_when: false
+
+    - name: Store template result
+      set_fact:
+        s4_template_ok: "{{ (s4_template_check.json.count | default(0)) > 0 }}"
+
+- name: "Section 4 Check | SPIRE Agent"
+  hosts: automation
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section4, spire]
+
+  tasks:
+    - name: Check SPIRE Agent service
+      systemd:
+        name: spire-agent
+      check_mode: true
+      register: s4_spire_status
+      failed_when: false
+
+    - name: Fetch SVID from SPIRE Agent
+      command: >
+        {{ spire_install_dir }}/bin/spire-agent api fetch x509
+        -socketPath {{ spire_agent_socket }}
+      register: s4_svid_fetch
+      changed_when: false
+      failed_when: false
+
+- name: "Section 4 Check | OPA Network Policy"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section4, opa]
+
+  tasks:
+    - name: Test OPA network allow (netadmin)
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: netadmin
+            user_groups: [network-admins]
+            spiffe_id: "spiffe://{{ idm_domain }}/workload/network-automation"
+            action: create_vlan
+            vlan_id: 200
+      register: s4_opa_allow
+      failed_when: false
+
+    - name: Test OPA network deny (neteng)
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: neteng
+            user_groups: []
+            spiffe_id: "spiffe://{{ idm_domain }}/workload/network-automation"
+            action: create_vlan
+            vlan_id: 200
+      register: s4_opa_deny
+      failed_when: false
+
+    - name: Test OPA network deny (invalid VLAN range)
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: netadmin
+            user_groups: [network-admins]
+            spiffe_id: "spiffe://{{ idm_domain }}/workload/network-automation"
+            action: create_vlan
+            vlan_id: 5000
+      register: s4_opa_vlan_range
+      failed_when: false
+
+- name: "Section 4 Check | VLAN on Switches"
+  hosts: network
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section4, network]
+
+  tasks:
+    - name: Check VLAN 200 on switch
+      arista.eos.eos_command:
+        commands:
+          - show vlan id 200
+      register: s4_vlan_check
+      failed_when: false
+
+- name: "Section 4 Check | NetBox VLAN"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section4, netbox]
+
+  tasks:
+    - name: Check VLAN 200 in NetBox
+      uri:
+        url: "http://{{ netbox_url | regex_replace('^https?://', '') }}/api/ipam/vlans/?vid=200"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+        status_code: [200]
+      register: s4_netbox_vlan
+      failed_when: false
+
+- name: "Section 4 Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section4, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    ctrl: "{{ hostvars['control'] | default({}) }}"
+    checks:
+      - name: "Template: Configure VLAN"
+        ok: "{{ s4_template_ok | default(false) }}"
+      - name: SPIRE Agent running on control
+        ok: "{{ (ctrl.s4_spire_status.status.ActiveState | default('')) == 'active' }}"
+      - name: SPIRE Agent can fetch SVID
+        ok: "{{ (ctrl.s4_svid_fetch.rc | default(1)) == 0 }}"
+      - name: OPA network allows netadmin
+        ok: "{{ (c.s4_opa_allow.json.result.allow | default(false)) == true }}"
+      - name: OPA network denies neteng
+        ok: "{{ (c.s4_opa_deny.json.result.allow | default(true)) == false }}"
+      - name: OPA network denies invalid VLAN (5000)
+        ok: "{{ (c.s4_opa_vlan_range.json.result.allow | default(true)) == false }}"
+      - name: VLAN 200 on ceos1
+        ok: "{{ '200' in (hostvars['ceos1']['s4_vlan_check']['stdout'] | default(['']) | first) }}"
+      - name: VLAN 200 on ceos2
+        ok: "{{ '200' in (hostvars['ceos2']['s4_vlan_check']['stdout'] | default(['']) | first) }}"
+      - name: VLAN 200 on ceos3
+        ok: "{{ '200' in (hostvars['ceos3']['s4_vlan_check']['stdout'] | default(['']) | first) }}"
+      - name: VLAN 200 in NetBox
+        ok: "{{ (c.s4_netbox_vlan.json.count | default(0)) > 0 }}"
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 4 verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 4 — SPIFFE-Verified Network VLAN Management           ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── INCOMPLETE ──                                              ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          {% else %}
+          ║  Section 4 complete — all exercises verified.                  ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

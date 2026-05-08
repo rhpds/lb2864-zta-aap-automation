@@ -1,0 +1,47 @@
+---
+# Section 2 Extension: Restore the correct SELinux context on the app
+# data directory and restart the application.
+#
+# Usage:
+#   ansible-playbook section2/playbooks/fix-selinux.yml
+
+- name: "Section 2 | Fix SELinux — Restore Container File Context"
+  hosts: app_servers
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Restore correct SELinux context on app directory
+      command: "chcon -R -t container_file_t {{ app_deploy_dir }}"
+
+    - name: Verify SELinux context
+      command: "ls -laZ {{ app_deploy_dir }}"
+      register: context_check
+      changed_when: false
+
+    - name: Restart the application
+      systemd:
+        name: ztaapp
+        state: restarted
+
+    - name: Wait for application to start
+      uri:
+        url: "http://{{ app_host }}:{{ app_port }}/health"
+        method: GET
+      register: health
+      until: health.status == 200
+      retries: 10
+      delay: 3
+      failed_when: false
+
+    - name: Display fix confirmation
+      debug:
+        msg: |
+          SELINUX CONTEXT FIXED
+          =====================
+
+          Restored: container_file_t on {{ app_deploy_dir }}
+          App health: {{ health.status | default('pending') }}
+
+          Context:
+          {{ context_check.stdout_lines | join('\n') }}

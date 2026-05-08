@@ -1,0 +1,20 @@
+=== Exercise 5.8 — Splunk alert tuning (extended)
+
+[TIP]
+.Detection quality is policy too
+====
+Bad tuning either **floods** operators (alert fatigue → real attacks ignored) or **suppresses** true positives. Treat searches like **code**: test with known-good automation traffic and known-bad simulations; document **why** an IP or user agent is allowlisted.
+====
+
+Tune saved search to reduce false positives from AAP controller IP, e.g.:
+
+[source]
+----
+(index=zta_app OR index=zta_syslog) sourcetype=syslog "Authentication failure" NOT src_ip=192.168.1.10
+| stats count by src_ip, host
+| where count >= 5
+----
+
+(Replace `192.168.1.10` with `dig +short control.zta.lab` for your lab.)
+
+Verify: brute force originating from non-AAP IPs still alerts; expected automation noise suppressed per instructor goals.

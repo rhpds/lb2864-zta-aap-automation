@@ -1,0 +1,158 @@
+---
+# Pre-workshop setup: Configure Wazuh to forward alerts to Event-Driven Ansible.
+#
+# This playbook:
+#   1. Deploys a custom Wazuh integration script that sends alerts to EDA via webhook
+#   2. Configures Wazuh ossec.conf to trigger the integration on brute-force rules
+#   3. Verifies the Wazuh agent on the app server is active
+#   4. Creates the "Emergency: Revoke App Credentials" job template in AAP (manual step documented)
+#
+# Prerequisites:
+#   - Wazuh manager is running on wazuh.zta.lab
+#   - Wazuh agent is installed on app.zta.lab
+#   - Event-Driven Ansible controller (AAP 2.6) is running on control.zta.lab (or AAP node)
+
+- name: Configure Wazuh → EDA Integration
+  hosts: wazuh_servers
+  become: true
+  gather_facts: false
+
+  vars:
+    eda_webhook_url: "http://control.zta.lab:5000/endpoint"
+    wazuh_config_dir: /var/ossec/etc
+    wazuh_integrations_dir: /var/ossec/integrations
+
+  tasks:
+    # ── 1. Deploy the custom EDA integration script ──
+    - name: Deploy custom EDA integration script
+      copy:
+        dest: "{{ wazuh_integrations_dir }}/custom-eda"
+        content: |
+          #!/bin/bash
+          # Wazuh custom integration — forward alerts to Event-Driven Ansible
+          # Called by Wazuh integratord when matching rules fire.
+          #
+          # Arguments:
+          #   $1 = alert file (JSON)
+          #   $2 = API key (unused)
+          #   $3 = hook URL
+
+          ALERT_FILE="$1"
+          HOOK_URL="$3"
+
+          if [ -z "$HOOK_URL" ]; then
+            HOOK_URL="{{ eda_webhook_url }}"
+          fi
+
+          if [ ! -f "$ALERT_FILE" ]; then
+            echo "$(date) custom-eda: alert file not found: $ALERT_FILE" >> /var/ossec/logs/integrations.log
+            exit 1
+          fi
+
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$HOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @"$ALERT_FILE" \
+            --connect-timeout 5 \
+            --max-time 10)
+
+          echo "$(date) custom-eda: sent alert to $HOOK_URL — HTTP $RESPONSE" >> /var/ossec/logs/integrations.log
+
+          if [ "$RESPONSE" -ge 200 ] && [ "$RESPONSE" -lt 300 ]; then
+            exit 0
+          else
+            exit 1
+          fi
+        mode: '0750'
+        owner: root
+        group: wazuh
+
+    - name: Deploy integration Python wrapper (required by integratord)
+      copy:
+        dest: "{{ wazuh_integrations_dir }}/custom-eda.py"
+        content: |
+          #!/usr/bin/env python3
+          """Wazuh custom integration wrapper for EDA webhook."""
+          import sys
+          import json
+          import urllib.request
+          import urllib.error
+
+          HOOK_URL = "{{ eda_webhook_url }}"
+
+          def main():
+              alert_file = sys.argv[1]
+              hook_url = sys.argv[3] if len(sys.argv) > 3 else HOOK_URL
+
+              with open(alert_file, 'r') as f:
+                  alert_data = f.read()
+
+              req = urllib.request.Request(
+                  hook_url,
+                  data=alert_data.encode('utf-8'),
+                  headers={'Content-Type': 'application/json'},
+                  method='POST'
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      print(f"custom-eda: sent to {hook_url} — HTTP {resp.status}")
+              except urllib.error.URLError as e:
+                  print(f"custom-eda: failed to send to {hook_url} — {e}", file=sys.stderr)
+                  sys.exit(1)
+
+          if __name__ == '__main__':
+              main()
+        mode: '0750'
+        owner: root
+        group: wazuh
+
+    # ── 2. Configure Wazuh integration in ossec.conf ──
+    - name: Add EDA integration to Wazuh ossec.conf
+      blockinfile:
+        path: "{{ wazuh_config_dir }}/ossec.conf"
+        insertbefore: "</ossec_config>"
+        block: |
+          <!-- Event-Driven Ansible integration — forward brute-force alerts -->
+          <integration>
+            <name>custom-eda</name>
+            <hook_url>{{ eda_webhook_url }}</hook_url>
+            <rule_id>5712,5763,5764</rule_id>
+            <alert_format>json</alert_format>
+          </integration>
+        marker: "<!-- {mark} EDA INTEGRATION -->"
+      notify: Restart Wazuh manager
+
+    # ── 3. Verify Wazuh agent on app server ──
+    - name: Check Wazuh agents
+      command: /var/ossec/bin/agent_control -l
+      register: agent_list
+      changed_when: false
+
+    - name: Display integration summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║       Wazuh → EDA Integration Configured                    ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Integration:  custom-eda                                    ║
+          ║  Webhook URL:  {{ eda_webhook_url }}║
+          ║  Rules:        5712, 5763, 5764 (SSH brute force)            ║
+          ║                                                              ║
+          ║  When Wazuh detects SSH brute force on any monitored host,   ║
+          ║  it will POST the alert JSON to the EDA webhook endpoint.    ║
+          ║  EDA then triggers the credential revocation job in AAP.     ║
+          ║                                                              ║
+          ║  Next steps:                                                 ║
+          ║    1. Add rulebook via Event-Driven Ansible controller (AAP 2.6) ║
+          ║    2. Create a Rulebook Activation                           ║
+          ║    3. Create the AAP job template:                           ║
+          ║       "Emergency: Revoke App Credentials"                    ║
+          ╚════════════════════════════════════════════════════════════════╝
+
+  handlers:
+    - name: Restart Wazuh manager
+      systemd:
+        name: wazuh-manager
+        state: restarted

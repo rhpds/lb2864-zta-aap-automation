@@ -1,0 +1,130 @@
+---
+# Section 5 Validation: Automated Incident Response (Splunk → EDA → Vault)
+#
+# Checks:
+#   - 3 job templates exist (Revoke, Simulate, Restore)
+#   - EDA webhook endpoint responding on control:5000
+#   - Application is healthy (pre-attack baseline)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section5.yml
+
+- name: "Section 5 Check | AAP Templates"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section5, aap]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check Section 5 job templates
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ item | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s5_template_checks
+      loop: "{{ expected_section5_templates }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    - name: Parse template results
+      set_fact:
+        s5_template_results: >-
+          {{ s5_template_results | default({}) | combine({
+            item.item: ((item.json.count | default(0)) > 0)
+          }) }}
+      loop: "{{ s5_template_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+- name: "Section 5 Check | EDA Webhook"
+  hosts: automation
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section5, eda]
+
+  tasks:
+    - name: Check EDA webhook port (5000)
+      ansible.builtin.wait_for:
+        host: localhost
+        port: 5000
+        timeout: 5
+      register: s5_eda_port
+      failed_when: false
+
+- name: "Section 5 Check | Application Health"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section5, app]
+
+  tasks:
+    - name: Check application health
+      uri:
+        url: "http://{{ app_host }}:{{ app_port }}/health"
+        method: GET
+        status_code: [200]
+      register: s5_app_health
+      failed_when: false
+
+- name: "Section 5 Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section5, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    ctrl: "{{ hostvars['control'] | default({}) }}"
+    checks:
+      - name: "Template: Emergency: Revoke App Credentials"
+        ok: "{{ (s5_template_results | default({}))['Emergency: Revoke App Credentials'] | default(false) }}"
+      - name: "Template: Simulate Brute Force"
+        ok: "{{ (s5_template_results | default({}))['Simulate Brute Force'] | default(false) }}"
+      - name: "Template: Restore App Credentials"
+        ok: "{{ (s5_template_results | default({}))['Restore App Credentials'] | default(false) }}"
+      - name: EDA webhook port listening (5000)
+        ok: "{{ (ctrl.s5_eda_port.state | default('')) == 'started' }}"
+      - name: Application healthy (pre-attack)
+        ok: "{{ (c.s5_app_health.status | default(0)) == 200 }}"
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 5 verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║   Section 5 — Automated Incident Response (Splunk → EDA)       ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── INCOMPLETE ──                                              ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          {% else %}
+          ║  Section 5 complete — all exercises verified.                  ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

@@ -1,0 +1,339 @@
+---
+# Deploy Arista cEOS Lab switches as containers on central
+#
+# Topology:
+#   ceos1 (spine) ── net1 ── ceos2 (leaf — data-tier)
+#     │                        │
+#     └── net3 ── ceos3 ──── net2 ──┘
+#             (leaf — app-tier)
+#
+# Data-plane networks:
+#   net2 = 10.30.0.0/24  (data-tier) — DB container at 10.30.0.10
+#   net3 = 10.20.0.0/24  (app-tier)  — App container at 10.20.0.10
+#   Traffic between app↔db routes through cEOS spine (ceos1)
+#
+# Management access (published on 192.168.1.x):
+#   ceos1:  SSH central.zta.lab:2001  |  eAPI central.zta.lab:6031
+#   ceos2:  SSH central.zta.lab:2002  |  eAPI central.zta.lab:6032
+#   ceos3:  SSH central.zta.lab:2003  |  eAPI central.zta.lab:6033
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-arista.yml
+
+- name: Deploy Arista cEOS Lab Switches
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    ceos_image: quay.io/nmartins/ceoslab-rh
+    config_local: "{{ playbook_dir }}/switch-configs"
+    config_dir: /tmp/setup
+    ceos_memory: 2g
+
+    ceos_env: &ceos_env
+      INTFTYPE: eth
+      ETBA: "1"
+      SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT: "1"
+      CEOS: "1"
+      EOS_PLATFORM: ceoslab
+      container: podman
+
+    ceos_systemd_args: >-
+      /sbin/init
+      systemd.setenv=INTFTYPE=eth
+      systemd.setenv=ETBA=1
+      systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1
+      systemd.setenv=CEOS=1
+      systemd.setenv=EOS_PLATFORM=ceoslab
+      systemd.setenv=container=podman
+
+    podman_networks:
+      - management
+      - net1
+      - net2
+      - net3
+
+    switches:
+      - name: ceos1
+        role: spine
+        config_src: "{{ config_dir }}/sw01/sw01"
+        ssh_port: 2001
+        eapi_port: 6031
+        networks: [net1, net3]
+      - name: ceos2
+        role: leaf
+        config_src: "{{ config_dir }}/sw02/sw02"
+        ssh_port: 2002
+        eapi_port: 6032
+        networks: [net1, net2]
+      - name: ceos3
+        role: leaf
+        config_src: "{{ config_dir }}/sw03/sw03"
+        ssh_port: 2003
+        eapi_port: 6033
+        networks: [net2, net3]
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Prerequisites
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Ensure podman and dependencies are installed
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - python3-podman
+          - git
+          - jq
+        state: present
+
+    - name: Disable SysRq to prevent cEOS from remounting host filesystem read-only
+      ansible.posix.sysctl:
+        name: kernel.sysrq
+        value: '0'
+        sysctl_file: /etc/sysctl.d/99-no-sysrq.conf
+        reload: true
+        state: present
+      failed_when: false
+
+    - name: Pull cEOS image
+      containers.podman.podman_image:
+        name: "{{ ceos_image }}"
+        state: present
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Deploy startup configs
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Remove stale config directory
+      ansible.builtin.file:
+        path: "{{ config_dir }}"
+        state: absent
+
+    - name: Copy switch startup configurations to target
+      ansible.builtin.copy:
+        src: "{{ config_local }}/"
+        dest: "{{ config_dir }}/"
+        mode: "0644"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — Clean up any previous deployment
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Force-kill existing cEOS containers (skip graceful EOS shutdown)
+      command: "podman kill {{ item.name }}"
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Force-remove existing cEOS containers
+      command: "podman rm -f {{ item.name }}"
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Remove existing podman networks
+      command: "podman network rm {{ item }}"
+      loop: "{{ podman_networks }}"
+      failed_when: false
+      changed_when: false
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Create networks
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Create podman management network (no explicit subnet)
+      command: "podman network create --disable-dns {{ item }}"
+      loop:
+        - management
+      register: net_simple
+      failed_when:
+        - net_simple.rc != 0
+        - "'already exists' not in (net_simple.stderr | default(''))"
+      changed_when: net_simple.rc == 0
+
+    - name: Create spine-leaf interconnect (net1 — 10.10.0.0/24)
+      command: "podman network create --disable-dns --subnet 10.10.0.0/24 --gateway 10.10.0.1 net1"
+      register: net1_create
+      failed_when:
+        - net1_create.rc != 0
+        - "'already exists' not in (net1_create.stderr | default(''))"
+      changed_when: net1_create.rc == 0
+
+    - name: Create data-tier network (net2 — 10.30.0.0/24)
+      command: "podman network create --disable-dns --subnet 10.30.0.0/24 --gateway 10.30.0.1 net2"
+      register: net2_create
+      failed_when:
+        - net2_create.rc != 0
+        - "'already exists' not in (net2_create.stderr | default(''))"
+      changed_when: net2_create.rc == 0
+
+    - name: Create app-tier network (net3 — 10.20.0.0/24)
+      command: "podman network create --disable-dns --subnet 10.20.0.0/24 --gateway 10.20.0.1 net3"
+      register: net3_create
+      failed_when:
+        - net3_create.rc != 0
+        - "'already exists' not in (net3_create.stderr | default(''))"
+      changed_when: net3_create.rc == 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — Launch cEOS containers
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Start cEOS containers
+      shell: >
+        podman run -d
+        --network management
+        --memory={{ ceos_memory }}
+        --name={{ item.name }}
+        --privileged
+        -v {{ item.config_src }}:/mnt/flash/startup-config
+        -e INTFTYPE=eth
+        -e ETBA=1
+        -e SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1
+        -e CEOS=1
+        -e EOS_PLATFORM=ceoslab
+        -e container=podman
+        -p {{ item.eapi_port }}:80
+        -p {{ item.ssh_port }}:22/tcp
+        {{ ceos_image }}
+        {{ ceos_systemd_args }}
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6 — Attach data-plane networks
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Connect switches to data-plane networks
+      command: "podman network connect {{ item.1 }} {{ item.0.name }}"
+      loop: "{{ switches | subelements('networks') }}"
+      loop_control:
+        label: "{{ item.0.name }} → {{ item.1 }}"
+
+    - name: Fix DNAT rules — keep only management network port forwarding
+      ansible.builtin.shell: |
+        MGMT_IP=$(podman inspect {{ item.name }} \
+          --format '{%raw%}{{(index .NetworkSettings.Networks "management").IPAddress}}{%endraw%}')
+        for port in {{ item.ssh_port }} {{ item.eapi_port }}; do
+          iptables -t nat -S | grep -E "dport ${port}\b.*DNAT" | grep -v "${MGMT_IP}" | \
+            sed 's/^-A/-D/' | while IFS= read -r rule; do
+              eval iptables -t nat "$rule" 2>/dev/null || true
+            done
+        done
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Wait for EOS to boot
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Wait for cEOS switches to boot (60s)
+      ansible.builtin.pause:
+        seconds: 60
+        prompt: "Waiting for EOS to load startup-config..."
+
+    - name: Verify SSH is reachable on each switch
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ item.ssh_port }}"
+        timeout: 120
+        delay: 5
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }} (port {{ item.ssh_port }})"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 8 — Enable auto-start on boot
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Generate systemd service for cEOS containers
+      containers.podman.podman_generate_systemd:
+        name: "{{ item.name }}"
+        dest: /etc/systemd/system/
+        restart_policy: always
+        new: false
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Enable cEOS systemd services
+      systemd:
+        name: "container-{{ item.name }}"
+        enabled: true
+        daemon_reload: true
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 9 — Gather management IPs
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Get management IP for each switch
+      command: >
+        podman inspect {{ item.name }}
+        --format {%raw%}'{{ (index .NetworkSettings.Networks "management").IPAddress }}'{%endraw%}
+      loop: "{{ switches }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: switch_ips
+      changed_when: false
+
+    - name: Store switch IPs as facts
+      ansible.builtin.set_fact:
+        ceos_addresses: "{{ ceos_addresses | default({}) | combine({item.item.name: item.stdout | trim}) }}"
+      loop: "{{ switch_ips.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Summary
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Display Arista cEOS deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║       Arista cEOS Lab — Deployment Complete                   ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Topology:                                                   ║
+          ║    ceos1 (spine) ── net1 ── ceos2 (leaf/data-tier)           ║
+          ║      │                        │                              ║
+          ║      └── net3 ── ceos3 (leaf/app-tier) ── net2 ──┘           ║
+          ║                                                              ║
+          ║  Data-Plane Networks:                                        ║
+          ║    net2 = 10.30.0.0/24  (data-tier)  gw 10.30.0.1 (ceos2)   ║
+          ║    net3 = 10.20.0.0/24  (app-tier)   gw 10.20.0.1 (ceos3)   ║
+          ║                                                              ║
+          ║  ACL: ZTA-DATA-TIER on ceos2                                 ║
+          ║    PERMIT  10.20.0.0/24 → 10.30.0.0/24:5432                 ║
+          ║    DENY    any → 10.30.0.0/24                                ║
+          ║                                                              ║
+          ║  Switch Access (via 192.168.1.x):                            ║
+          ║    ceos1:  ssh -p 2001 admin@central.zta.lab                 ║
+          ║    ceos2:  ssh -p 2002 admin@central.zta.lab                 ║
+          ║    ceos3:  ssh -p 2003 admin@central.zta.lab                 ║
+          ║                                                              ║
+          ║  eAPI (JSON-RPC):                                            ║
+          ║    ceos1:  http://central.zta.lab:6031                       ║
+          ║    ceos2:  http://central.zta.lab:6032                       ║
+          ║    ceos3:  http://central.zta.lab:6033                       ║
+          ║                                                              ║
+          ║  Management IPs:                                             ║
+          ║    ceos1:  {{ ceos_addresses.ceos1 | default('unknown') }}
+          ║    ceos2:  {{ ceos_addresses.ceos2 | default('unknown') }}
+          ║    ceos3:  {{ ceos_addresses.ceos3 | default('unknown') }}
+          ║                                                              ║
+          ║  Next: deploy-rhel-containers.yml connects                   ║
+          ║        db→net2 (10.30.0.10) and app→net3 (10.20.0.10)       ║
+          ╚════════════════════════════════════════════════════════════════╝

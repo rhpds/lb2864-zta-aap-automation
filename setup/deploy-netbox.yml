@@ -1,0 +1,155 @@
+---
+# Deploy NetBox CMDB as containers on the netbox VM using podman-compose
+#
+# Deploys the full netbox-docker stack:
+#   - NetBox web (gunicorn)
+#   - NetBox worker (background jobs)
+#   - NetBox housekeeping (periodic cleanup)
+#   - PostgreSQL 16
+#   - Redis 7
+#
+# Services exposed:
+#   - Web UI:  http://netbox.zta.lab:8880
+#   - API:     http://netbox.zta.lab:8880/api/
+#
+# Credentials:
+#   - Admin user:  admin / netbox
+#   - API Token:   0123456789abcdef0123456789abcdef01234567
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-netbox.yml
+
+- name: Deploy NetBox on netbox VM
+  hosts: netbox_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    netbox_dir: /opt/netbox-docker
+    netbox_port: 8880
+    netbox_superuser: admin
+    netbox_superuser_password: netbox
+    netbox_superuser_email: "admin@zta.lab"
+    netbox_api_token: "0123456789abcdef0123456789abcdef01234567"
+    netbox_repo: https://github.com/netbox-community/netbox-docker.git
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Prerequisites
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Install system packages
+      dnf:
+        name:
+          - podman
+          - python3-podman
+          - podman-compose
+          - git
+        state: present
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Clone and configure netbox-docker
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Clone netbox-docker repository
+      git:
+        repo: "{{ netbox_repo }}"
+        dest: "{{ netbox_dir }}"
+        version: release
+        force: true
+
+    - name: Write docker-compose.override.yml
+      copy:
+        dest: "{{ netbox_dir }}/docker-compose.override.yml"
+        mode: '0644'
+        content: |
+          services:
+            netbox:
+              ports:
+                - "{{ netbox_port }}:8080"
+              environment:
+                ALLOWED_HOSTS: "*"
+                SKIP_SUPERUSER: "false"
+                SUPERUSER_EMAIL: "{{ netbox_superuser_email }}"
+                SUPERUSER_PASSWORD: "{{ netbox_superuser_password }}"
+                SUPERUSER_NAME: "{{ netbox_superuser }}"
+                SUPERUSER_API_TOKEN: "{{ netbox_api_token }}"
+              healthcheck:
+                start_period: 300s
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — Pull images and start containers
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Kill stale aardvark-dns (conflicts with IdM named on port 53)
+      command: pkill -f aardvark-dns
+      failed_when: false
+      changed_when: false
+
+    - name: Pre-create podman network with DNS disabled
+      command: podman network create --disable-dns netbox-docker_default
+      register: net_create
+      failed_when: false
+      changed_when: "'netbox-docker_default' in net_create.stdout"
+
+    - name: Strip depends_on health conditions (podman-compose 1.5.x hangs on them)
+      shell: |
+        sed -i 's/condition: service_healthy//g' {{ netbox_dir }}/docker-compose.yml
+        sed -i 's/condition: service_started//g' {{ netbox_dir }}/docker-compose.yml
+      changed_when: true
+
+    - name: Pull NetBox images
+      command: podman-compose pull
+      args:
+        chdir: "{{ netbox_dir }}"
+      changed_when: true
+
+    - name: Start all NetBox containers
+      command: podman-compose up -d
+      args:
+        chdir: "{{ netbox_dir }}"
+      changed_when: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Wait for NetBox to be ready
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Wait for NetBox API to respond
+      uri:
+        url: "http://localhost:{{ netbox_port }}/api/status/"
+        method: GET
+        status_code: [200]
+      register: netbox_health
+      until: netbox_health.status == 200
+      retries: 60
+      delay: 10
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — Summary
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Display NetBox deployment summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║           NetBox CMDB — Deployment Complete                   ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Web UI:    http://netbox.zta.lab:{{ netbox_port }}
+          ║  API:       http://netbox.zta.lab:{{ netbox_port }}/api/
+          ║                                                              ║
+          ║  Credentials:                                                ║
+          ║    Username:  {{ netbox_superuser }}
+          ║    Password:  {{ netbox_superuser_password }}
+          ║                                                              ║
+          ║  API Token:  {{ netbox_api_token }}         ║
+          ║                                                              ║
+          ║  Stack:      {{ netbox_dir }}
+          ║                                                              ║
+          ║  Manage:                                                     ║
+          ║    podman-compose -f {{ netbox_dir }}/docker-compose.yml ps
+          ║    podman-compose -f {{ netbox_dir }}/docker-compose.yml logs
+          ║    podman-compose -f {{ netbox_dir }}/docker-compose.yml down
+          ║                                                              ║
+          ║  Next: run setup/configure-netbox.yml to seed lab data       ║
+          ╚════════════════════════════════════════════════════════════════╝

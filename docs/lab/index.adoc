@@ -1,0 +1,21 @@
+= ZTA Workshop — Lab guides (AsciiDoc)
+:toc: right
+:toclevels: 2
+:idprefix:
+:idseparator: -
+
+AsciiDoc versions of the hands-on labs live next to each section. Steps assume **Red Hat Ansible Automation Platform 2.6** (automation controller + Event-Driven Ansible controller); see the platform note in link:common-environment.adoc[common-environment.adoc].
+
+* link:../../overview/lab/index.adoc[Workshop Overview — Zero Trust Architecture with AAP]
+
+* link:../../section1/lab/index.adoc[Section 1 — Verify ZTA + AAP integration]
+* link:../../section2/lab/index.adoc[Section 2 — Short-lived credentials]
+* link:../../section3/lab/index.adoc[Section 3 — Policy as Code patching]
+* link:../../section4/lab/index.adoc[Section 4 — SPIFFE VLAN management]
+* link:../../section5/lab/index.adoc[Section 5 — Splunk → EDA → Vault]
+* link:../../section6/lab/index.adoc[Section 6 — SSH lockdown & break-glass]
+* link:../../section7/lab/index.adoc[Section 7 — Wazuh (optional)]
+
+Shared environment tables: link:common-environment.adoc[common-environment.adoc]
+
+Narrative Markdown guide (instructor/student): `docs/exercise-guide.md`.

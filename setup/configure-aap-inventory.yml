@@ -1,0 +1,303 @@
+---
+# configure-aap-inventory.yml — Create a static inventory in AAP Controller
+# with all workshop lab systems, groups, and connection variables.
+#
+# This gives AAP a ready-to-use inventory without depending on the NetBox
+# dynamic source.  Both can coexist — the static inventory is useful for
+# initial bootstrap and troubleshooting.
+#
+# When the ZTA Workshop project already exists on the controller, this playbook
+# also adds an SCM inventory source (inventory/hosts.ini) so inventory/group_vars/all.yml
+# is merged on sync. If the project is missing (e.g. before configure-aap-project.yml),
+# that step is skipped; re-run this playbook after setup/configure-aap-project.yml.
+#
+# Prerequisites:
+#   - AAP Controller is installed and reachable
+#   - ansible.controller collection available
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-inventory.yml
+
+- name: Create AAP Inventory for ZTA Workshop Lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+    aap_user: admin
+    aap_password: "{{ lookup('env', 'AAP_ADMIN_PASSWORD') | default('ansible123!', true) }}"
+    aap_verify_ssl: false
+    aap_organization: Default
+
+    inventory_name: ZTA Lab Inventory
+    # Must match setup/configure-aap-project.yml project_name and ee_name.
+    aap_workshop_project_name: ZTA Workshop
+    aap_workshop_ee_name: ZTA Workshop EE
+    aap_inventory_scm_path: inventory/hosts.ini
+    aap_inventory_scm_source_name: Workshop hosts.ini (project)
+
+    lab_groups:
+      - name: zta_services
+        description: Central VM — IdM, OPA, Keycloak, SPIRE Server
+        variables:
+          ansible_user: rhel
+      - name: vault_servers
+        description: HashiCorp Vault
+        variables:
+          ansible_user: rhel
+      - name: netbox_servers
+        description: NetBox CMDB
+        variables:
+          ansible_user: rhel
+      - name: wazuh_servers
+        description: Wazuh SIEM
+        variables:
+          ansible_user: rhel
+      - name: automation
+        description: Automation controller / Event-Driven Ansible (AAP 2.6)
+        variables:
+          ansible_user: rhel
+      - name: app_servers
+        description: Application server (RHEL container on central)
+        variables:
+          ansible_user: rhel
+      - name: db_servers
+        description: Database server (RHEL container on central)
+        variables:
+          ansible_user: rhel
+      - name: network
+        description: Arista cEOS switch fabric (spine + 2 leaf)
+        variables:
+          ansible_user: admin
+          ansible_password: admin
+          ansible_network_os: arista.eos.eos
+          ansible_connection: ansible.netcommon.network_cli
+
+    lab_hosts:
+      - name: central
+        description: "Central VM — IdM, OPA, Keycloak, SPIRE, containers"
+        groups:
+          - zta_services
+        variables:
+          ansible_host: "{{ hostvars['central']['ansible_host'] | default('192.168.1.11') }}"
+
+      - name: control
+        description: "Automation controller and Event-Driven Ansible controller (AAP 2.6)"
+        groups:
+          - automation
+        variables:
+          ansible_host: "{{ hostvars['control']['ansible_host'] | default('192.168.1.10') }}"
+
+      - name: vault
+        description: "HashiCorp Vault — secrets management, SSH CA"
+        groups:
+          - vault_servers
+        variables:
+          ansible_host: "{{ hostvars['vault']['ansible_host'] | default('192.168.1.12') }}"
+
+      - name: netbox
+        description: "NetBox CMDB — infrastructure source of truth"
+        groups:
+          - netbox_servers
+        variables:
+          ansible_host: "{{ hostvars['netbox']['ansible_host'] | default('192.168.1.15') }}"
+
+      - name: wazuh
+        description: "Wazuh SIEM — security monitoring and alerting"
+        groups:
+          - wazuh_servers
+        variables:
+          ansible_host: "{{ hostvars['wazuh']['ansible_host'] | default('192.168.1.13') }}"
+
+      - name: app
+        description: "Application server — Global Telemetry Platform (Flask)"
+        groups:
+          - app_servers
+        variables:
+          ansible_host: "{{ hostvars['app']['ansible_host'] | default('192.168.1.11') }}"
+          ansible_port: 2023
+
+      - name: db
+        description: "Database server — PostgreSQL"
+        groups:
+          - db_servers
+        variables:
+          ansible_host: "{{ hostvars['db']['ansible_host'] | default('192.168.1.11') }}"
+          ansible_port: 2022
+
+      - name: ceos1
+        description: "Arista cEOS spine switch"
+        groups:
+          - network
+        variables:
+          ansible_host: "{{ hostvars['ceos1']['ansible_host'] | default('192.168.1.11') }}"
+          ansible_port: 2001
+
+      - name: ceos2
+        description: "Arista cEOS leaf switch — data tier"
+        groups:
+          - network
+        variables:
+          ansible_host: "{{ hostvars['ceos2']['ansible_host'] | default('192.168.1.11') }}"
+          ansible_port: 2002
+
+      - name: ceos3
+        description: "Arista cEOS leaf switch — app tier"
+        groups:
+          - network
+        variables:
+          ansible_host: "{{ hostvars['ceos3']['ansible_host'] | default('192.168.1.11') }}"
+          ansible_port: 2003
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+
+    # ── Verify AAP is reachable ────────────────────────────────────────
+
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: aap_ping
+
+    - name: Display AAP version
+      debug:
+        msg: "AAP Controller {{ aap_ping.json.version }} detected"
+
+    # ── Create inventory ───────────────────────────────────────────────
+
+    - name: Create ZTA Lab Inventory
+      ansible.controller.inventory:
+        name: "{{ inventory_name }}"
+        description: "Static inventory with all ZTA workshop lab systems"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    # ── Create groups ──────────────────────────────────────────────────
+
+    - name: Create inventory groups
+      ansible.controller.group:
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        inventory: "{{ inventory_name }}"
+        variables: "{{ item.variables | default({}) }}"
+        state: present
+      loop: "{{ lab_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ── Create hosts and assign to groups ──────────────────────────────
+
+    - name: Create inventory hosts
+      ansible.controller.host:
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        inventory: "{{ inventory_name }}"
+        variables: "{{ item.variables }}"
+        state: present
+      loop: "{{ lab_hosts }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Assign hosts to groups
+      ansible.controller.group:
+        name: "{{ item.1 }}"
+        inventory: "{{ inventory_name }}"
+        hosts:
+          - "{{ item.0.name }}"
+        preserve_existing_hosts: true
+        state: present
+      loop: "{{ lab_hosts | subelements('groups') }}"
+      loop_control:
+        label: "{{ item.0.name }} → {{ item.1 }}"
+
+    # ── SCM inventory source (hosts.ini + inventory/group_vars from repo) ──
+
+    - name: Check if ZTA Workshop project exists on controller
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/projects/?name__exact={{ aap_workshop_project_name | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: aap_project_lookup
+
+    - name: Add inventory source from project (hosts.ini + group_vars)
+      ansible.controller.inventory_source:
+        name: "{{ aap_inventory_scm_source_name }}"
+        description: "Static inventory from workshop repo — loads inventory/group_vars/all.yml on sync"
+        inventory: "{{ inventory_name }}"
+        organization: "{{ aap_organization }}"
+        source: scm
+        source_project: "{{ aap_workshop_project_name }}"
+        source_path: "{{ aap_inventory_scm_path }}"
+        execution_environment: "{{ aap_workshop_ee_name }}"
+        overwrite: true
+        update_on_launch: true
+        state: present
+      when: aap_project_lookup.json.count | default(0) | int > 0
+
+    - name: Sync SCM inventory source
+      ansible.controller.inventory_source_update:
+        inventory_source: "{{ aap_inventory_scm_source_name }}"
+        inventory: "{{ inventory_name }}"
+        wait: true
+        timeout: 120
+      when: aap_project_lookup.json.count | default(0) | int > 0
+
+    - name: Note when SCM inventory source was skipped
+      ansible.builtin.debug:
+        msg: >
+          Skipped adding SCM inventory source: project '{{ aap_workshop_project_name }}' not found on controller.
+          Run setup/configure-aap-project.yml (project sync), then re-run this playbook.
+      when: aap_project_lookup.json.count | default(0) | int == 0
+
+    # ── Summary ────────────────────────────────────────────────────────
+
+    - name: Display inventory summary
+      debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════════════════╗
+          ║      AAP Inventory — Configuration Complete                  ║
+          ╠═══════════════════════════════════════════════════════════════╣
+          ║                                                             ║
+          ║  Inventory:  {{ inventory_name }}{{ ' ' * (46 - inventory_name | length) }}║
+          ║  Hosts:      {{ lab_hosts | length }} systems                                      ║
+          ║  Groups:     {{ lab_groups | length }} groups                                       ║
+          ║                                                             ║
+          ║  ┌─────────────┬─────────────────┬──────────────────┐       ║
+          ║  │ Host        │ IP              │ Group            │       ║
+          ║  ├─────────────┼─────────────────┼──────────────────┤       ║
+          ║  │ central     │ 192.168.1.11    │ zta_services     │       ║
+          ║  │ control     │ 192.168.1.10    │ automation       │       ║
+          ║  │ vault       │ 192.168.1.12    │ vault_servers    │       ║
+          ║  │ netbox      │ 192.168.1.15    │ netbox_servers   │       ║
+          ║  │ wazuh       │ 192.168.1.13    │ wazuh_servers    │       ║
+          ║  │ app         │ 192.168.1.11    │ app_servers      │       ║
+          ║  │ db          │ 192.168.1.11    │ db_servers       │       ║
+          ║  │ ceos1       │ 192.168.1.11    │ network          │       ║
+          ║  │ ceos2       │ 192.168.1.11    │ network          │       ║
+          ║  │ ceos3       │ 192.168.1.11    │ network          │       ║
+          ║  └─────────────┴─────────────────┴──────────────────┘       ║
+          ║                                                             ║
+          ║  Network devices use: arista.eos.eos / network_cli          ║
+          ║  Linux hosts use:     SSH as rhel                           ║
+          ║  Container hosts:     SSH via published ports on central    ║
+          ║    app → :2023, db → :2022                                  ║
+          ║    ceos1 → :2001, ceos2 → :2002, ceos3 → :2003             ║
+          ║                                                             ║
+          ║  SCM source: {{ aap_inventory_scm_source_name }} ({{ aap_inventory_scm_path }}) ║
+          ║    Merges inventory/group_vars/all.yml when project '{{ aap_workshop_project_name }}' exists ║
+          ║                                                             ║
+          ╚═══════════════════════════════════════════════════════════════╝

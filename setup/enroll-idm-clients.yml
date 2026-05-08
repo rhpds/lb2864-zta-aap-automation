@@ -1,0 +1,63 @@
+---
+# enroll-idm-clients.yml — Enroll RHEL servers and AAP as IdM clients
+#
+# Uses the redhat.rhel_idm.ipaclient role to install ipa-client on every
+# Linux host (except the IdM server itself and the Arista switches), trust
+# the IdM CA, and enable SSSD so that IdM users can log in over SSH and
+# sudo rules from IdM are enforced.
+#
+# Usage:
+#   ansible-playbook setup/enroll-idm-clients.yml
+#
+# Prerequisites:
+#   - IdM (central.zta.lab) is installed and running
+#   - DNS is configured so hosts can resolve central.zta.lab
+#     (run setup/configure-dns.yml first, or use /etc/hosts)
+
+- name: Enroll Linux hosts as IdM clients
+  hosts: idm_clients
+  become: true
+  gather_facts: true
+
+  vars:
+    ipaclient_domain: "{{ idm_domain }}"
+    ipaclient_realm: "{{ idm_realm }}"
+    ipaclient_servers: "{{ idm_hostname }}"
+    ipaadmin_principal: admin
+    ipaadmin_password: "{{ idm_admin_password }}"
+    ipaclient_mkhomedir: true
+    ipaclient_force_ntpd: true
+
+  roles:
+    - role: redhat.rhel_idm.ipaclient
+      state: present
+
+  tasks:
+    - name: Verify SSSD is running
+      systemd:
+        name: sssd
+        state: started
+        enabled: true
+
+    - name: Verify IdM CA trust is installed
+      stat:
+        path: /etc/ipa/ca.crt
+      register: ca_cert
+
+    - name: Assert IdM CA cert exists
+      assert:
+        that: ca_cert.stat.exists
+        fail_msg: "/etc/ipa/ca.crt missing — enrollment may have failed"
+
+    - name: Test IdM user resolution via SSSD
+      command: "id admin@{{ idm_domain }}"
+      register: id_test
+      changed_when: false
+      failed_when: false
+
+    - name: Display enrollment result
+      debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          enrolled={{ ca_cert.stat.exists }},
+          admin lookup={{ 'OK' if id_test.rc == 0 else 'FAILED (user may need time to propagate)' }}

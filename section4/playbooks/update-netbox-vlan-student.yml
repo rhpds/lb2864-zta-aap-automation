@@ -1,0 +1,87 @@
+---
+# Section 4 — Student Exercise: Update NetBox CMDB after VLAN creation
+#
+# After a VLAN is created on the switches, the CMDB must be updated to remain
+# the single source of truth. This is a core ZTA principle: if the CMDB says
+# a VLAN doesn't exist, monitoring and compliance tools treat it as rogue.
+#
+# YOUR TASK: Complete the NetBox API calls to:
+#   1. Check if the VLAN already exists in NetBox
+#   2. Create the VLAN record if it doesn't exist
+#   3. Display a summary of what was done
+#
+# Hints:
+#   - NetBox API base URL: {{ netbox_url }}
+#   - NetBox API token: {{ netbox_token }}
+#   - VLAN list endpoint: /api/ipam/vlans/
+#   - Filter by VLAN ID: ?vid=<number>
+#   - POST body needs: vid (int), name (string), status ("active")
+#   - Always include Authorization header: "Token {{ netbox_token }}"
+#
+# This playbook is designed to run AFTER configure-vlan.yml has created the
+# VLAN on the switches. In the full workflow, OPA approval is verified before
+# this play runs.
+
+- name: Update Netbox CMDB with New VLAN
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  vars:
+    new_vlan_id: "{{ new_vlan_id | int }}"
+    new_vlan_name: "{{ new_vlan_name | default('NEW-VLAN') }}"
+    network_user: "{{ awx_user_name | default('unknown') }}"
+
+  tasks:
+    # ── YOUR CODE STARTS HERE ───────────────────────────────────────
+
+    # TASK 1: Check if the VLAN already exists in NetBox
+    #
+    # Use the uri module to GET from the VLAN list endpoint with a filter.
+    # Register the result so you can check .json.count to see if it exists.
+
+    # - name: Check if VLAN already exists in Netbox
+    #   uri:
+    #     url: "{{ netbox_url }}/api/ipam/vlans/?vid={{ new_vlan_id }}"
+    #     method: GET
+    #     headers:
+    #       Authorization: "Token {{ netbox_token }}"
+    #   register: netbox_vlan_check
+
+    # TASK 2: Create the VLAN in NetBox if it doesn't exist
+    #
+    # Use the uri module to POST a new VLAN. Only run this task when
+    # the VLAN was not found in the previous check (count == 0).
+    # The body needs: vid, name, status, and a description.
+    # Accept status codes 201 (created) and 400 (already exists race condition).
+
+    # - name: Create VLAN in Netbox
+    #   uri:
+    #     url: "FILL_IN"
+    #     method: POST
+    #     headers:
+    #       Authorization: "Token {{ netbox_token }}"
+    #       Content-Type: application/json
+    #     body_format: json
+    #     body:
+    #       vid: "FILL_IN — must be an integer"
+    #       name: "FILL_IN"
+    #       status: active
+    #       description: "Created via ZTA Workshop by {{ network_user }}"
+    #     status_code: [201, 400]
+    #   register: netbox_create
+    #   when: "FILL_IN — only create if count is 0"
+
+    # TASK 3: Display a summary of the CMDB update
+
+    # - name: CMDB update summary
+    #   debug:
+    #     msg: |
+    #       NetBox CMDB Update:
+    #         VLAN ID:   {{ new_vlan_id }}
+    #         VLAN Name: {{ new_vlan_name }}
+    #         Status:    {{ 'Created' if netbox_vlan_check.json.count == 0 else 'Already exists' }}
+    #         User:      {{ network_user }}
+    #
+    #       The CMDB is now the authoritative source of truth for this VLAN.
+    #       Any VLAN on the network without a matching CMDB record is considered rogue.

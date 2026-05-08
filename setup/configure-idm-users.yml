@@ -1,0 +1,112 @@
+---
+# Pre-workshop setup: Create IdM organisational structure, users, and groups
+- name: Configure IdM Users and Groups for Workshop
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  tasks:
+    # ── Teams (organisational grouping) ──
+    - name: Create organisational teams
+      redhat.rhel_idm.ipagroup:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        state: present
+      loop: "{{ idm_teams }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ── Functional groups (used by OPA policies) ──
+    - name: Create functional groups
+      redhat.rhel_idm.ipagroup:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        state: present
+      loop: "{{ idm_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ── Users ──
+    - name: Create workshop users
+      redhat.rhel_idm.ipauser:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ item.uid }}"
+        first: "{{ item.first }}"
+        last: "{{ item.last }}"
+        title: "{{ item.title | default(omit) }}"
+        password: "{{ idm_admin_password }}"
+        update_password: on_create
+        state: present
+      loop: "{{ idm_workshop_users }}"
+      loop_control:
+        label: "{{ item.uid }} ({{ item.first }} {{ item.last }})"
+
+    # ── Group memberships ──
+    - name: Add users to their groups
+      redhat.rhel_idm.ipagroup:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: "{{ item.1 }}"
+        user: "{{ item.0.uid }}"
+        action: member
+        state: present
+      loop: "{{ idm_workshop_users | subelements('groups', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.uid }} → {{ item.1 }}"
+
+    # ── Service accounts ──
+    - name: Create keycloak-svc bind user
+      redhat.rhel_idm.ipauser:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: keycloak-svc
+        first: Keycloak
+        last: Service
+        title: "LDAP bind account for Keycloak"
+        loginshell: /sbin/nologin
+        password: "{{ idm_admin_password }}"
+        update_password: on_create
+        state: present
+
+    - name: Create vault-svc service account
+      redhat.rhel_idm.ipauser:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: vault-svc
+        first: Vault
+        last: Service
+        title: "Service account for Vault LDAP auth"
+        loginshell: /sbin/nologin
+        password: "{{ idm_admin_password }}"
+        update_password: on_create
+        state: present
+
+    # ── Summary ──
+    - name: Display IdM configuration summary
+      debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════════════════╗
+          ║            IdM Directory — Configuration Complete            ║
+          ╠═══════════════════════════════════════════════════════════════╣
+          ║                                                             ║
+          ║  Teams (organisational):                                    ║
+          {% for t in idm_teams %}
+          ║    {{ ('● ' + t.name) }}║
+          {% endfor %}
+          ║                                                             ║
+          ║  Functional Groups (OPA policy):                            ║
+          {% for g in idm_groups %}
+          ║    {{ ('● ' + g.name + ' — ' + g.description) }}║
+          {% endfor %}
+          ║                                                             ║
+          ║  Users ({{ idm_workshop_users | length }} total):                                          ║
+          ║                                                             ║
+          {% for u in idm_workshop_users %}
+          ║    {{ ('● ' + u.uid) }}{{ u.first }}{{ u.last }}{{ (u.groups | join(', '))[:21] }}║
+          {% endfor %}
+          ║                                                             ║
+          ║  Service Accounts:                                          ║
+          ║    ● keycloak-svc (LDAP bind)                               ║
+          ║    ● vault-svc    (Vault LDAP auth)                         ║
+          ║                                                             ║
+          ║  All user passwords: {{ idm_admin_password }}║
+          ╚═══════════════════════════════════════════════════════════════╝

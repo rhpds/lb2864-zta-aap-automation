@@ -1,0 +1,203 @@
+---
+# Deploy code-server (VS Code in the browser) on central
+#
+# Provides a browser-based IDE for workshop participants to edit playbooks,
+# Rego policies, and configuration files without needing a local editor.
+#
+# Services exposed:
+#   - Web UI:  http://central.zta.lab:8443
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-code-server.yml
+
+- name: Deploy code-server on central
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    codeserver_user: rhel
+    codeserver_home: /home/rhel
+    codeserver_port: 8443
+    codeserver_service: code-server
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 1 — Install code-server (standalone)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Check if code-server is already installed
+      ansible.builtin.stat:
+        path: "{{ codeserver_home }}/.local/lib/code-server-{{ codeserver_version | default('latest') }}"
+      register: codeserver_bin_check
+      failed_when: false
+
+    - name: Download code-server install script
+      ansible.builtin.get_url:
+        url: https://code-server.dev/install.sh
+        dest: /tmp/code-server-install.sh
+        mode: '0755'
+
+    - name: Install code-server (standalone method)
+      ansible.builtin.command:
+        cmd: /tmp/code-server-install.sh --method=standalone
+      environment:
+        HOME: "{{ codeserver_home }}"
+      become_user: "{{ codeserver_user }}"
+      register: codeserver_install
+      changed_when: "'already installed' not in codeserver_install.stdout"
+
+    - name: Remove install script
+      ansible.builtin.file:
+        path: /tmp/code-server-install.sh
+        state: absent
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 2 — VS Code user settings
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Create VS Code settings directory
+      ansible.builtin.file:
+        path: "{{ codeserver_home }}/.local/share/code-server/User"
+        state: directory
+        owner: "{{ codeserver_user }}"
+        group: "{{ codeserver_user }}"
+        mode: '0755'
+
+    - name: Write VS Code settings.json
+      ansible.builtin.copy:
+        dest: "{{ codeserver_home }}/.local/share/code-server/User/settings.json"
+        owner: "{{ codeserver_user }}"
+        group: "{{ codeserver_user }}"
+        mode: '0644'
+        content: |
+          {
+            "git.ignoreLegacyWarning": true,
+            "window.menuBarVisibility": "visible",
+            "git.enableSmartCommit": true,
+            "workbench.tips.enabled": false,
+            "workbench.startupEditor": "readme",
+            "telemetry.enableTelemetry": false,
+            "search.smartCase": true,
+            "git.confirmSync": false,
+            "workbench.colorTheme": "Visual Studio Dark",
+            "update.showReleaseNotes": false,
+            "update.mode": "none",
+            "files.exclude": {
+              "**/.*": true
+            },
+            "security.workspace.trust.enabled": false,
+            "redhat.telemetry.enabled": false
+          }
+      register: settings_file
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 3 — code-server config
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Create code-server config directory
+      ansible.builtin.file:
+        path: "{{ codeserver_home }}/.config/code-server"
+        state: directory
+        owner: "{{ codeserver_user }}"
+        group: "{{ codeserver_user }}"
+        mode: '0755'
+
+    - name: Write code-server config.yaml
+      ansible.builtin.copy:
+        dest: "{{ codeserver_home }}/.config/code-server/config.yaml"
+        owner: "{{ codeserver_user }}"
+        group: "{{ codeserver_user }}"
+        mode: '0644'
+        content: |
+          bind-addr: 0.0.0.0:{{ codeserver_port }}
+          auth: none
+          password: netbox
+          cert: false
+      register: config_file
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 4 — Systemd service
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Deploy systemd service for code-server
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/{{ codeserver_service }}.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=code-server (VS Code in browser)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ codeserver_user }}
+          WorkingDirectory={{ codeserver_home }}
+          ExecStart={{ codeserver_home }}/.local/bin/code-server
+          Restart=always
+          RestartSec=5
+          Environment=HOME={{ codeserver_home }}
+
+          [Install]
+          WantedBy=multi-user.target
+      register: systemd_file
+
+    - name: Enable and restart code-server
+      ansible.builtin.systemd:
+        name: "{{ codeserver_service }}"
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      when: settings_file.changed or config_file.changed or systemd_file.changed or codeserver_install.changed
+
+    - name: Ensure code-server is running
+      ansible.builtin.systemd:
+        name: "{{ codeserver_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 5 — Firewall
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Open port {{ codeserver_port }}/tcp in firewalld
+      ansible.posix.firewalld:
+        port: "{{ codeserver_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      failed_when: false
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 6 — Verify
+    # ═══════════════════════════════════════════════════════════════════════
+
+    - name: Wait for code-server to be ready
+      ansible.builtin.uri:
+        url: "http://localhost:{{ codeserver_port }}"
+        method: GET
+        status_code: [200, 302]
+      register: codeserver_health
+      until: codeserver_health.status in [200, 302]
+      retries: 12
+      delay: 5
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║     code-server (VS Code) — Deployed                        ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  URL:       http://{{ ansible_host }}:{{ codeserver_port }}{{ ' ' * (28 - ansible_host | length) }}║
+          ║  Auth:      none (no password required)                      ║
+          ║                                                              ║
+          ║  Service:   systemctl status {{ codeserver_service }}                   ║
+          ║  Logs:      journalctl -u {{ codeserver_service }} -f                  ║
+          ║  Restart:   systemctl restart {{ codeserver_service }}                  ║
+          ║                                                              ║
+          ║  Config:    {{ codeserver_home }}/.config/code-server/config.yaml       ║
+          ║  Settings:  {{ codeserver_home }}/.local/share/code-server/User/        ║
+          ╚════════════════════════════════════════════════════════════════╝

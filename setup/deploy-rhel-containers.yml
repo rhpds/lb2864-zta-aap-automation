@@ -1,0 +1,477 @@
+---
+# Deploy two RHEL "VM-like" containers on central for DB and App
+#
+# These are full systemd-enabled RHEL UBI9 containers that:
+#   - Run systemd as PID 1
+#   - Have SSH enabled (so AAP can manage them like real hosts)
+#   - Support dnf patching (for workshop Section 3 exercises)
+#   - Persist data across restarts
+#   - Are connected to the Arista cEOS switch fabric for data-plane routing
+#   - Are enrolled as IdM clients (DNS, Kerberos, HBAC)
+#
+# Prerequisites:
+#   - setup/deploy-arista.yml must be run first (creates net2/net3 with subnets)
+#
+# Network architecture:
+#   Management plane (192.168.1.x via port forwarding):
+#     DB:  SSH :2022, PostgreSQL :5432
+#     App: SSH :2023, HTTP :8081
+#   Data plane (routed through cEOS switches):
+#     DB:  10.30.0.10 on net2 (data-tier, via ceos2)
+#     App: 10.20.0.10 on net3 (app-tier, via ceos3)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-rhel-containers.yml
+
+- name: Deploy RHEL systemd containers for DB and App
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    rhel_image: registry.access.redhat.com/ubi9/ubi-init:latest
+    container_user: rhel
+    container_password: "{{ idm_admin_password }}"
+    central_ip: "{{ ansible_host | default('192.168.1.11') }}"
+    upstream_dns: "{{ upstream_dns_server | default('172.30.0.10') }}"
+    containers:
+      - name: db
+        hostname: db.zta.lab
+        ssh_port: 2022
+        extra_ports:
+          - "5432:5432"
+        packages:
+          - postgresql-server
+          - postgresql
+          - python3-psycopg2
+          - python3
+        data_volume: db-data
+        data_network: net2
+        data_ip: "10.30.0.10"
+        data_gateway: "10.30.0.1"
+        peer_network: "10.20.0.0/24"
+      - name: app
+        hostname: app.zta.lab
+        ssh_port: 2023
+        extra_ports:
+          - "8081:8081"
+        packages:
+          - python3
+          - python3-pip
+        data_volume: app-data
+        data_network: net3
+        data_ip: "10.20.0.10"
+        data_gateway: "10.20.0.1"
+        peer_network: "10.30.0.0/24"
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Prerequisites
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Ensure podman is installed
+      dnf:
+        name:
+          - podman
+          - python3-podman
+        state: present
+
+    - name: Pull RHEL UBI9 init image
+      command: "podman pull {{ rhel_image }}"
+      register: pull_result
+      changed_when: "'Pulling' in pull_result.stdout or pull_result.rc == 0"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Build a systemd+SSH enabled image
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Create build directory
+      file:
+        path: /opt/rhel-containers
+        state: directory
+        mode: '0755'
+
+    - name: Write Containerfile for SSH-enabled RHEL
+      copy:
+        dest: /opt/rhel-containers/Containerfile
+        mode: '0644'
+        content: |
+          FROM {{ rhel_image }}
+
+          RUN dnf -y install openssh-server openssh-clients sudo passwd procps-ng \
+              iproute iputils dnf-utils ipa-client bind-utils && \
+              dnf clean all && \
+              ssh-keygen -A && \
+              sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+              sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+              systemctl enable sshd
+
+          RUN useradd -m -s /bin/bash {{ container_user }} && \
+              echo "{{ container_user }}:{{ container_password }}" | chpasswd && \
+              echo "{{ container_user }} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/{{ container_user }}
+
+          RUN echo "root:{{ container_password }}" | chpasswd
+
+          EXPOSE 22
+
+          CMD ["/sbin/init"]
+
+    - name: Build SSH-enabled RHEL image
+      command: >
+        podman build
+        --network host
+        -v /etc/pki/entitlement:/etc/pki/entitlement:z
+        -v /etc/rhsm:/etc/rhsm:z
+        -t rhel-ssh:latest
+        -f /opt/rhel-containers/Containerfile
+        /opt/rhel-containers/
+      register: build_result
+      changed_when: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — Stop any existing containers
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Stop and remove existing containers
+      command: "podman rm -f {{ item.name }}"
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+      changed_when: false
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Start containers
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Start RHEL systemd containers
+      shell: >
+        podman run -d
+        --name {{ item.name }}
+        --hostname {{ item.hostname }}
+        --privileged
+        --restart always
+        -v {{ item.data_volume }}:/data:z
+        -v /etc/pki/entitlement:/etc/pki/entitlement:z
+        -v /etc/rhsm:/etc/rhsm:z
+        -p {{ item.ssh_port }}:22
+        {% for p in item.extra_ports %}
+        -p {{ p }}
+        {% endfor %}
+        rhel-ssh:latest
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for SSH to be available
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ item.ssh_port }}"
+        timeout: 30
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }} (port {{ item.ssh_port }})"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — Configure DNS (must happen before dnf for repo access)
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Configure DNS resolver (IdM + upstream fallback)
+      shell: >-
+        podman exec {{ item.name }} bash -c
+        'printf "search zta.lab\nnameserver {{ central_ip }}\nnameserver {{ upstream_dns }}\n" > /etc/resolv.conf'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+
+    - name: Verify internal DNS (zta.lab via IdM)
+      command: >
+        podman exec {{ item.name }}
+        dig +short central.zta.lab @{{ central_ip }}
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dns_verify_internal
+      changed_when: false
+      failed_when: false
+
+    - name: Verify external DNS (cdn.redhat.com for repo access)
+      command: >
+        podman exec {{ item.name }}
+        dig +short cdn.redhat.com
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dns_verify_external
+      changed_when: false
+      failed_when: false
+
+    - name: Set external DNS reachable flag
+      set_fact:
+        external_dns_ok: >-
+          {{ dns_verify_external.results | map(attribute='stdout') |
+             select('match', '.+') | list | length == containers | length }}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6 — Install role-specific packages
+    #   Strategy: try direct dnf first. If external DNS is down, fall
+    #   back to downloading RPMs on central and copying them in.
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Install packages in containers (online)
+      command: >
+        podman exec {{ item.name }}
+        dnf -y install {{ item.packages | join(' ') }}
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: pkg_install
+      changed_when: "'Complete!' in pkg_install.stdout"
+      when: external_dns_ok | bool
+
+    # ── Offline fallback: download on central, copy in, localinstall ──
+
+    - name: Create RPM staging directories on central
+      file:
+        path: "/tmp/rpms-{{ item.name }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not (external_dns_ok | bool)
+
+    - name: Download RPMs on central (has RHSM repos)
+      command: >
+        dnf download --resolve --alldeps
+        --destdir /tmp/rpms-{{ item.name }}
+        {{ item.packages | join(' ') }}
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: rpm_download
+      changed_when: true
+      when: not (external_dns_ok | bool)
+
+    - name: Copy RPMs into containers
+      command: "podman cp /tmp/rpms-{{ item.name }} {{ item.name }}:/tmp/rpms"
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not (external_dns_ok | bool)
+
+    - name: Install RPMs locally inside containers (offline)
+      shell: >
+        podman exec {{ item.name }} bash -c
+        'dnf -y localinstall /tmp/rpms/*.rpm && rm -rf /tmp/rpms'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: pkg_install_offline
+      changed_when: "'Complete!' in (pkg_install_offline.stdout | default(''))"
+      when: not (external_dns_ok | bool)
+
+    - name: Clean up RPM staging on central
+      file:
+        path: "/tmp/rpms-{{ item.name }}"
+        state: absent
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not (external_dns_ok | bool)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Verify SSH and dnf
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Verify SSH access to containers
+      command: >
+        sshpass -p '{{ container_password }}'
+        ssh -o StrictHostKeyChecking=no
+        -p {{ item.ssh_port }}
+        {{ container_user }}@localhost
+        hostname
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ssh_verify
+      changed_when: false
+
+    - name: Verify dnf works (patching readiness)
+      command: >
+        podman exec {{ item.name }} dnf check-update --quiet
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dnf_check
+      failed_when: false
+      changed_when: false
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 8 — Enable auto-start on boot
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Generate systemd service for RHEL containers
+      containers.podman.podman_generate_systemd:
+        name: "{{ item.name }}"
+        dest: /etc/systemd/system/
+        restart_policy: always
+        new: false
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Enable RHEL container systemd services
+      systemd:
+        name: "container-{{ item.name }}"
+        enabled: true
+        daemon_reload: true
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 9 — Connect containers to Arista switch fabric
+    #
+    # Persistent approach: write a NetworkManager keyfile inside each
+    # container so the data-plane IP and peer route survive restarts.
+    # The Podman-assigned IP on eth1 is left untouched — removing it
+    # breaks Podman's internal DNAT rules for port-forwarded services.
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Connect containers to data-plane networks
+      command: "podman network connect {{ item.data_network }} {{ item.name }}"
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.data_network }}"
+      register: net_connect
+      failed_when: net_connect.rc != 0 and 'already' not in (net_connect.stderr | default(''))
+
+    - name: Discover data-plane interface inside each container
+      shell: >-
+        podman exec {{ item.name }}
+        ip -o link show | awk -F': ' '{print $2}' | grep -v lo | tail -1 | sed 's/@.*//'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: data_ifaces
+      changed_when: false
+
+    # Add data-plane IP as a secondary address — never flush the Podman-
+    # assigned IP, which backs the container's port-forwarding DNAT rules.
+    - name: Add data-plane IP on containers (secondary, non-destructive)
+      shell: |
+        podman exec {{ item.item.name }} ip addr show dev {{ item.stdout | trim }} \
+          | grep -q '{{ item.item.data_ip }}/' \
+          || podman exec {{ item.item.name }} ip addr add {{ item.item.data_ip }}/24 dev {{ item.stdout | trim }}
+        podman exec {{ item.item.name }} ip link set {{ item.stdout | trim }} up
+      loop: "{{ data_ifaces.results }}"
+      loop_control:
+        label: "{{ item.item.name }}: {{ item.item.data_ip }}/24 on {{ item.stdout | trim }}"
+      changed_when: true
+
+    - name: Add route to peer data-plane network inside containers
+      shell: >-
+        podman exec {{ item.name }}
+        bash -c 'ip route show | grep -q "{{ item.peer_network }}" ||
+        ip route add {{ item.peer_network }} via {{ item.data_gateway }}'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}: {{ item.peer_network }} via {{ item.data_gateway }}"
+      changed_when: true
+      failed_when: false
+
+    # Write a NetworkManager keyfile so the data-plane IP and peer route
+    # survive container restarts.  printf avoids heredoc indentation issues
+    # with YAML (square-bracket INI section headers confuse the YAML parser).
+    - name: Write persistent NetworkManager keyfile for data-plane interface
+      shell: |
+        podman exec {{ item.item.name }} bash -c '
+          mkdir -p /etc/NetworkManager/system-connections
+          printf "%s\n" \
+            "[connection]" \
+            "id=dataplane" \
+            "type=ethernet" \
+            "interface-name={{ item.stdout | trim }}" \
+            "autoconnect=true" \
+            "" \
+            "[ethernet]" \
+            "" \
+            "[ipv4]" \
+            "method=auto" \
+            "address1={{ item.item.data_ip }}/24" \
+            "route1={{ item.item.peer_network }},{{ item.item.data_gateway }}" \
+            "" \
+            "[ipv6]" \
+            "method=disabled" \
+            > /etc/NetworkManager/system-connections/dataplane.nmconnection
+          chmod 600 /etc/NetworkManager/system-connections/dataplane.nmconnection
+          nmcli connection reload 2>/dev/null || true
+        '
+      loop: "{{ data_ifaces.results }}"
+      loop_control:
+        label: "{{ item.item.name }}: persist {{ item.item.data_ip }} on {{ item.stdout | trim }}"
+      changed_when: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 10 — IdM client enrollment
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Enroll containers as IdM clients
+      shell: |
+        podman exec {{ item.name }} bash -c '
+        if [ -f /etc/ipa/default.conf ]; then
+          echo "Already enrolled"
+          exit 0
+        fi
+        ipa-client-install \
+          --hostname={{ item.hostname }} \
+          --server=central.zta.lab \
+          --domain=zta.lab \
+          --realm=ZTA.LAB \
+          --principal=admin \
+          --password={{ idm_admin_password }} \
+          --mkhomedir \
+          --force-join \
+          --unattended \
+          --no-ntp
+        '
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.hostname }}"
+      register: idm_enroll
+      changed_when: "'Already enrolled' not in (idm_enroll.stdout | default(''))"
+      failed_when: false
+
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║     RHEL Containers — Deployment Complete                     ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  DB Container:                                               ║
+          ║    SSH:        ssh {{ container_user }}@central.zta.lab -p 2022
+          ║    PostgreSQL: central.zta.lab:5432                          ║
+          ║    Hostname:   db.zta.lab                                    ║
+          ║    Data IP:    10.30.0.10 (net2 / data-tier via ceos2)       ║
+          ║                                                              ║
+          ║  App Container:                                              ║
+          ║    SSH:        ssh {{ container_user }}@central.zta.lab -p 2023
+          ║    HTTP:       http://central.zta.lab:8081                   ║
+          ║    Hostname:   app.zta.lab                                   ║
+          ║    Data IP:    10.20.0.10 (net3 / app-tier via ceos3)        ║
+          ║                                                              ║
+          ║  Credentials:  {{ container_user }} / {{ container_password }}
+          ║  Privilege:    sudo (NOPASSWD)                               ║
+          ║  Patching:     dnf update works in both containers           ║
+          ║  DNS:          Resolves via IdM ({{ central_ip }})
+          ║  IdM enrolled: {{ 'Yes' if idm_enroll is defined else 'Skipped' }}
+          ║                                                              ║
+          ║  Data-Plane (via Arista cEOS switches):                      ║
+          ║    App (10.20.0.10) ↔ ceos3 ↔ ceos1 ↔ ceos2 ↔ DB (10.30.0.10)
+          ║    ACL: app→db:5432 PERMIT, all other cross-tier DENY        ║
+          ║                                                              ║
+          ║  Next: run setup/deploy-db-app.yml                           ║
+          ╚════════════════════════════════════════════════════════════════╝

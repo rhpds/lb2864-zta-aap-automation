@@ -1,0 +1,269 @@
+---
+# Included by configure-aap-podman-gateway-prereqs.yml and optionally configure-aap-ldap.yml.
+# Target: [automation] (AAP on Podman). Podman must use the rootless owner's graphroot
+# (aap_podman_run_user, default rhel). If ansible_user is root, tasks use become to that user.
+# If ansible_user is already that owner, become is skipped so podman matches an interactive rhel
+# shell (sudo -u rhel -i can differ and trigger overlay / merged/etc/passwd errors).
+#
+# Host resolution strategy: lab hostnames are written to /etc/hosts on the control host.
+# Podman containers inherit the host /etc/hosts at runtime (base_hosts_file default), so all
+# containers resolve lab names without changing the DNS server they use. This is preferred over
+# a containers.conf.d [network] dns_servers drop-in which globally redirects all container DNS.
+
+- name: Resolve IdM / central IP for /etc/hosts entries and CA download
+  ansible.builtin.set_fact:
+    aap_podman_central_ip: >-
+      {{ idm_ip | default(
+           (('zta_services' in groups) and (groups['zta_services'] | length > 0)) | ternary(
+             hostvars[groups['zta_services'][0]]['ansible_host'],
+             '192.168.1.11'
+           ), true) }}
+
+- name: Resolve Vault IP for /etc/hosts entries
+  ansible.builtin.set_fact:
+    aap_podman_vault_ip: >-
+      {{ vault_ip | default(
+           (('vault_servers' in groups) and (groups['vault_servers'] | length > 0)) | ternary(
+             hostvars[groups['vault_servers'][0]]['ansible_host'],
+             '192.168.1.12'
+           ), true) }}
+
+- name: Resolve NetBox IP for /etc/hosts entries
+  ansible.builtin.set_fact:
+    aap_podman_netbox_ip: >-
+      {{ netbox_ip | default(
+           (('netbox_servers' in groups) and (groups['netbox_servers'] | length > 0)) | ternary(
+             hostvars[groups['netbox_servers'][0]]['ansible_host'],
+             '192.168.1.15'
+           ), true) }}
+
+- name: Resolve Wazuh IP for /etc/hosts entries
+  ansible.builtin.set_fact:
+    aap_podman_wazuh_ip: >-
+      {{ wazuh_ip | default(
+           (('wazuh_servers' in groups) and (groups['wazuh_servers'] | length > 0)) | ternary(
+             hostvars[groups['wazuh_servers'][0]]['ansible_host'],
+             '192.168.1.13'
+           ), true) }}
+
+- name: Default IdM CA download URL (HTTP to central)
+  ansible.builtin.set_fact:
+    aap_podman_idm_ca_url_effective: "{{ aap_podman_idm_ca_url | default('http://' ~ aap_podman_central_ip ~ '/ipa/config/ca.crt') }}"
+
+- name: Decide whether Podman tasks need become to the rootless owner
+  ansible.builtin.set_fact:
+    aap_podman_need_owner_become: "{{ (ansible_user | default('', true)) != (aap_podman_run_user | default('rhel')) }}"
+
+# central.zta.lab also covers splunk.zta.lab, app.zta.lab, db.zta.lab — all run as
+# containers on central and are reached via published ports on its management IP.
+- name: Add lab hostnames to /etc/hosts (inherited by all Podman containers)
+  when: not (aap_podman_skip_dns | default(false) | bool)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    state: present
+  loop:
+    - regexp: '.*\bcentral\.zta\.lab\b.*'
+      line: "{{ aap_podman_central_ip }}  central.zta.lab splunk.zta.lab app.zta.lab db.zta.lab"
+    - regexp: '.*\bvault\.zta\.lab\b.*'
+      line: "{{ aap_podman_vault_ip }}  vault.zta.lab"
+    - regexp: '.*\bnetbox\.zta\.lab\b.*'
+      line: "{{ aap_podman_netbox_ip }}  netbox.zta.lab"
+    - regexp: '.*\bwazuh\.zta\.lab\b.*'
+      line: "{{ aap_podman_wazuh_ip }}  wazuh.zta.lab"
+  become: true
+
+- name: Stat IdM CA on control host (IdM-enrolled clients)
+  ansible.builtin.stat:
+    path: /etc/ipa/ca.crt
+  register: aap_podman_ipa_ca_stat
+
+- name: Stage IdM CA from /etc/ipa/ca.crt
+  when:
+    - not (aap_podman_skip_ca | default(false) | bool)
+    - (aap_podman_ca_path_remote | default('') | length) == 0
+    - aap_podman_ipa_ca_stat.stat.exists | bool
+  ansible.builtin.copy:
+    src: /etc/ipa/ca.crt
+    dest: "{{ aap_podman_ca_staged_path }}"
+    remote_src: true
+    mode: '0644'
+  become: true
+
+- name: Stage IdM CA from explicit path on target
+  when:
+    - not (aap_podman_skip_ca | default(false) | bool)
+    - (aap_podman_ca_path_remote | default('') | length) > 0
+  ansible.builtin.copy:
+    src: "{{ aap_podman_ca_path_remote }}"
+    dest: "{{ aap_podman_ca_staged_path }}"
+    remote_src: true
+    mode: '0644'
+
+- name: Download IdM CA when not present on disk
+  when:
+    - not (aap_podman_skip_ca | default(false) | bool)
+    - (aap_podman_ca_path_remote | default('') | length) == 0
+    - not (aap_podman_ipa_ca_stat.stat.exists | bool)
+  ansible.builtin.get_url:
+    url: "{{ aap_podman_idm_ca_url_effective }}"
+    dest: "{{ aap_podman_ca_staged_path }}"
+    mode: '0644'
+
+- name: Resolve rootless Podman user uid (for XDG_RUNTIME_DIR when Ansible runs as root)
+  when: >-
+    (not (aap_podman_skip_ca | default(false) | bool))
+    or (not (aap_podman_skip_restart | default(false) | bool))
+  ansible.builtin.command: getent passwd {{ aap_podman_run_user | default('rhel') }}
+  register: aap_podman_getent_passwd
+  changed_when: false
+  failed_when: aap_podman_getent_passwd.rc != 0
+
+- name: Set facts for rootless Podman environment
+  when: >-
+    (not (aap_podman_skip_ca | default(false) | bool))
+    or (not (aap_podman_skip_restart | default(false) | bool))
+  ansible.builtin.set_fact:
+    aap_podman_run_uid: "{{ aap_podman_getent_passwd.stdout.split(':')[2] }}"
+
+- name: Check automation-gateway container exists (rootless podman user)
+  when: not (aap_podman_skip_ca | default(false) | bool)
+  ansible.builtin.command:
+    cmd: podman inspect {{ aap_podman_gateway_container }}
+  register: aap_podman_gw_inspect
+  changed_when: false
+  failed_when: aap_podman_gw_inspect.rc != 0
+  become: "{{ aap_podman_need_owner_become | bool }}"
+  become_user: "{{ aap_podman_run_user | default('rhel') }}"
+  become_flags: "{{ '-i' if (aap_podman_need_owner_become | bool) else omit }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ aap_podman_run_uid }}"
+
+- name: Install IdM CA into gateway container trust store
+  when: not (aap_podman_skip_ca | default(false) | bool)
+  ansible.builtin.command:
+    cmd: >-
+      podman cp {{ aap_podman_ca_staged_path }}
+      {{ aap_podman_gateway_container }}:/etc/pki/ca-trust/source/anchors/{{ aap_podman_ca_anchor_name }}
+  register: aap_podman_cp_ca
+  changed_when: aap_podman_cp_ca.rc == 0
+  become: "{{ aap_podman_need_owner_become | bool }}"
+  become_user: "{{ aap_podman_run_user | default('rhel') }}"
+  become_flags: "{{ '-i' if (aap_podman_need_owner_become | bool) else omit }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ aap_podman_run_uid }}"
+
+- name: Refresh CA trust inside gateway container
+  when: not (aap_podman_skip_ca | default(false) | bool)
+  ansible.builtin.command:
+    cmd: podman exec -u 0 {{ aap_podman_gateway_container }} update-ca-trust extract
+  changed_when: true
+  become: "{{ aap_podman_need_owner_become | bool }}"
+  become_user: "{{ aap_podman_run_user | default('rhel') }}"
+  become_flags: "{{ '-i' if (aap_podman_need_owner_become | bool) else omit }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ aap_podman_run_uid }}"
+
+# The AAP installer writes its internal TLS CA to /home/rhel/aap/tls/ca.cert on the host.
+# Some lab Podman setups inherit the host system trust store at container startup; others use
+# an isolated container trust store. We do both: update the host AND inject directly into the
+# gateway container's trust store, so it works regardless of Podman bind-mount configuration.
+- name: Install AAP TLS CA into host system trust store and gateway container
+  when: not (aap_podman_skip_aap_ca | default(false) | bool)
+  vars:
+    aap_podman_aap_ca_src: "{{ aap_podman_aap_ca_path | default('/home/rhel/aap/tls/ca.cert') }}"
+  block:
+    - name: Stat AAP TLS CA on host
+      ansible.builtin.stat:
+        path: "{{ aap_podman_aap_ca_src }}"
+      register: aap_podman_aap_ca_stat
+
+    - name: Copy AAP TLS CA to host system trust anchors
+      when: aap_podman_aap_ca_stat.stat.exists | bool
+      ansible.builtin.copy:
+        src: "{{ aap_podman_aap_ca_src }}"
+        dest: /etc/pki/ca-trust/source/anchors/aap-tls-ca.crt
+        remote_src: true
+        mode: '0644'
+      become: true
+
+    - name: Rebuild host system trust bundle
+      when: aap_podman_aap_ca_stat.stat.exists | bool
+      ansible.builtin.command: update-ca-trust
+      changed_when: true
+      become: true
+
+    # Copy into the container anchor dir then rebuild the bundle inside the container.
+    # update-ca-trust extract must run BEFORE the gateway restart so that when the container
+    # restarts, the workers start fresh and load the updated ca-bundle.crt from the overlay.
+    # The container does NOT auto-run update-ca-trust on start — the anchor file alone is
+    # not enough; the bundle file must be explicitly regenerated first.
+    - name: Copy AAP TLS CA into gateway container trust anchors
+      when: aap_podman_aap_ca_stat.stat.exists | bool
+      ansible.builtin.command:
+        cmd: podman cp {{ aap_podman_aap_ca_src }} {{ aap_podman_gateway_container }}:/etc/pki/ca-trust/source/anchors/aap-tls-ca.crt
+      changed_when: true
+      become: "{{ aap_podman_need_owner_become | bool }}"
+      become_user: "{{ aap_podman_run_user | default('rhel') }}"
+      become_flags: "{{ '-i' if (aap_podman_need_owner_become | bool) else omit }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ aap_podman_run_uid }}"
+
+    - name: Rebuild CA bundle inside gateway container
+      when: aap_podman_aap_ca_stat.stat.exists | bool
+      ansible.builtin.command:
+        cmd: podman exec -u 0 {{ aap_podman_gateway_container }} update-ca-trust extract
+      changed_when: true
+      become: "{{ aap_podman_need_owner_become | bool }}"
+      become_user: "{{ aap_podman_run_user | default('rhel') }}"
+      become_flags: "{{ '-i' if (aap_podman_need_owner_become | bool) else omit }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ aap_podman_run_uid }}"
+
+    - name: Warn if AAP TLS CA not found
+      when: not (aap_podman_aap_ca_stat.stat.exists | bool)
+      ansible.builtin.debug:
+        msg: "WARNING: AAP TLS CA not found at {{ aap_podman_aap_ca_src }} — run after AAP install."
+
+# podman restart can race overlay teardown and fail with:
+# "open .../merged/etc/passwd: no such file or directory" (rc 125). Stop + pause + start avoids that.
+- name: Restart automation-gateway (stop then start)
+  when: not (aap_podman_skip_restart | default(false) | bool)
+  become: "{{ aap_podman_need_owner_become | bool }}"
+  become_user: "{{ aap_podman_run_user | default('rhel') }}"
+  become_flags: "{{ '-i' if (aap_podman_need_owner_become | bool) else omit }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ aap_podman_run_uid }}"
+  block:
+    - name: Stop automation-gateway
+      ansible.builtin.command:
+        cmd: podman stop -t 90 {{ aap_podman_gateway_container }}
+      register: aap_podman_gate_stop
+      changed_when: aap_podman_gate_stop.rc == 0
+      failed_when: >-
+        aap_podman_gate_stop.rc != 0
+        and ('not running' not in (aap_podman_gate_stop.stderr | default('') | lower))
+
+    - name: Wait for gateway container filesystem to unmount
+      ansible.builtin.pause:
+        seconds: "{{ aap_podman_gateway_restart_pause | default(3) | int }}"
+
+    - name: Start automation-gateway
+      ansible.builtin.command:
+        cmd: podman start {{ aap_podman_gateway_container }}
+      register: aap_podman_gate_start
+      changed_when: true
+      until: aap_podman_gate_start.rc == 0
+      retries: "{{ aap_podman_gateway_restart_retries | default(3) | int }}"
+      delay: "{{ aap_podman_gateway_restart_delay | default(5) | int }}"
+
+- name: Summary — Podman gateway IdM LDAPS prerequisites
+  ansible.builtin.debug:
+    msg:
+      - "/etc/hosts entries: {{ 'added (central/vault/netbox/wazuh)' if not (aap_podman_skip_dns | default(false) | bool) else 'skipped' }}"
+      - "IdM CA staged: {{ aap_podman_ca_staged_path if not (aap_podman_skip_ca | default(false) | bool) else 'skipped' }}"
+      - "Gateway container: {{ aap_podman_gateway_container }}"
+      - "Verify: podman exec -it {{ aap_podman_gateway_container }} getent hosts central.zta.lab"
+      - "Verify TLS: podman exec {{ aap_podman_gateway_container }} openssl s_client -connect central.zta.lab:636 -brief </dev/null"
+      - "AAP TLS CA: {{ 'installed to host trust store' if not (aap_podman_skip_aap_ca | default(false) | bool) else 'skipped' }}"

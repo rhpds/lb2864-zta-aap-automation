@@ -1,0 +1,160 @@
+---
+# rotate-eda-webhook-token.yml — Rotate the EDA webhook token in Vault
+# and the Splunk "SplunkEDA" webhook notification.
+#
+# Generates a new random token, writes it to Vault KV at
+# secret/services/eda-webhook, then updates the Splunk webhook
+# alert action named "SplunkEDA" with the new token via REST API.
+#
+# After rotation the EDA credential must also be updated — either
+# re-run configure-aap-project.yml --tags eda,section5 or update
+# the "ZTA EDA Event Stream" credential manually in the EDA UI.
+#
+# Prerequisites:
+#   - Vault deployed, unsealed, KV v2 at secret/
+#   - Splunk deployed with the EDA webhook notification configured
+#   - The "SplunkEDA" webhook alert action exists on the target
+#     saved search (default: "ZTA: SSH Brute Force Detected")
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/rotate-eda-webhook-token.yml
+#   ansible-playbook -i inventory/hosts.ini setup/rotate-eda-webhook-token.yml --tags vault
+#   ansible-playbook -i inventory/hosts.ini setup/rotate-eda-webhook-token.yml --tags splunk
+#
+# Override saved search name:
+#   -e splunk_saved_search="My Custom Search"
+#
+# Override Splunk webhook name:
+#   -e splunk_webhook_name="My Webhook"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 1 — Generate new token and store in Vault
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "Phase 1 — Rotate EDA webhook token in Vault"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [vault, splunk]
+
+  vars:
+    vault_username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+    vault_password: "{{ lookup('env', 'VAULT_PASSWORD') | default('ansible123!', true) }}"
+    eda_webhook_vault_path: secret/data/services/eda-webhook
+    new_token: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=48') }}"
+
+  tasks:
+    - name: Authenticate to Vault
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/{{ vault_username }}"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ vault_password }}"
+        validate_certs: false
+        status_code: 200
+      register: _vault_login
+
+    - name: Read current token from Vault
+      uri:
+        url: "{{ vault_addr }}/v1/{{ eda_webhook_vault_path }}"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ _vault_login.json.auth.client_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: _current_secret
+
+    - name: Write new token to Vault KV
+      uri:
+        url: "{{ vault_addr }}/v1/{{ eda_webhook_vault_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ _vault_login.json.auth.client_token }}"
+        body_format: json
+        body:
+          data:
+            token: "{{ new_token }}"
+        validate_certs: false
+        status_code: [200, 204]
+
+    - name: Cache new token for Phase 2
+      ansible.builtin.set_fact:
+        _new_token: "{{ new_token }}"
+        _vault_token: "{{ _vault_login.json.auth.client_token }}"
+
+    - name: Report Vault rotation
+      ansible.builtin.debug:
+        msg: >-
+          Vault KV {{ eda_webhook_vault_path }}: token rotated.
+          Previous version: {{ _current_secret.json.data.metadata.version | default('none') }}.
+          New token: {{ new_token }}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 2 — Update the Splunk "SplunkEDA" webhook with the new token
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "Phase 2 — Update Splunk webhook with rotated token"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  tags: [splunk]
+
+  vars:
+    splunk_password: "{{ idm_admin_password }}"
+    splunk_mgmt: "https://localhost:8089"
+    splunk_saved_search: "ZTA: SSH Brute Force Detected"
+    splunk_webhook_name: "SplunkEDA"
+    _new_token: "{{ hostvars['localhost']['_new_token'] }}"
+
+  tasks:
+    - name: Wait for Splunk management API
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/services/server/info"
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _splunk_ready
+      until: _splunk_ready.status == 200
+      retries: 12
+      delay: 10
+
+    - name: Update SplunkEDA webhook token on saved search
+      ansible.builtin.uri:
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/saved/searches/{{ splunk_saved_search | urlencode }}"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          action.webhook.param.auth_token: "{{ _new_token }}"
+        status_code: [200]
+      register: _webhook_update
+
+    - name: Report Splunk update
+      ansible.builtin.debug:
+        msg: >-
+          Splunk saved search "{{ splunk_saved_search }}":
+          webhook token updated for "{{ splunk_webhook_name }}"
+
+    - name: Display rotation summary
+      ansible.builtin.debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════════════════════════╗
+          ║       EDA Webhook Token — Rotation Complete                         ║
+          ╠═══════════════════════════════════════════════════════════════════════╣
+          ║                                                                     ║
+          ║  Vault:   secret/services/eda-webhook — UPDATED                     ║
+          ║  Splunk:  "{{ splunk_saved_search }}" — webhook token UPDATED       ║
+          ║                                                                     ║
+          ║  New token: {{ _new_token }}                                        ║
+          ║                                                                     ║
+          ║  Next steps:                                                        ║
+          ║    1. Update the EDA credential — either:                           ║
+          ║       a) Re-run: ansible-playbook -i inventory/hosts.ini            ║
+          ║          setup/configure-aap-project.yml --tags eda,section5         ║
+          ║       b) Edit "ZTA EDA Event Stream" in EDA UI → paste new token    ║
+          ║    2. Restart any active EDA rulebook activations                    ║
+          ║                                                                     ║
+          ╚═══════════════════════════════════════════════════════════════════════╝

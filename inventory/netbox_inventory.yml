@@ -1,0 +1,15 @@
+plugin: netbox.netbox.nb_inventory
+config_context: true
+validate_certs: False
+group_by:
+  - platforms
+  - device_roles
+  - sites
+
+compose:
+  ansible_network_os: platform.name
+  # Containers (app, db) SSH through central with forwarded ports.
+  # Only override when the custom field is set; other devices keep ansible_host
+  # from primary_ip4 which nb_inventory resolves before compose runs.
+  ansible_host: custom_fields.host if custom_fields.host else ansible_host
+  ansible_port: (custom_fields.port | int) if custom_fields.port else 22

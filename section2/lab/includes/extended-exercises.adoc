@@ -1,0 +1,151 @@
+=== Exercise 2.6 — Credential rotation (optional)
+
+Schedule **Rotate DB Credentials** (e.g. every 5 minutes) to refresh Vault leases and restart the app.
+
+[TIP]
+.Continuous authorisation in practice
+====
+Rotation ties **availability** to **ongoing permission to run automation**: if someone loses access to AAP or Vault policies tighten, renewal jobs fail *loudly* instead of leaving a decade-old password in a config file.
+====
+
+=== Exercise 2.7 — Gitea webhook (optional)
+
+Enable workflow webhook; register URL/key in Gitea; push to trigger pipeline.
+
+[TIP]
+.GitOps trigger, same gates
+====
+A webhook does **not** bypass Zero Trust—it only changes *who clicks Launch*. The same workflow, OPA checks, and Vault paths still run, which is how you avoid **unauthenticated CI** becoming a backdoor.
+====
+
+=== Exercise 2.8 — Firewall debugging (hands-on)
+
+*Instructor:* `ansible-playbook section2/playbooks/break-firewall.yml`
+
+Symptom: app health fails; DB port missing from `firewalld` on DB host.
+
+* On DB container: `firewall-cmd --list-ports` -> add `5432/tcp`, reload, verify health.
+
+[TIP]
+.Layered enforcement
+====
+Micro-segmentation on the switch does not remove the need for **host-level** controls. If `firewalld` blocks the port, the app cannot reach PostgreSQL even when ACLs and credentials are correct—showing **defence in depth** and why ZTA operations must **map the whole path** (app -> network -> host -> database).
+====
+
+=== Exercise 2.9 — Vault policy path (hands-on)
+
+This exercise demonstrates that **OPA authorisation** and **Vault policy** are independent enforcement layers. OPA checks whether the _user role_ may request database credentials; Vault policy controls which _secret paths_ the user's token can read. Breaking one while the other is intact exposes a real diagnostic scenario.
+
+==== Facilitator setup (one-time)
+
+The default workflow authenticates to Vault as `admin` (root token), which bypasses all policies. To make this exercise work, the workflow must authenticate as the launching user with only the `app-deployer` policy.
+
+. Ensure Vault userpass accounts exist for IdM users (created during lab setup by `configure-vault.yml`). Each user gets policies mapped from their IdM group membership — e.g. `appdev` (in `app-deployers`) receives the `app-deployer` Vault policy.
++
+If the accounts were not created during setup, re-run:
++
+[source,bash]
+----
+ansible-playbook -i inventory/hosts.ini setup/configure-vault.yml
+----
+
+. In AAP, edit the **Create DB Credential** job template. Change the playbook to:
++
+----
+section2/playbooks/create-db-credential-user.yml
+----
++
+This variant authenticates to Vault as the AAP launcher user (`awx_user_name`) instead of admin.
+
+. Verify: log in as `appdev`, run the Section 2 workflow. The job output should show:
++
+----
+Authenticated to Vault as 'appdev' (policies: app-deployer, default)
+----
++
+The workflow should complete successfully.
+
+==== Break
+
+*Instructor:* run from AAP or CLI:
+
+[source,bash]
+----
+ansible-playbook -i inventory/hosts.ini section2/playbooks/break-vault-policy.yml
+----
+
+This changes the `app-deployer` policy path from `database/creds/ztaapp-short-lived` to `database/creds/ztaapp-readonly` (a role that does not exist).
+
+==== Symptom
+
+Re-run the Section 2 workflow as `appdev`:
+
+* **Check DB Access Policy** — PASSES (OPA does not check Vault policies)
+* **Create DB Credential** — **FAILS** with Vault 403 Permission Denied
+
+The job output shows the user's policies (`app-deployer, default`) but the request is denied because `app-deployer` no longer grants access to the correct secret path.
+
+==== Diagnosis
+
+. Note the 403 error at the "Request dynamic database credentials" step.
+. SSH to the Vault host and inspect the broken policy:
++
+[source,bash]
+----
+vault policy read app-deployer
+----
++
+The output shows `database/creds/ztaapp-readonly` — which doesn't match any configured role.
+. List the available database roles:
++
+[source,bash]
+----
+vault list database/roles
+----
++
+This shows `ztaapp-short-lived` as the only role.
+
+==== Fix
+
+Correct the policy path to match the actual role name:
+
+[source,bash]
+----
+vault policy write app-deployer - <<EOF
+path "database/creds/ztaapp-short-lived" {
+  capabilities = ["read"]
+}
+path "secret/data/network/*" {
+  capabilities = ["read"]
+}
+path "sys/leases/revoke" {
+  capabilities = ["update"]
+}
+EOF
+----
+
+Re-run the workflow — it should pass.
+
+*Instructor shortcut:* `ansible-playbook -i inventory/hosts.ini section2/playbooks/fix-vault-policy.yml`
+
+==== Rollback to admin-mode workflow
+
+After the exercise, optionally restore the original job template playbook (`section2/playbooks/create-db-credential.yml`) if subsequent sections should not depend on per-user Vault accounts.
+
+[TIP]
+.Multiple PDPs, multiple denials
+====
+**OPA** can say "this human role may request DB creds" while **Vault policy** still enforces _which paths_ the automation token may read. That separation is healthy: **authorisation** (intent) vs **secret issuance** (mechanism). A typo in Vault policy is a reminder that Zero Trust systems must be **tested end-to-end**, not assumed from one green checkmark. The fact that `appdev` can see their own policy names in the job output but still gets denied reinforces that **visibility is not access**.
+====
+
+=== Exercise 2.10 — SELinux context (hands-on)
+
+*Instructor:* `ansible-playbook section2/playbooks/break-selinux.yml`
+
+Symptom: permission errors; `ls -Z /opt/ztaapp` shows wrong context. Use `ausearch -m avc`, `audit2why`, fix with `chcon -R -t container_file_t /opt/ztaapp`, restart app.
+
+[TIP]
+.Mandatory access control
+====
+SELinux enforces **kernel-level** boundaries: even root in a container cannot read mislabelled files. ZTA-minded platforms keep SELinux **enforcing** because identity and network controls are not enough if a process is tricked—**MAC** limits blast radius on the node.
+====

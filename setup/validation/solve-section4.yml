@@ -1,0 +1,93 @@
+---
+# Section 4 Solve: SPIFFE-Verified Network VLAN Management
+#
+# Auto-creates:
+#   - "Configure VLAN" job template with survey
+#   - Launches it to create VLAN 200 (DMZ) on all switches + update NetBox
+#
+# Prerequisites: Section 1 solve must be complete, SPIRE agent running
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section4.yml
+
+- name: "Section 4 Solve | Template & VLAN"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section4]
+
+  vars_files:
+    - validation_vars.yml
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+
+    # ── Job Template with Survey ───────────────────────────────────────
+
+    - name: Create Configure VLAN template
+      ansible.controller.job_template:
+        name: Configure VLAN
+        description: "Section 4 — SPIFFE-verified VLAN creation (two OPA policy rings)"
+        project: "{{ expected_project }}"
+        playbook: section4/playbooks/configure-vlan.yml
+        inventory: "{{ expected_inventory }}"
+        credentials: [ZTA Machine Credential, ZTA Arista Credential]
+        survey_enabled: true
+        survey_spec:
+          name: "VLAN configuration survey"
+          description: "Specify the VLAN ID and name to create"
+          spec:
+            - question_name: VLAN ID
+              question_description: "VLAN ID to create (100-999)"
+              required: true
+              type: integer
+              variable: new_vlan_id
+              default: 200
+            - question_name: VLAN Name
+              question_description: "Name for the new VLAN"
+              required: true
+              type: text
+              variable: new_vlan_name
+              default: DMZ
+        state: present
+      tags: [template]
+
+    # ── Launch VLAN creation ───────────────────────────────────────────
+
+    - name: Launch Configure VLAN (VLAN 200 DMZ)
+      ansible.controller.job_launch:
+        job_template: Configure VLAN
+        extra_vars:
+          new_vlan_id: 200
+          new_vlan_name: DMZ
+        wait: true
+        timeout: 180
+      register: s4_vlan_launch
+      tags: [launch]
+
+    - name: Display solve summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 4 Solve — Complete                                    ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  Created:                                                      ║
+          ║    ✓ Template: Configure VLAN (with survey)                    ║
+          ║    ✓ VLAN 200 (DMZ) created on ceos1, ceos2, ceos3            ║
+          ║    ✓ NetBox CMDB updated with VLAN record                      ║
+          ║                                                                ║
+          ║  Run check-section4.yml to verify.                             ║
+          ╚══════════════════════════════════════════════════════════════════╝

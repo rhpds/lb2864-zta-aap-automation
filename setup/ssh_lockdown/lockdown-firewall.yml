@@ -1,0 +1,72 @@
+---
+# SSH Lockdown — Layer 1: Firewall
+#
+# Restrict SSH on all managed RHEL hosts so that ONLY the AAP controller
+# and the management host (central) can reach port 22.
+#
+# After this playbook runs:
+#   ✓ ssh from control (AAP)    → ALLOWED
+#   ✓ ssh from central (mgmt)   → ALLOWED
+#   ✗ ssh from any workstation   → CONNECTION REFUSED
+#
+# WARNING: Run this AFTER all other setup playbooks are complete.
+#          Only rollback-firewall.yml or manual intervention will undo this.
+
+- name: "SSH Lockdown | Layer 1 — Firewall: Restrict SSH Sources"
+  hosts: idm_clients
+  become: true
+  gather_facts: false
+
+  vars:
+    allowed_ssh_sources:
+      - ip: "192.168.1.10"
+        label: "AAP Controller (control)"
+      - ip: "192.168.1.11"
+        label: "Management / Break-glass (central)"
+
+  tasks:
+    - name: "Add rich rule — allow SSH from {{ item.label }}"
+      firewalld:
+        rich_rule: >-
+          rule family="ipv4"
+          source address="{{ item.ip }}/32"
+          service name="ssh"
+          accept
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ allowed_ssh_sources }}"
+      loop_control:
+        label: "{{ item.label }} ({{ item.ip }})"
+
+    - name: Remove default SSH service (blocks untrusted sources)
+      firewalld:
+        service: ssh
+        permanent: true
+        immediate: true
+        state: disabled
+
+    - name: Verify firewall rules applied
+      command: firewall-cmd --list-rich-rules
+      register: rich_rules
+      changed_when: false
+
+    - name: Display lockdown summary
+      debug:
+        msg: |
+          ┌──────────────────────────────────────────────────────────────┐
+          │  {{ inventory_hostname }} — SSH Firewall Lockdown Active  │
+          ├──────────────────────────────────────────────────────────────┤
+          │                                                            │
+          │  Allowed sources:                                          │
+          {% for src in allowed_ssh_sources %}
+          │    ✓ {{ (src.ip + '/32 — ' + src.label) }}│
+          {% endfor %}
+          │                                                            │
+          │  All other SSH connections: REFUSED                        │
+          │                                                            │
+          │  Active rich rules:                                        │
+          {% for rule in rich_rules.stdout_lines %}
+          │    {{ rule }}│
+          {% endfor %}
+          └──────────────────────────────────────────────────────────────┘

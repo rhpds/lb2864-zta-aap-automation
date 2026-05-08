@@ -1,0 +1,183 @@
+---
+# Configure AAP Controller with Vault SSH Signed Certificate credentials.
+#
+# This playbook:
+#   1. Creates an AppRole in Vault for AAP SSH certificate signing
+#   2. Creates a "HashiCorp Vault Signed SSH" credential in AAP
+#   3. Creates a Machine credential that sources its signed cert from Vault
+#
+# Prerequisites:
+#   - AAP Controller is installed and reachable
+#   - Vault SSH engine configured with CA (setup/configure-vault.yml)
+#   - Vault SSH CA trust distributed to hosts (setup/configure-vault-ssh.yml)
+#
+# Usage:
+#   ansible-playbook setup/configure-aap-vault-ssh.yml
+
+- name: Configure AAP Vault SSH Signed Certificate Credentials
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+    aap_user: admin
+    aap_password: "{{ lookup('env', 'AAP_ADMIN_PASSWORD') | default('ansible123!', true) }}"
+    aap_verify_ssl: false
+
+    vault_username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+    vault_password: "{{ lookup('env', 'VAULT_PASSWORD') | default('ansible123!', true) }}"
+
+  tasks:
+    # ── 1. Authenticate to Vault ───────────────────────────────────────
+    - name: Authenticate to Vault with userpass
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/{{ vault_username }}"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ vault_password }}"
+        validate_certs: false
+        status_code: 200
+      register: vault_login
+
+    - name: Set Vault token
+      set_fact:
+        vault_token: "{{ vault_login.json.auth.client_token }}"
+
+    # ── 2. Enable AppRole auth (idempotent) ────────────────────────────
+    - name: Enable AppRole auth method in Vault
+      uri:
+        url: "{{ vault_addr }}/v1/sys/auth/approle"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          type: approle
+        validate_certs: false
+        status_code: [200, 204, 400]
+      register: approle_enable
+      failed_when:
+        - approle_enable.status == 400
+        - "'already in use' not in (approle_enable.json.errors | default([]) | join(' '))"
+
+    # ── 3. Create AppRole for AAP SSH signing ──────────────────────────
+    - name: Create SSH client AppRole
+      uri:
+        url: "{{ vault_addr }}/v1/auth/approle/role/{{ ssh_approle_name }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          token_policies: "{{ ssh_approle_policies }}"
+          token_ttl: 1h
+          token_max_ttl: 4h
+          bind_secret_id: true
+        validate_certs: false
+        status_code: [200, 204]
+
+    - name: Read AppRole role-id
+      uri:
+        url: "{{ vault_addr }}/v1/auth/approle/role/{{ ssh_approle_name }}/role-id"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        validate_certs: false
+        status_code: 200
+      register: role_id_response
+
+    - name: Generate AppRole secret-id
+      uri:
+        url: "{{ vault_addr }}/v1/auth/approle/role/{{ ssh_approle_name }}/secret-id"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        validate_certs: false
+        status_code: 200
+      register: secret_id_response
+
+    - name: Extract AppRole credentials
+      set_fact:
+        ssh_role_id: "{{ role_id_response.json.data.role_id }}"
+        ssh_secret_id: "{{ secret_id_response.json.data.secret_id }}"
+
+    # ── 4. Verify AAP is reachable ─────────────────────────────────────
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: aap_ping
+
+    - name: Display AAP version
+      debug:
+        msg: "AAP Controller {{ aap_ping.json.version }} detected"
+
+    # ── 5. Look up credential type IDs ─────────────────────────────────
+    - name: Look up HashiCorp Vault Signed SSH credential type
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/credential_types/?name=HashiCorp+Vault+Signed+SSH"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: vault_ssh_cred_type
+
+    - name: Verify credential type exists
+      assert:
+        that: vault_ssh_cred_type.json.count > 0
+        fail_msg: >
+          'HashiCorp Vault Signed SSH' credential type not found in AAP.
+          Ensure Red Hat Ansible Automation Platform 2.6 (or newer supported release) is installed with the Vault credential plugin.
+
+    - name: Set credential type ID
+      set_fact:
+        vault_ssh_cred_type_id: "{{ vault_ssh_cred_type.json.results[0].id }}"
+
+    # ── 6. Create Vault SSH credential in AAP ──────────────────────────
+    - name: Check if ZTA Vault SSH credential already exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/credentials/?name=ZTA+Vault+SSH+Credential"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: existing_vault_ssh_cred
+
+    - name: Create ZTA Vault SSH credential
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/credentials/"
+        method: POST
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body:
+          name: "ZTA Vault SSH Credential"
+          credential_type: "{{ vault_ssh_cred_type_id }}"
+          organization: 1
+          inputs:
+            url: "{{ vault_addr }}"
+            role_id: "{{ ssh_role_id }}"
+            secret_id: "{{ ssh_secret_id }}"
+        status_code: [200, 201]
+      register: vault_ssh_cred_created
+      when: existing_vault_ssh_cred.json.count == 0
+
+    # ── 7. Summary ─────────────────────────────────────────────────────
+    - name: Display configuration summary
+      debug:
+        msg:
+          - "AAP Vault SSH signed certificate — configuration complete"
+          - "Vault SSH CA — engine path: {{ vault_ssh_secrets_path }}, signing role: {{ vault_ssh_role_name }}, cert TTL: {{ vault_ssh_ttl }}"
+          - "Vault AppRole — name: {{ ssh_approle_name }}, role_id: {{ ssh_role_id }}, policies: {{ ssh_approle_policies | join(', ') }}"
+          - "AAP credential: ZTA Vault SSH Credential (HashiCorp Vault Signed SSH), auth AppRole ({{ ssh_approle_name }})"
+          - "Next: create/link Machine credential for signed SSH; set username rhel + principals; attach to job templates."

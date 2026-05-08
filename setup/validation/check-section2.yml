@@ -1,0 +1,206 @@
+---
+# Section 2 Validation: Deploy Application with Short-Lived Credentials
+#
+# Checks:
+#   - 5 pipeline job templates exist in AAP
+#   - Workflow template "Deploy Application Pipeline" exists
+#   - OPA db_access policy: appdev allowed, neteng denied
+#   - Application healthy at http://app.zta.lab:8081
+#   - Arista ACL on ceos2 is correctly scoped (not overly permissive)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section2.yml
+
+- name: "Section 2 Check | AAP Templates & Workflow"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section2, aap]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check Section 2 job templates
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ item | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s2_template_checks
+      loop: "{{ expected_section2_templates }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    - name: Check workflow template
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_templates/?name={{ expected_section2_workflow | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s2_workflow_check
+      failed_when: false
+
+    - name: Parse template results
+      set_fact:
+        s2_template_results: >-
+          {{ s2_template_results | default({}) | combine({
+            item.item: ((item.json.count | default(0)) > 0)
+          }) }}
+      loop: "{{ s2_template_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Store workflow check
+      set_fact:
+        s2_workflow_ok: "{{ (s2_workflow_check.json.count | default(0)) > 0 }}"
+
+- name: "Section 2 Check | OPA DB Access Policy"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section2, opa]
+
+  tasks:
+    - name: Test OPA db_access allow (appdev)
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/db_access/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: appdev
+            user_groups: [app-deployers]
+            target_database: "{{ db_name }}"
+            requested_permissions: [SELECT, INSERT, UPDATE]
+      register: s2_opa_db_allow
+      failed_when: false
+
+    - name: Test OPA db_access deny (neteng)
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/db_access/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: neteng
+            user_groups: []
+            target_database: "{{ db_name }}"
+            requested_permissions: [SELECT, INSERT, UPDATE]
+      register: s2_opa_db_deny
+      failed_when: false
+
+- name: "Section 2 Check | Application Health"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section2, app]
+
+  tasks:
+    - name: Check application health
+      uri:
+        url: "http://{{ app_host }}:{{ app_port }}/health"
+        method: GET
+        status_code: [200]
+      register: s2_app_health
+      failed_when: false
+
+    - name: Check application dashboard
+      uri:
+        url: "http://{{ app_host }}:{{ app_port }}/"
+        method: GET
+        status_code: [200, 302]
+      register: s2_app_dashboard
+      failed_when: false
+
+- name: "Section 2 Check | Arista ACL"
+  hosts: ceos2
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section2, network]
+
+  tasks:
+    - name: Check ACL on ceos2
+      arista.eos.eos_command:
+        commands:
+          - show access-lists ZTA-APP-TO-DB
+      register: s2_acl_check
+      failed_when: false
+
+- name: "Section 2 Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section2, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    checks:
+      - name: "Template: Check DB Access Policy"
+        ok: "{{ (s2_template_results | default({}))['Check DB Access Policy'] | default(false) }}"
+      - name: "Template: Create DB Credential"
+        ok: "{{ (s2_template_results | default({}))['Create DB Credential'] | default(false) }}"
+      - name: "Template: Configure DB Access List"
+        ok: "{{ (s2_template_results | default({}))['Configure DB Access List'] | default(false) }}"
+      - name: "Template: Deploy Application"
+        ok: "{{ (s2_template_results | default({}))['Deploy Application'] | default(false) }}"
+      - name: "Template: Rotate DB Credentials"
+        ok: "{{ (s2_template_results | default({}))['Rotate DB Credentials'] | default(false) }}"
+      - name: "Workflow: Deploy Application Pipeline"
+        ok: "{{ s2_workflow_ok | default(false) }}"
+      - name: OPA db_access allows appdev
+        ok: "{{ (c.s2_opa_db_allow.json.result.allow | default(false)) == true }}"
+      - name: OPA db_access denies neteng
+        ok: "{{ (c.s2_opa_db_deny.json.result.allow | default(true)) == false }}"
+      - name: Application healthy
+        ok: "{{ (c.s2_app_health.status | default(0)) == 200 }}"
+      - name: Application dashboard loads
+        ok: "{{ (c.s2_app_dashboard.status | default(0)) in [200, 302] }}"
+      - name: "Arista ACL correctly scoped (not 'any')"
+        ok: >-
+          {{
+            (hostvars['ceos2']['s2_acl_check']['stdout'] | default(['']) | first) is search('host 10.20.0.10')
+            and not ((hostvars['ceos2']['s2_acl_check']['stdout'] | default(['']) | first) is search('permit ip any'))
+          }}
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 2 verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 2 — Deploy Application with Short-Lived Credentials   ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── INCOMPLETE ──                                              ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          {% else %}
+          ║  Section 2 complete — all exercises verified.                  ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

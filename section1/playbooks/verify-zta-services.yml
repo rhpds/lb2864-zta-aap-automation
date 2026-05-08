@@ -1,0 +1,121 @@
+---
+# Section 1: Verify all ZTA infrastructure services are operational
+- name: Verify ZTA Infrastructure Services
+  hosts: zta_services
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+
+  tasks:
+    - name: Verify IdM services are running
+      command: ipactl status
+      register: idm_status
+      changed_when: false
+      failed_when: "'RUNNING' not in idm_status.stdout"
+
+    - name: Verify Vault is unsealed and healthy
+      uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: false
+        status_code: [200, 429, 472, 473]
+      register: vault_health
+
+    - name: Verify OPA is healthy
+      uri:
+        url: "{{ opa_url }}/health"
+        method: GET
+      register: opa_health
+
+    - name: Verify OPA policies are loaded
+      uri:
+        url: "{{ opa_url }}/v1/policies"
+        method: GET
+        return_content: true
+      register: opa_policies
+
+    - name: Verify Netbox is accessible
+      uri:
+        url: "{{ netbox_url }}/api/status/"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+        status_code: 200
+      register: netbox_health
+
+    - name: Verify Kerberos authentication
+      shell: echo '{{ idm_admin_password }}' | kinit admin && klist
+      register: krb_check
+      changed_when: false
+      no_log: true
+
+    - name: Verify DNS resolution for lab hosts
+      command: "dig +short {{ item }} @127.0.0.1"
+      register: dns_checks
+      changed_when: false
+      failed_when: dns_checks.stdout | length == 0
+      loop:
+        - "{{ idm_hostname }}"
+        - vault.zta.lab
+        - netbox.zta.lab
+        - "{{ app_host }}"
+        - "{{ db_host }}"
+        - ceos1.zta.lab
+        - ceos2.zta.lab
+        - ceos3.zta.lab
+
+    - name: Service verification summary
+      debug:
+        msg: |
+          Section 1 — ZTA Service Verification
+          =====================================
+
+          IdM:      {{ 'RUNNING' if 'RUNNING' in idm_status.stdout else 'FAILED' }}
+          Vault:    {{ 'HEALTHY (unsealed)' if vault_health.status == 200 else 'CHECK REQUIRED' }}
+          OPA:      {{ 'HEALTHY (' + (opa_policies.json.result | length | string) + ' policies)' }}
+          Netbox:   {{ 'ACCESSIBLE' if netbox_health.status == 200 else 'FAILED' }}
+          Kerberos: {{ 'OK' if krb_check.rc == 0 else 'FAILED' }}
+          DNS:      ALL RECORDS RESOLVE
+
+          Zero Trust infrastructure is ready for AAP integration.
+
+- name: Verify Database Server
+  hosts: db_servers
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+
+  tasks:
+    - name: Check PostgreSQL is running
+      systemd:
+        name: postgresql
+      register: pg_svc
+      failed_when: pg_svc.status.ActiveState != 'active'
+
+    - name: Test database connectivity
+      become_user: postgres
+      command: psql -d {{ db_name }} -c "SELECT 'db_ok' AS status;"
+      register: db_test
+      changed_when: false
+
+    - name: Database status
+      debug:
+        msg: "PostgreSQL: {{ pg_svc.status.ActiveState }} | DB test: {{ 'PASS' if 'db_ok' in db_test.stdout else 'FAIL' }}"
+
+- name: Verify Arista cEOS Switches
+  hosts: network
+  gather_facts: false
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+
+  tasks:
+    - name: Gather Arista switch facts
+      arista.eos.eos_facts:
+        gather_subset: min
+      register: switch_info
+
+    - name: Switch status
+      debug:
+        msg: "Arista {{ switch_info.ansible_facts.ansible_net_model | default('cEOS') }} — {{ switch_info.ansible_facts.ansible_net_hostname | default(inventory_hostname) }} — EOS {{ switch_info.ansible_facts.ansible_net_version | default('unknown') }}"

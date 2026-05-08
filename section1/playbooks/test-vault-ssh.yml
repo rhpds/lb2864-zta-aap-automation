@@ -1,0 +1,164 @@
+---
+# Section 1: Demonstrate Vault SSH Signed Certificates — short-lived machine credentials
+#
+# This playbook:
+#   1. Verifies the SSH CA signing role is configured in Vault
+#   2. Generates an ephemeral keypair and signs it with Vault
+#   3. Uses the signed certificate to SSH into target hosts
+#   4. Displays certificate details (TTL, principals, serial)
+#   5. Shows the full lifecycle: generate key → sign → authenticate → inspect
+#
+# Zero Trust principle: no standing access to machines. Every login requires
+# a just-in-time certificate that is time-bound, audited, and scoped.
+
+- name: Demonstrate Vault SSH Signed Certificates
+  hosts: vault_servers
+  become: true
+  gather_facts: false
+  # Minimal AAP inventory skips project inventory/group_vars; load lab defaults from the repo.
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+
+  vars:
+    vault_username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+    vault_password: "{{ lookup('env', 'VAULT_PASSWORD') | default(lookup('vars', 'idm_admin_password', default='ansible123!'), true) }}"
+    # When app/db are not in inventory (common on AAP), use IdM host + published SSH ports from hosts.yml layout.
+    ssh_test_targets:
+      - name: app
+        ip: "{{ hostvars['app']['ansible_host'] if 'app' in hostvars else idm_hostname }}"
+        port: "{{ hostvars['app']['ansible_port'] | default(2023) if 'app' in hostvars else 2023 }}"
+      - name: db
+        ip: "{{ hostvars['db']['ansible_host'] if 'db' in hostvars else idm_hostname }}"
+        port: "{{ hostvars['db']['ansible_port'] | default(2022) if 'db' in hostvars else 2022 }}"
+    ephemeral_key_dir: /tmp/vault-ssh-test
+
+  pre_tasks:
+    - name: Default Vault API variables when inventory has no group_vars
+      ansible.builtin.set_fact:
+        vault_addr: "{{ vault_addr | default(lookup('env', 'VAULT_ADDR') | default('http://vault.zta.lab:8200', true), true) }}"
+        vault_skip_verify: "{{ vault_skip_verify | default(true) | bool }}"
+        vault_ssh_secrets_path: "{{ vault_ssh_secrets_path | default('ssh') }}"
+        vault_ssh_role_name: "{{ vault_ssh_role_name | default('ssh-signer') }}"
+        vault_ssh_ttl: "{{ vault_ssh_ttl | default('30m') }}"
+      delegate_to: localhost
+
+    - name: Authenticate to Vault with userpass
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/{{ vault_username }}"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ vault_password }}"
+        validate_certs: false
+        status_code: 200
+      register: vault_login
+      delegate_to: localhost
+
+    - name: Set Vault token from login
+      set_fact:
+        vault_env:
+          VAULT_ADDR: "{{ vault_addr }}"
+          VAULT_SKIP_VERIFY: "{{ vault_skip_verify | string }}"
+          VAULT_TOKEN: "{{ vault_login.json.auth.client_token }}"
+
+  tasks:
+    # ── Phase 1: Verify SSH CA engine is configured ──
+    - name: "Phase 1 | Read SSH CA role configuration"
+      command: "vault read -format=json {{ vault_ssh_secrets_path }}/roles/{{ vault_ssh_role_name }}"
+      environment: "{{ vault_env }}"
+      register: ssh_role_check
+      changed_when: false
+
+    - name: "Phase 1 | Parse role details"
+      set_fact:
+        ssh_role: "{{ ssh_role_check.stdout | from_json }}"
+
+    - name: "Phase 1 | Confirm role is CA type"
+      assert:
+        that:
+          - ssh_role.data.key_type == "ca"
+          - "'rhel' in ssh_role.data.allowed_users"
+        success_msg: "SSH CA role '{{ vault_ssh_role_name }}' is correctly configured (allowed_users: {{ ssh_role.data.allowed_users }})"
+        fail_msg: "SSH CA role misconfigured — expected key_type=ca with 'rhel' in allowed_users"
+
+    # ── Phase 2: Generate ephemeral keypair and sign with Vault ──
+    - name: "Phase 2 | Create ephemeral key directory"
+      file:
+        path: "{{ ephemeral_key_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: "Phase 2 | Generate ephemeral SSH keypair"
+      command: >
+        ssh-keygen -t rsa -b 2048
+        -f {{ ephemeral_key_dir }}/id_rsa
+        -N '' -q
+      args:
+        creates: "{{ ephemeral_key_dir }}/id_rsa"
+
+    - name: "Phase 2 | Sign public key with Vault SSH CA"
+      shell: >
+        vault write -field=signed_key
+        {{ vault_ssh_secrets_path }}/sign/{{ vault_ssh_role_name }}
+        public_key=@{{ ephemeral_key_dir }}/id_rsa.pub
+        valid_principals=rhel
+        > {{ ephemeral_key_dir }}/id_rsa-cert.pub
+      environment: "{{ vault_env }}"
+
+    - name: "Phase 2 | Inspect the signed certificate"
+      command: "ssh-keygen -L -f {{ ephemeral_key_dir }}/id_rsa-cert.pub"
+      register: cert_details
+      changed_when: false
+
+    - name: "Phase 2 | Display certificate details"
+      debug:
+        msg: "{{ cert_details.stdout_lines }}"
+
+    # ── Phase 3: Use the signed cert to authenticate ──
+    - name: "Phase 3 | SSH to {{ item.name }} using signed certificate"
+      shell: |
+        ssh -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o IdentityFile={{ ephemeral_key_dir }}/id_rsa \
+            -o CertificateFile={{ ephemeral_key_dir }}/id_rsa-cert.pub \
+            -p {{ item.port }} \
+            rhel@{{ item.ip }} \
+            'echo "CERT_LOGIN_OK hostname=$(hostname) user=$(whoami) date=$(date -Iseconds)"'
+      register: ssh_test_results
+      loop: "{{ ssh_test_targets }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.ip }})"
+      failed_when: false
+
+    # ── Phase 4: Parse certificate metadata ──
+    - name: "Phase 4 | Extract certificate validity period"
+      shell: "ssh-keygen -L -f {{ ephemeral_key_dir }}/id_rsa-cert.pub | grep -E 'Valid|Serial|Type|Key ID'"
+      register: cert_metadata
+      changed_when: false
+
+    # ── Phase 5: Clean up and display results ──
+    - name: "Phase 5 | Clean up ephemeral keys"
+      file:
+        path: "{{ ephemeral_key_dir }}"
+        state: absent
+
+    - name: "Phase 5 | Display SSH signed certificate test results"
+      debug:
+        msg: |
+          Vault SSH signed certificates — test results
+
+          SSH CA engine path: {{ vault_ssh_secrets_path }}
+          Signing role: {{ vault_ssh_role_name }}
+          Certificate TTL: {{ vault_ssh_ttl }}
+
+          Certificate metadata:
+          {% for line in cert_metadata.stdout_lines | default([]) %}
+            {{ line }}
+          {% endfor %}
+
+          Per-host cert login:
+          {% for result in ssh_test_results.results %}
+            {{ result.item.name }} ({{ result.item.ip }}): {{ 'PASS' if result.rc == 0 else 'FAIL' }}
+          {% endfor %}
+
+          Zero Trust: JIT signing by Vault, short-lived ({{ vault_ssh_ttl }}), scoped principals, audited requests, CA pubkey only on hosts, no Vault contact at login.

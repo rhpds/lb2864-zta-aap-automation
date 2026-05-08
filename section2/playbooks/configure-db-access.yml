@@ -1,0 +1,43 @@
+---
+# Section 2, Step 3: Configure Arista ACL to allow app server → database only
+#
+# Uses the data-plane IPs (10.20.0.10 and 10.30.0.10) that route
+# through the cEOS switch fabric. The ACL is applied on ceos2
+# (the data-tier leaf switch).
+- name: Configure Network Access for App to Database
+  hosts: network
+  gather_facts: false
+
+  vars:
+    acl_name: ZTA-APP-TO-DB
+    # Data-plane IPs come from inventory (group_vars/all.yml: app_data_ip, db_data_ip).
+    # Do not redefine them here with hostvars['app'] — that host is often absent when
+    # this play runs against [network] only (AAP job), and | default(app_data_ip) on
+    # the same variable name causes recursive templating.
+    target_switch: ceos2
+
+  tasks:
+    - name: Configure ACL on data-tier leaf switch (ceos2)
+      when: inventory_hostname == target_switch
+      block:
+        # eos_acls renders well-known TCP ports (e.g. 5432) as service names (postgres);
+        # cEOS rejects "eq postgres" in this ACL — use eos_config so eq stays numeric.
+        - name: Configure ACL permitting app server to database
+          arista.eos.eos_config:
+            replace: block
+            parents: "ip access-list {{ acl_name }}"
+            lines:
+              - "10 permit tcp host {{ app_data_ip }} host {{ db_data_ip }} eq {{ db_port }}"
+              - "20 permit tcp host {{ db_data_ip }} eq {{ db_port }} host {{ app_data_ip }}"
+              - "100 deny ip any host {{ db_data_ip }}"
+
+        - name: Display ACL configuration
+          debug:
+            msg: |
+              Network micro-segmentation applied on {{ target_switch }}:
+                ACL: {{ acl_name }}
+                PERMIT: {{ app_data_ip }} → {{ db_data_ip }}:{{ db_port }}
+                DENY:   any → {{ db_data_ip }}:{{ db_port }}
+
+              Only the app container ({{ app_data_ip }}) can reach the
+              database via the Arista cEOS switch fabric.

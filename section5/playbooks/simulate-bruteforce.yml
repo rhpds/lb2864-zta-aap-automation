@@ -1,0 +1,65 @@
+---
+# Section 5: Simulate a brute-force SSH attack against the app server.
+#
+# This generates rapid failed SSH login attempts against app.zta.lab,
+# which Splunk detects via a saved search alert (5+ failures in 60s).
+# Splunk then fires a webhook to Event-Driven Ansible, which triggers
+# an automatic credential revocation.
+#
+# Run this from the control/AAP host (or any host with SSH access):
+#   ansible-playbook section5/playbooks/simulate-bruteforce.yml
+
+- name: Simulate Brute-Force Attack on App Server
+  hosts: automation
+  become: false
+  gather_facts: false
+
+  vars:
+    target_ip: "{{ hostvars['app']['ansible_host'] }}"
+    target_port: "{{ hostvars['app']['ansible_port'] | default(22) }}"
+    target_hostname: app.zta.lab
+    attack_user: rhel
+    attempt_count: 20
+    attempt_delay: 1
+
+  tasks:
+    - name: Verify app server is reachable
+      wait_for:
+        host: "{{ target_ip }}"
+        port: "{{ target_port }}"
+        timeout: 10
+
+    - name: Display attack simulation warning
+      debug:
+        msg:
+          - "Attack simulation — brute-force SSH (Splunk → EDA)"
+          - "Target: {{ target_hostname }} ({{ target_ip }}), user: {{ attack_user }}, attempts: {{ attempt_count }}"
+          - "Generates failed SSH logins; Splunk detects pattern and webhooks EDA; EDA can trigger Revoke App Credentials."
+
+    - name: "Generate {{ attempt_count }} failed SSH login attempts"
+      shell: |
+        sshpass -p 'wrong-password-{{ item }}' \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o NumberOfPasswordPrompts=1 \
+              -o ConnectTimeout=3 \
+              -p {{ target_port }} \
+              {{ attack_user }}@{{ target_ip }} \
+              'echo should-not-reach' 2>&1 || true
+        sleep {{ attempt_delay }}
+      loop: "{{ range(1, attempt_count + 1) | list }}"
+      loop_control:
+        label: "Attempt {{ item }}/{{ attempt_count }}"
+      changed_when: false
+
+    - name: Wait for Splunk to process the events
+      pause:
+        seconds: 20
+        prompt: "Waiting 20 seconds for Splunk to detect the brute-force pattern..."
+
+    - name: Display post-attack status
+      debug:
+        msg:
+          - "Attack simulation complete — {{ attempt_count }} failed SSH attempts to {{ target_hostname }}"
+          - "Expected: Splunk UF → indexer → saved search (5+ fails/60s) → webhook → EDA → AAP Revoke App Credentials → Vault lease revoked → app loses DB access"
+          - "Verify: Splunk triggered alerts, EDA events, AAP job, http://app.zta.lab:8081/health"

@@ -1,0 +1,111 @@
+---
+# Pre-workshop setup: Configure RHEL hosts to trust Vault SSH signed certificates
+#
+# This playbook:
+#   1. Fetches the Vault SSH CA public key
+#   2. Distributes it to each RHEL host as a TrustedUserCAKeys file
+#   3. Configures sshd to accept Vault-signed certificates
+#
+# After this playbook runs, AAP (or any client with a Vault-signed cert) can:
+#   vault write -field=signed_key ssh/sign/ssh-signer public_key=@~/.ssh/id_rsa.pub
+#   ssh -i ~/.ssh/id_rsa -o CertificateFile=signed-cert.pub rhel@<target>
+#
+# The certificate is time-bound (default 30m) and scoped to specific principals.
+# No agent or binary is required on the target hosts — only native OpenSSH.
+
+- name: Configure RHEL Hosts to Trust Vault SSH CA
+  hosts: idm_clients
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Authenticate to Vault
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/{{ vault_username | default('admin') }}"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ vault_password | default(idm_admin_password) }}"
+        validate_certs: false
+        status_code: 200
+      register: vault_login
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fetch Vault SSH CA public key
+      uri:
+        url: "{{ vault_addr }}/v1/{{ vault_ssh_secrets_path }}/public_key"
+        method: GET
+        return_content: true
+        validate_certs: false
+        status_code: 200
+      register: vault_ca_pubkey
+      delegate_to: localhost
+      run_once: true
+
+  tasks:
+    # ── 1. Distribute the Vault CA public key ──
+    - name: Write Vault SSH CA public key to trusted CA file
+      copy:
+        dest: "{{ vault_ssh_ca_pubkey_path }}"
+        content: "{{ vault_ca_pubkey.content }}"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Validate and restart sshd
+
+    # ── 2. Configure sshd to trust certificates signed by Vault ──
+    - name: Configure TrustedUserCAKeys in sshd
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?TrustedUserCAKeys"
+        line: "TrustedUserCAKeys {{ vault_ssh_ca_pubkey_path }}"
+      notify: Validate and restart sshd
+
+    # ── 3. Configure AuthorizedPrincipalsFile for fine-grained access ──
+    - name: Create principals directory
+      file:
+        path: /etc/ssh/auth_principals
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Write authorized principals for rhel user
+      copy:
+        dest: /etc/ssh/auth_principals/rhel
+        content: |
+          rhel
+          aap-service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Validate and restart sshd
+
+    - name: Configure AuthorizedPrincipalsFile in sshd
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?AuthorizedPrincipalsFile"
+        line: "AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u"
+      notify: Validate and restart sshd
+
+    # ── 4. Verification ──
+    - name: Display per-host summary
+      debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          Vault SSH CA trusted ({{ vault_ssh_ca_pubkey_path }}),
+          sshd configured for certificate authentication
+
+  handlers:
+    - name: Validate and restart sshd
+      shell: |
+        if sshd -t; then
+          systemctl restart sshd
+        else
+          echo "SSHD CONFIG INVALID on {{ inventory_hostname }} — not restarting to avoid lockout" >&2
+          exit 1
+        fi
+      register: sshd_restart
+      failed_when: false
+      changed_when: sshd_restart.rc == 0

@@ -1,0 +1,194 @@
+---
+# Section 4: Manage IdM Identity — create groups, users, and group memberships.
+#
+# Designed for AAP with a survey. Survey variables:
+#   action:       create_group | create_user | add_user_to_group | show_identity
+#   group_name:   IdM group name (e.g. team-readonly)
+#   group_desc:   Group description (for create_group)
+#   user_id:      IdM uid (e.g. neteng)
+#   user_first:   First name (for create_user)
+#   user_last:    Last name (for create_user)
+#   user_password: Initial password (for create_user, optional — defaults to idm_admin_password)
+#
+# Usage (CLI):
+#   ansible-playbook -i inventory/hosts.ini section4/playbooks/manage-idm-identity.yml \
+#     -e action=create_group -e group_name=team-readonly -e group_desc="Read-only template access"
+#
+#   ansible-playbook -i inventory/hosts.ini section4/playbooks/manage-idm-identity.yml \
+#     -e action=add_user_to_group -e user_id=neteng -e group_name=team-readonly
+#
+#   ansible-playbook -i inventory/hosts.ini section4/playbooks/manage-idm-identity.yml \
+#     -e action=show_identity -e user_id=neteng
+
+- name: "Manage IdM Identity"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    action: "{{ action }}"
+    idm_base_dn: "dc={{ idm_domain | replace('.', ',dc=') }}"
+    idm_groups_dn: "cn=groups,cn=accounts,{{ idm_base_dn }}"
+    idm_users_dn: "cn=users,cn=accounts,{{ idm_base_dn }}"
+
+  tasks:
+    # ── Create Group ────────────────────────────────────────────────────
+    - name: Create IdM group
+      when: action == "create_group"
+      block:
+        - name: Validate group_name is provided
+          assert:
+            that: group_name is defined and group_name | length > 0
+            fail_msg: "Survey variable 'group_name' is required for create_group"
+
+        - name: Create group in IdM
+          command: >
+            ipa group-add {{ group_name | quote }}
+            --desc={{ (group_desc | default('Created by ZTA Workshop automation')) | quote }}
+          register: group_create
+          failed_when: group_create.rc != 0 and 'already exists' not in group_create.stderr
+          changed_when: "'Added group' in group_create.stdout"
+
+        - name: Display group creation result
+          debug:
+            msg: |
+              IdM Group {{ 'Created' if group_create.changed else 'Already Exists' }}
+              ===========================================================
+
+              Group:       {{ group_name }}
+              Description: {{ group_desc | default('Created by ZTA Workshop automation') }}
+              DN:          cn={{ group_name }},{{ idm_groups_dn }}
+
+              LDAP authenticator map value (paste into AAP):
+              cn={{ group_name }},{{ idm_groups_dn }}
+
+    # ── Create User ─────────────────────────────────────────────────────
+    - name: Create IdM user
+      when: action == "create_user"
+      block:
+        - name: Validate user fields are provided
+          assert:
+            that:
+              - user_id is defined and user_id | length > 0
+              - user_first is defined and user_first | length > 0
+              - user_last is defined and user_last | length > 0
+            fail_msg: "Survey variables 'user_id', 'user_first', 'user_last' are required for create_user"
+
+        - name: Create user in IdM
+          command: >
+            ipa user-add {{ user_id | quote }}
+            --first={{ user_first | quote }}
+            --last={{ user_last | quote }}
+            --password
+          environment:
+            IPA_USER_PASSWORD: "{{ user_password | default(idm_admin_password) }}"
+          register: user_create
+          failed_when: user_create.rc != 0 and 'already exists' not in user_create.stderr
+          changed_when: "'Added user' in user_create.stdout"
+
+        - name: Set user password via kpasswd workaround
+          shell: |
+            echo -e '{{ idm_admin_password }}\n{{ user_password | default(idm_admin_password) }}\n{{ user_password | default(idm_admin_password) }}' \
+              | kinit {{ user_id | quote }} 2>/dev/null || true
+            kdestroy -q 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          when: user_create.changed
+
+        - name: Display user creation result
+          debug:
+            msg: |
+              IdM User {{ 'Created' if user_create.changed else 'Already Exists' }}
+              ============================================================
+
+              UID:      {{ user_id }}
+              Name:     {{ user_first }} {{ user_last }}
+              DN:       uid={{ user_id }},{{ idm_users_dn }}
+              Password: {{ user_password | default(idm_admin_password) }}
+
+    # ── Add User to Group ───────────────────────────────────────────────
+    - name: Add user to IdM group
+      when: action == "add_user_to_group"
+      block:
+        - name: Validate user_id and group_name are provided
+          assert:
+            that:
+              - user_id is defined and user_id | length > 0
+              - group_name is defined and group_name | length > 0
+            fail_msg: "Survey variables 'user_id' and 'group_name' are required for add_user_to_group"
+
+        - name: Add user to group
+          command: >
+            ipa group-add-member {{ group_name | quote }} --users={{ user_id | quote }}
+          register: membership_add
+          failed_when: membership_add.rc != 0 and 'already a member' not in membership_add.stderr
+          changed_when: "'member added' in membership_add.stdout | lower or 'Number of members added 1' in membership_add.stdout"
+
+        - name: Fetch updated group info
+          command: "ipa group-show {{ group_name | quote }}"
+          register: group_info
+          changed_when: false
+
+        - name: Fetch updated user info
+          command: "ipa user-show {{ user_id | quote }}"
+          register: user_info
+          changed_when: false
+
+        - name: Display membership result
+          debug:
+            msg: |
+              Group Membership Updated
+              ========================
+
+              User:   {{ user_id }} → Group: {{ group_name }}
+              Status: {{ 'Added' if membership_add.changed else 'Already a member' }}
+
+              Group DN: cn={{ group_name }},{{ idm_groups_dn }}
+              User DN:  uid={{ user_id }},{{ idm_users_dn }}
+
+              --- Group details ---
+              {{ group_info.stdout }}
+
+              --- User details ---
+              {{ user_info.stdout }}
+
+    # ── Show Identity ───────────────────────────────────────────────────
+    - name: Show identity details
+      when: action == "show_identity"
+      block:
+        - name: Fetch user info from IdM
+          command: "ipa user-show {{ user_id | quote }}"
+          register: user_detail
+          changed_when: false
+          when: user_id is defined and user_id | length > 0
+
+        - name: Fetch group info from IdM
+          command: "ipa group-show {{ group_name | quote }}"
+          register: group_detail
+          changed_when: false
+          when: group_name is defined and group_name | length > 0
+
+        - name: Display user identity
+          debug:
+            msg: |
+              IdM Identity Details
+              ====================
+
+              User DN: uid={{ user_id }},{{ idm_users_dn }}
+
+              {{ user_detail.stdout }}
+          when: user_id is defined and user_id | length > 0
+
+        - name: Display group identity
+          debug:
+            msg: |
+              IdM Group Details
+              =================
+
+              Group DN: cn={{ group_name }},{{ idm_groups_dn }}
+
+              {{ group_detail.stdout }}
+
+              LDAP authenticator map value (paste into AAP):
+              cn={{ group_name }},{{ idm_groups_dn }}
+          when: group_name is defined and group_name | length > 0

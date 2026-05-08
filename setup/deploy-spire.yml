@@ -1,0 +1,472 @@
+---
+# Pre-workshop setup: Deploy SPIFFE/SPIRE for workload identity
+#
+# SPIRE Server runs on central (alongside IdM and OPA).
+# SPIRE Agents run on automation (AAP), db, and vault hosts.
+# Workload entries are registered for the network automation use case.
+#
+# Run AFTER: configure-dns.yml, configure-idm-users.yml, configure-opa-base.yml
+
+
+# ── Phase 1: Install SPIRE binaries on all hosts ────────────────────
+- name: "Phase 1: Install SPIRE binaries"
+  hosts: zta_services:spire_agents
+  become: true
+  gather_facts: true
+
+  vars:
+    spire_tarball: "spire-{{ spire_version }}-{{ spire_arch }}.tar.gz"
+    spire_url: "{{ spire_download_base }}/v{{ spire_version }}/{{ spire_tarball }}"
+
+  pre_tasks:
+    - name: Check if SPIRE tarball already on controller
+      stat:
+        path: "/tmp/{{ spire_tarball }}"
+      delegate_to: localhost
+      run_once: true
+      register: spire_local
+
+    - name: Download SPIRE release to controller
+      get_url:
+        url: "{{ spire_url }}"
+        dest: "/tmp/{{ spire_tarball }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      when: not spire_local.stat.exists
+
+  tasks:
+    - name: Create SPIRE directory structure
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ spire_install_dir }}"
+        - "{{ spire_install_dir }}/bin"
+        - "{{ spire_install_dir }}/conf/server"
+        - "{{ spire_install_dir }}/conf/agent"
+        - "{{ spire_install_dir }}/data/server"
+        - "{{ spire_install_dir }}/data/agent"
+
+    - name: Copy SPIRE tarball from controller to target
+      copy:
+        src: "/tmp/{{ spire_tarball }}"
+        dest: "/tmp/{{ spire_tarball }}"
+        mode: '0644'
+
+    - name: Extract SPIRE archive
+      unarchive:
+        src: "/tmp/{{ spire_tarball }}"
+        dest: /tmp
+        remote_src: true
+
+    - name: Install SPIRE binaries
+      copy:
+        src: "/tmp/spire-{{ spire_version }}/bin/{{ item }}"
+        dest: "{{ spire_install_dir }}/bin/{{ item }}"
+        mode: '0755'
+        remote_src: true
+      loop:
+        - spire-server
+        - spire-agent
+
+    - name: Clean up downloaded archive
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/{{ spire_tarball }}"
+        - "/tmp/spire-{{ spire_version }}"
+
+
+# ── Phase 2: Configure and start SPIRE Server ───────────────────────
+- name: "Phase 2: Configure SPIRE Server"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Deploy SPIRE Server configuration
+      copy:
+        dest: "{{ spire_install_dir }}/conf/server/server.conf"
+        mode: '0644'
+        content: |
+          server {
+              bind_address = "0.0.0.0"
+              bind_port = "{{ spire_server_bind_port }}"
+              trust_domain = "{{ spire_trust_domain }}"
+              data_dir = "{{ spire_install_dir }}/data/server"
+              log_level = "INFO"
+
+              ca_ttl = "24h"
+              default_x509_svid_ttl = "1h"
+          }
+
+          plugins {
+              DataStore "sql" {
+                  plugin_data {
+                      database_type = "sqlite3"
+                      connection_string = "{{ spire_install_dir }}/data/server/datastore.sqlite3"
+                  }
+              }
+
+              NodeAttestor "join_token" {
+                  plugin_data {}
+              }
+
+              KeyManager "disk" {
+                  plugin_data {
+                      keys_path = "{{ spire_install_dir }}/data/server/keys.json"
+                  }
+              }
+          }
+
+    - name: Create SPIRE Server systemd unit
+      copy:
+        dest: /etc/systemd/system/spire-server.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=SPIRE Server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart={{ spire_install_dir }}/bin/spire-server run -config {{ spire_install_dir }}/conf/server/server.conf
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start SPIRE Server
+      systemd:
+        name: spire-server
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for SPIRE Server to become healthy
+      command: "{{ spire_install_dir }}/bin/spire-server healthcheck -socketPath {{ spire_server_socket }}"
+      register: server_health
+      until: server_health.rc == 0
+      retries: 15
+      delay: 3
+
+    - name: List stale agents from previous runs
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server agent list
+        -socketPath {{ spire_server_socket }}
+        | grep 'SPIFFE ID' | awk '{print $NF}'
+      register: stale_agents
+      changed_when: false
+
+    - name: Evict stale agents for clean re-attestation
+      command: >
+        {{ spire_install_dir }}/bin/spire-server agent evict
+        -socketPath {{ spire_server_socket }}
+        -spiffeID {{ item }}
+      loop: "{{ stale_agents.stdout_lines }}"
+      loop_control:
+        label: "{{ item }}"
+      when: stale_agents.stdout_lines | length > 0
+
+    - name: Delete stale workload entries from previous runs
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+        | grep 'Entry ID' | awk '{print $NF}'
+      register: stale_entries
+      changed_when: false
+
+    - name: Remove stale entries
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry delete
+        -socketPath {{ spire_server_socket }}
+        -entryID {{ item }}
+      loop: "{{ stale_entries.stdout_lines }}"
+      loop_control:
+        label: "{{ item }}"
+      when: stale_entries.stdout_lines | length > 0
+
+    - name: Export trust bundle for agents
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server bundle show
+        -socketPath {{ spire_server_socket }}
+        > {{ spire_install_dir }}/conf/server/bootstrap.crt
+      changed_when: true
+
+    - name: Read trust bundle
+      slurp:
+        src: "{{ spire_install_dir }}/conf/server/bootstrap.crt"
+      register: spire_trust_bundle
+
+
+# ── Phase 3: Generate join tokens and start SPIRE Agents ────────────
+- name: "Phase 3: Bootstrap SPIRE Agents"
+  hosts: spire_agents
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: Generate join token on SPIRE Server
+      command: >
+        {{ spire_install_dir }}/bin/spire-server token generate
+        -spiffeID spiffe://{{ spire_trust_domain }}/host/{{ inventory_hostname }}
+        -socketPath {{ spire_server_socket }}
+        -ttl 600
+      delegate_to: "{{ groups['zta_services'][0] }}"
+      register: token_result
+
+    - name: Parse join token
+      set_fact:
+        spire_join_token: "{{ token_result.stdout | regex_search('Token:\\s+(\\S+)', '\\1') | first }}"
+
+    - name: Record this agent's SPIFFE ID (derived from join token)
+      set_fact:
+        spire_agent_id: "spiffe://{{ spire_trust_domain }}/spire/agent/join_token/{{ spire_join_token }}"
+
+    - name: Distribute trust bundle
+      copy:
+        content: "{{ hostvars[groups['zta_services'][0]]['spire_trust_bundle']['content'] | b64decode }}"
+        dest: "{{ spire_install_dir }}/conf/agent/bootstrap.crt"
+        mode: '0644'
+
+    - name: Create agent socket directory
+      file:
+        path: "{{ spire_agent_socket | dirname }}"
+        state: directory
+        mode: '0755'
+
+    - name: Stop SPIRE Agent if running (before clearing data)
+      systemd:
+        name: spire-agent
+        state: stopped
+      failed_when: false
+
+    - name: Clear agent attestation state for clean re-attestation
+      file:
+        path: "{{ spire_install_dir }}/data/agent"
+        state: absent
+
+    - name: Recreate agent data directory
+      file:
+        path: "{{ spire_install_dir }}/data/agent"
+        state: directory
+        mode: '0755'
+
+    - name: Deploy SPIRE Agent configuration
+      copy:
+        dest: "{{ spire_install_dir }}/conf/agent/agent.conf"
+        mode: '0644'
+        content: |
+          agent {
+              data_dir = "{{ spire_install_dir }}/data/agent"
+              log_level = "INFO"
+              server_address = "{{ spire_server_host }}"
+              server_port = "{{ spire_server_bind_port }}"
+              trust_domain = "{{ spire_trust_domain }}"
+              trust_bundle_path = "{{ spire_install_dir }}/conf/agent/bootstrap.crt"
+              socket_path = "{{ spire_agent_socket }}"
+          }
+
+          plugins {
+              NodeAttestor "join_token" {
+                  plugin_data {}
+              }
+
+              KeyManager "disk" {
+                  plugin_data {
+                      directory = "{{ spire_install_dir }}/data/agent"
+                  }
+              }
+
+              WorkloadAttestor "unix" {
+                  plugin_data {
+                      discover_workload_path = true
+                  }
+              }
+          }
+
+    - name: Create SPIRE Agent systemd unit
+      copy:
+        dest: /etc/systemd/system/spire-agent.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=SPIRE Agent
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart={{ spire_install_dir }}/bin/spire-agent run -config {{ spire_install_dir }}/conf/agent/agent.conf -joinToken {{ spire_join_token }}
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start SPIRE Agent
+      systemd:
+        name: spire-agent
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for SPIRE Agent to attest
+      command: "{{ spire_install_dir }}/bin/spire-agent healthcheck -socketPath {{ spire_agent_socket }}"
+      register: agent_health
+      until: agent_health.rc == 0
+      retries: 15
+      delay: 3
+
+    - name: Remove join token from systemd unit after successful attestation
+      copy:
+        dest: /etc/systemd/system/spire-agent.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=SPIRE Agent
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart={{ spire_install_dir }}/bin/spire-agent run -config {{ spire_install_dir }}/conf/agent/agent.conf
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd (join token removed)
+      systemd:
+        daemon_reload: true
+
+
+# ── Phase 4: Register workload entries ──────────────────────────────
+- name: "Phase 4: Register SPIFFE Workload Entries"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: List attested agents
+      command: >
+        {{ spire_install_dir }}/bin/spire-server agent list
+        -socketPath {{ spire_server_socket }}
+      register: agent_list
+
+    - name: Display attested agents
+      debug:
+        msg: "{{ agent_list.stdout }}"
+
+    - name: Get existing entry IDs (for idempotent re-runs)
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+        | grep 'Entry ID' | awk '{print $NF}'
+      register: existing_entries
+      changed_when: false
+
+    - name: Delete stale entries before re-registration
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry delete
+        -socketPath {{ spire_server_socket }}
+        -entryID {{ item }}
+      loop: "{{ existing_entries.stdout_lines }}"
+      loop_control:
+        label: "{{ item }}"
+      when: existing_entries.stdout_lines | length > 0
+
+    - name: Register workload entries
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry create
+        -socketPath {{ spire_server_socket }}
+        -spiffeID {{ item.spiffe_id }}
+        -parentID {{ hostvars[item.parent_host]['spire_agent_id'] }}
+        -selector {{ item.selectors | join(' -selector ') }}
+      loop: "{{ spire_workloads }}"
+      loop_control:
+        label: "{{ item.spiffe_id }}"
+      register: entry_result
+
+    - name: List registered entries
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+      register: entry_list
+
+
+# ── Phase 5: Verify deployment ──────────────────────────────────────
+- name: "Phase 5: Verify SPIRE Deployment"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: SPIRE Server health check
+      command: "{{ spire_install_dir }}/bin/spire-server healthcheck -socketPath {{ spire_server_socket }}"
+      register: final_server_health
+
+    - name: Count attested agents
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server agent list
+        -socketPath {{ spire_server_socket }}
+        | grep -c 'SPIFFE ID'
+      register: agent_count
+
+    - name: Count registered entries
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+        | grep -c 'Entry ID'
+      register: entry_count
+
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════╗
+          ║       SPIFFE / SPIRE Deployment Complete                 ║
+          ╠════════════════════════════════════════════════════════════╣
+          ║                                                          ║
+          ║  Trust Domain:  {{ spire_trust_domain }}║
+          ║  Server:        {{ spire_server_host }}║
+          ║  Server Port:   {{ (spire_server_bind_port | string) }}║
+          ║                                                          ║
+          ║  Agents Attested:     {{ agent_count.stdout }}║
+          ║  Workloads Registered: {{ entry_count.stdout }}║
+          ║                                                          ║
+          ║  Registered Workload Identities:                         ║
+          {% for w in spire_workloads %}
+          ║    {{ w.spiffe_id }}║
+          {% endfor %}
+          ║                                                          ║
+          ║  The automation platform and services now have            ║
+          ║  cryptographic workload identities (X.509 SVIDs).        ║
+          ╚════════════════════════════════════════════════════════════╝
+
+- name: "Phase 5 (cont): Verify SPIRE Agents can fetch SVIDs"
+  hosts: spire_agents
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Wait for agents to sync new workload entries
+      pause:
+        seconds: 10
+
+    - name: Fetch X.509 SVID from local SPIRE Agent
+      command: "{{ spire_install_dir }}/bin/spire-agent api fetch x509 -socketPath {{ spire_agent_socket }}"
+      register: svid_fetch
+      retries: 10
+      delay: 5
+      until: "'Received' in svid_fetch.stdout"
+
+    - name: Display fetched SVID info
+      debug:
+        msg: "{{ inventory_hostname }}: {{ svid_fetch.stdout_lines | select('search', 'SPIFFE ID') | list }}"

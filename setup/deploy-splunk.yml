@@ -1,0 +1,504 @@
+---
+# Deploy Splunk Enterprise as a container on central
+#
+# Services exposed:
+#   - Web UI:                http://central.zta.lab:8000
+#   - HTTP Event Collector:  https://central.zta.lab:8088
+#   - Management API:        https://central.zta.lab:8089
+#   - Forwarder receiving:   central.zta.lab:9997
+#
+# Credentials:
+#   - Admin user:  admin
+#   - Password:    ansible123!
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-splunk.yml
+
+- name: Deploy Splunk Enterprise Container
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    splunk_container_name: splunk
+    splunk_image: docker.io/splunk/splunk:latest
+    splunk_password: "{{ idm_admin_password }}"
+    splunk_hec_token: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    splunk_data_dir: /opt/splunk-data
+    splunk_service_name: container-splunk
+    splunk_start_args: "--accept-license"
+    splunk_general_terms: "--accept-sgt-current-at-splunk-com"
+    splunk_container_apps_path: /opt/splunk/etc/apps
+    splunk_app_owner: ansible
+    splunk_app_group: ansible
+    splunk_apps:
+      - url: "https://my-splunk-apps.s3.us-east-1.amazonaws.com/apps/app-for-cisco-network-data_281.tgz"
+        filename: "app-for-cisco-network-data_281.tgz"
+      - url: "https://my-splunk-apps.s3.us-east-1.amazonaws.com/apps/deprecated-add-on-for-cisco-network-data_279.tgz"
+        filename: "deprecated-add-on-for-cisco-network-data_279.tgz"
+      - url: "https://my-splunk-apps.s3.us-east-1.amazonaws.com/apps/red-hat-event-driven-ansible-add-on-for-splunk_101.tgz"
+        filename: "red-hat-event-driven-ansible-add-on-for-splunk_101.tgz"
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Prerequisites
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Ensure podman is installed
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - python3-podman
+        state: present
+
+    - name: Create Splunk persistent data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - "{{ splunk_data_dir }}"
+        - "{{ splunk_data_dir }}/var"
+        - "{{ splunk_data_dir }}/etc"
+        - "{{ splunk_data_dir }}/etc/apps"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Deploy Splunk container
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Stop any existing Splunk container
+      containers.podman.podman_container:
+        name: "{{ splunk_container_name }}"
+        state: absent
+      failed_when: false
+
+    - name: Ensure Splunk search limits directory exists
+      ansible.builtin.file:
+        path: "{{ splunk_data_dir }}/etc/system/local"
+        state: directory
+        mode: '0755'
+      failed_when: false
+
+    - name: Write Splunk search limits to prevent slot exhaustion
+      ansible.builtin.copy:
+        dest: "{{ splunk_data_dir }}/etc/system/local/limits.conf"
+        content: |
+          # Prevent Cisco data model acceleration from consuming all search slots
+          [search]
+          base_max_searches = 30
+          max_searches_per_cpu = 3
+        mode: '0644'
+      failed_when: false
+
+    - name: Run Splunk Enterprise container
+      containers.podman.podman_container:
+        name: "{{ splunk_container_name }}"
+        image: "{{ splunk_image }}"
+        state: started
+        hostname: splunk.zta.lab
+        privileged: true
+        ports:
+          - "8000:8000"
+          - "8088:8088"
+          - "8089:8089"
+          - "9997:9997"
+        env:
+          SPLUNK_START_ARGS: "{{ splunk_start_args }}"
+          SPLUNK_GENERAL_TERMS: "{{ splunk_general_terms }}"
+          SPLUNK_PASSWORD: "{{ splunk_password }}"
+          SPLUNK_HEC_TOKEN: "{{ splunk_hec_token }}"
+        volume:
+          - "{{ splunk_data_dir }}/var:/opt/splunk/var"
+          - "{{ splunk_data_dir }}/etc:/opt/splunk/etc"
+        detach: true
+      register: splunk_container
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — Wait for Splunk to be ready
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Wait for Splunk web interface (first boot takes 3-5 minutes)
+      ansible.builtin.uri:
+        url: "http://localhost:8000"
+        method: GET
+        status_code: [200, 302, 303]
+      register: splunk_health
+      until: splunk_health.status in [200, 302, 303]
+      retries: 60
+      delay: 10
+
+    - name: Wait for Splunk management API
+      ansible.builtin.uri:
+        url: "https://localhost:8089/services/server/info"
+        method: GET
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: mgmt_health
+      until: mgmt_health.status == 200
+      retries: 30
+      delay: 5
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Configure HEC and indexes
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Enable HTTP Event Collector
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/admin/splunk_httpinput/data/inputs/http/http"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          disabled: "0"
+          enableSSL: "1"
+        status_code: [200, 201, 409]
+
+    - name: Create HEC token for ZTA integration
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/admin/splunk_httpinput/data/inputs/http"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: zta-workshop
+          token: "{{ splunk_hec_token }}"
+          index: main
+          sourcetype: _json
+          disabled: "0"
+        status_code: [200, 201, 409]
+
+    - name: Create workshop indexes
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/admin/search/data/indexes"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: "{{ item.name }}"
+          datatype: event
+        status_code: [200, 201, 409]
+      loop:
+        - { name: zta_security, description: "security / bypass alerts" }
+        - { name: zta_audit, description: "AAP job audit trail" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — Firewall
+    # ═══════════════════════════════════════════════════════════════════
+
+    # - name: Open Splunk firewall ports
+    #   ansible.builtin.firewalld:
+    #     port: "{{ item }}"
+    #     permanent: true
+    #     immediate: true
+    #     state: enabled
+    #   loop:
+    #     - 8000/tcp
+    #     - 8088/tcp
+    #     - 8089/tcp
+    #     - 9997/tcp
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6 — Install Splunk apps from S3
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Create temporary directory for Splunk apps
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: splunk_apps
+      register: temp_apps_dir
+
+    - name: Download Splunk apps from S3
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ temp_apps_dir.path }}/{{ item.filename }}"
+        mode: '0644'
+      loop: "{{ splunk_apps }}"
+      loop_control:
+        label: "{{ item.filename }}"
+
+    - name: Copy app tarballs into Splunk container
+      containers.podman.podman_container_copy:
+        container: "{{ splunk_container_name }}"
+        src: "{{ temp_apps_dir.path }}/{{ item.filename }}"
+        dest: "/tmp/{{ item.filename }}"
+      loop: "{{ splunk_apps }}"
+      loop_control:
+        label: "{{ item.filename }}"
+
+    - name: Extract Splunk apps inside container
+      containers.podman.podman_container_exec:
+        name: "{{ splunk_container_name }}"
+        command: "tar -xzf /tmp/{{ item.filename }} -C {{ splunk_container_apps_path }}"
+        user: root
+      loop: "{{ splunk_apps }}"
+      loop_control:
+        label: "{{ item.filename }}"
+
+    - name: Set ownership of app files to splunk user
+      containers.podman.podman_container_exec:
+        name: "{{ splunk_container_name }}"
+        command: "chown -R {{ splunk_app_owner }}:{{ splunk_app_group }} {{ splunk_container_apps_path }}"
+        user: root
+
+    - name: Clean up app tarballs from container
+      containers.podman.podman_container_exec:
+        name: "{{ splunk_container_name }}"
+        command: "rm -f /tmp/{{ item.filename }}"
+        user: root
+      loop: "{{ splunk_apps }}"
+      loop_control:
+        label: "{{ item.filename }}"
+      ignore_errors: true
+
+    - name: Clean up temporary directory
+      ansible.builtin.file:
+        path: "{{ temp_apps_dir.path }}"
+        state: absent
+
+    - name: Restart Splunk container to load the apps
+      containers.podman.podman_container:
+        name: "{{ splunk_container_name }}"
+        state: started
+        restart: true
+
+    - name: Wait for Splunk to come back after app install
+      ansible.builtin.uri:
+        url: "http://localhost:8000"
+        method: GET
+        status_code: [200, 302, 303]
+      register: splunk_post_apps
+      until: splunk_post_apps.status in [200, 302, 303]
+      retries: 30
+      delay: 10
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6.5 — Pre-stage EDA add-on configuration
+    #
+    # Writes the saved search (brute-force alert) to the host-mounted
+    # volume and registers the EDA environment via REST API.
+    # The webhook_endpoint defaults to a placeholder; update via the
+    # Splunk GUI or the Configure Splunk EDA AAP job template.
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Create user-namespace savedsearches.conf directory on host volume
+      ansible.builtin.file:
+        path: "{{ splunk_data_dir }}/etc/users/admin/ansible_addon_for_splunk/local"
+        state: directory
+        mode: '0755'
+        owner: "41812"
+        group: "41812"
+
+    - name: Write EDA saved search (brute-force alert) to host volume
+      ansible.builtin.copy:
+        dest: "{{ splunk_data_dir }}/etc/users/admin/ansible_addon_for_splunk/local/savedsearches.conf"
+        owner: "41812"
+        group: "41812"
+        mode: '0644'
+        content: |
+          [ZTA: SSH Brute Force Detected]
+          alert.severity = 4
+          alert.suppress = 0
+          alert.track = 1
+          actions = ansible_core
+          action.ansible_core = 1
+          action.ansible_core.param.alert_type = webhook
+          action.ansible_core.param.environment = ZTA
+          counttype = number of events
+          cron_schedule = */1 * * * *
+          dispatch.earliest_time = -5m
+          dispatch.latest_time = now
+          enableSched = 1
+          quantity = 0
+          relation = greater than
+          search = (index=zta_app OR index=zta_syslog) sourcetype=syslog "Authentication failure" | rex field=_raw "from (?P<src_ip>\d+\.\d+\.\d+\.\d+)" | stats count by src_ip, host | where count >= 5 | sort -count
+
+    - name: Wait for Splunk management API before environment registration
+      ansible.builtin.uri:
+        url: "https://localhost:8089/services/server/info"
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: splunk_mgmt_ready
+      until: splunk_mgmt_ready.status == 200
+      retries: 30
+      delay: 5
+      tags: [eda_webhook]
+
+    - name: Check if EDA environment already exists
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/nobody/ansible_addon_for_splunk/ansible_addon_for_splunk_environment/ZTA?output_mode=json"
+        method: GET
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 404, 500]
+      register: eda_env_check
+      tags: [eda_webhook]
+
+    - name: Create EDA webhook environment via REST API
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/nobody/ansible_addon_for_splunk/ansible_addon_for_splunk_environment"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          name: ZTA
+          environment: ZTA
+          integration_type: webhook
+          webhook_endpoint: "{{ eda_event_stream_url | default('CHANGE_ME_EDA_EVENT_STREAM_URL') }}"
+          auth_type: apikey
+          token: "{{ eda_webhook_token }}"
+          connection_timeout: "10"
+          retries: "3"
+          ssl_check_hostname: "0"
+        status_code: [200, 201]
+      when: eda_env_check.status != 200
+      tags: [eda_webhook]
+
+    - name: Update existing EDA webhook environment
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/nobody/ansible_addon_for_splunk/ansible_addon_for_splunk_environment/ZTA"
+        method: POST
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          environment: ZTA
+          integration_type: webhook
+          webhook_endpoint: "{{ eda_event_stream_url | default('CHANGE_ME_EDA_EVENT_STREAM_URL') }}"
+          auth_type: apikey
+          token: "{{ eda_webhook_token }}"
+          connection_timeout: "10"
+          retries: "3"
+          ssl_check_hostname: "0"
+        status_code: [200]
+      when: eda_env_check.status == 200
+      tags: [eda_webhook]
+
+    - name: EDA add-on pre-staging status
+      ansible.builtin.debug:
+        msg: >-
+          EDA saved search written to host volume.
+          {% if eda_env_check is defined and eda_env_check.status is defined %}
+          Environment 'ZTA' {{ '(created)' if eda_env_check.status != 200 else '(updated)' }}.
+          {% endif %}
+          NOTE: Configure the webhook endpoint in Splunk GUI (Apps → Ansible Add-on for Splunk → Configuration → ZTA) with the EDA Token Event Stream URL.
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Systemd service for reboot persistence
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Generate systemd service file for Splunk container
+      containers.podman.podman_generate_systemd:
+        name: "{{ splunk_container_name }}"
+        dest: /etc/systemd/system/
+        restart_policy: always
+        new: false
+      register: splunk_systemd
+
+    - name: Enable and start Splunk systemd service
+      ansible.builtin.systemd:
+        name: "{{ splunk_service_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 8 — Verify with a test HEC event
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Send test event to HEC
+      ansible.builtin.uri:
+        url: "https://localhost:8088/services/collector/event"
+        method: POST
+        headers:
+          Authorization: "Splunk {{ splunk_hec_token }}"
+        body_format: json
+        body:
+          event: "ZTA Workshop Splunk deployment verified"
+          sourcetype: "zta:setup"
+          source: "ansible"
+          index: main
+        validate_certs: false
+        status_code: [200]
+      register: hec_test
+
+    # ═══════════════════════════════════════════════════════════════════
+    - name: Disable Cisco data model acceleration (prevents consuming all search slots)
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/admin/{{ item }}/data/models/{{ item | regex_replace('-', '_') | upper }}"
+        method: POST
+        user: admin
+        password: "{{ splunk_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          "acceleration.enabled": "0"
+        status_code: [200, 201, 404]
+      loop:
+        - app-for-cisco-network-data
+      failed_when: false
+      tags: [splunk-apps, configure]
+
+        # Summary
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Display Splunk deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║         Splunk Enterprise — Deployment Complete               ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Web UI:     http://{{ ansible_host }}:8000{{ ' ' * 23 }}║
+          ║  HEC:        https://{{ ansible_host }}:8088{{ ' ' * 22 }}║
+          ║  Mgmt API:   https://{{ ansible_host }}:8089{{ ' ' * 22 }}║
+          ║  Forwarder:  {{ ansible_host }}:9997{{ ' ' * 27 }}║
+          ║                                                              ║
+          ║  Credentials:                                                ║
+          ║    Username:  admin                                          ║
+          ║    Password:  {{ splunk_password }}║
+          ║                                                              ║
+          ║  HEC Token:  {{ splunk_hec_token }}║
+          ║                                                              ║
+          ║  Indexes:                                                    ║
+          ║    main          — default events                            ║
+          ║    zta_security  — security / brute-force / bypass alerts    ║
+          ║    zta_audit     — AAP job audit trail                       ║
+          ║                                                              ║
+          ║  Installed Apps:                                             ║
+          ║    - Network Data App (Cisco/general syslog)                 ║
+          ║    - Network Data Add-on                                     ║
+          ║    - Red Hat EDA Add-on for Splunk                           ║
+          ║                                                              ║
+          ║  HEC test:   {{ ('OK' if hec_test.status == 200 else 'FAILED') }}║
+          ║                                                              ║
+          ║  Systemd:    {{ splunk_service_name }}║
+          ║  Status:     systemctl status {{ splunk_service_name }}║
+          ║  Logs:       journalctl -u {{ splunk_service_name }}║
+          ╚════════════════════════════════════════════════════════════════╝

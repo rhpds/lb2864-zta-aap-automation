@@ -1,0 +1,386 @@
+---
+# Section 1 Validation: Configure ZTA Components & AAP Integration
+#
+# Checks:
+#   - AAP credentials exist (Vault, Machine, Arista, NetBox, Vault SSH)
+#   - AAP project synced
+#   - AAP inventory with NetBox source, hosts populated
+#   - Job templates created (Verify ZTA Services, Test Vault Integration, etc.)
+#   - ZTA service health (IdM, Vault, OPA, NetBox, Kerberos, DNS, PostgreSQL, cEOS)
+#   - Vault KV readable, SSH CA role exists
+#   - OPA policies loaded and responding
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section1.yml
+
+- name: "Section 1 Check | AAP Resources"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section1, aap]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check AAP Controller reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: s1_aap_ping
+      failed_when: false
+
+    - name: Check AAP credentials exist
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/credentials/?name={{ item | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s1_cred_checks
+      loop: "{{ expected_credentials }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    - name: Check AAP project exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/projects/?name={{ expected_project | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s1_project_check
+      failed_when: false
+
+    - name: Check AAP inventory exists
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/inventories/?name={{ expected_inventory | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s1_inventory_check
+      failed_when: false
+
+    - name: Check Section 1 job templates exist
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ item | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s1_template_checks
+      loop: "{{ expected_section1_templates }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    - name: Parse credential results
+      set_fact:
+        s1_cred_results: >-
+          {{ s1_cred_results | default({}) | combine({
+            item.item: ((item.json.count | default(0)) > 0)
+          }) }}
+      loop: "{{ s1_cred_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Parse template results
+      set_fact:
+        s1_template_results: >-
+          {{ s1_template_results | default({}) | combine({
+            item.item: ((item.json.count | default(0)) > 0)
+          }) }}
+      loop: "{{ s1_template_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Store AAP resource checks
+      set_fact:
+        s1_aap_ok: "{{ (s1_aap_ping.status | default(0)) == 200 }}"
+        s1_project_ok: "{{ (s1_project_check.json.count | default(0)) > 0 }}"
+        s1_inventory_ok: "{{ (s1_inventory_check.json.count | default(0)) > 0 }}"
+
+- name: "Section 1 Check | ZTA Service Health"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section1, services]
+
+  tasks:
+    - name: Check IdM services
+      command: ipactl status
+      register: s1_idm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check Vault health
+      uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: false
+        status_code: [200, 429, 472, 473]
+      register: s1_vault_health
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Check OPA health
+      uri:
+        url: "{{ opa_url }}/health"
+        method: GET
+      register: s1_opa_health
+      failed_when: false
+
+    - name: Check OPA policies loaded
+      uri:
+        url: "{{ opa_url }}/v1/policies"
+        method: GET
+        return_content: true
+      register: s1_opa_policies
+      failed_when: false
+
+    - name: Check NetBox API
+      uri:
+        url: "{{ netbox_url }}/api/status/"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+        status_code: 200
+      register: s1_netbox_health
+      failed_when: false
+
+    - name: Check Kerberos
+      shell: echo '{{ idm_admin_password }}' | kinit admin && klist
+      register: s1_krb_check
+      changed_when: false
+      no_log: true
+      failed_when: false
+
+    - name: Check DNS resolution
+      command: "dig +short {{ item }} @127.0.0.1"
+      register: s1_dns_checks
+      changed_when: false
+      failed_when: false
+      loop:
+        - central.zta.lab
+        - vault.zta.lab
+        - app.zta.lab
+        - db.zta.lab
+
+    - name: Test OPA patching allow
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/patching/decision"
+        method: POST
+        body_format: json
+        body:
+          input: "{{ opa_test_patching_allow }}"
+      register: s1_opa_patch_allow
+      failed_when: false
+      vars:
+        opa_test_patching_allow:
+          user: ztauser
+          user_groups: [patch-admins]
+          target_server: app.zta.lab
+          target_server_status: Active
+          maintenance_approved: true
+
+    - name: Test OPA patching deny
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/patching/decision"
+        method: POST
+        body_format: json
+        body:
+          input: "{{ opa_test_patching_deny }}"
+      register: s1_opa_patch_deny
+      failed_when: false
+      vars:
+        opa_test_patching_deny:
+          user: neteng
+          user_groups: []
+          target_server: app.zta.lab
+          target_server_status: Active
+          maintenance_approved: true
+
+    - name: Check Vault KV readable
+      uri:
+        url: "{{ vault_addr }}/v1/secret/data/machine/rhel"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ s1_vault_token }}"
+        validate_certs: false
+        status_code: [200]
+      register: s1_vault_kv
+      failed_when: false
+      delegate_to: localhost
+      vars:
+        s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
+      when: s1_vault_login is defined and s1_vault_login is not failed
+
+    - name: Check Vault SSH role
+      uri:
+        url: "{{ vault_addr }}/v1/ssh/roles/ssh-signer"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ s1_vault_token }}"
+        validate_certs: false
+        status_code: [200]
+      register: s1_vault_ssh_role
+      failed_when: false
+      delegate_to: localhost
+      vars:
+        s1_vault_token: "{{ s1_vault_login.json.auth.client_token }}"
+      when: s1_vault_login is defined and s1_vault_login is not failed
+
+  pre_tasks:
+    - name: Authenticate to Vault
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/admin"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ idm_admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: s1_vault_login
+      failed_when: false
+      delegate_to: localhost
+
+- name: "Section 1 Check | Database"
+  hosts: db_servers
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section1, services]
+
+  tasks:
+    - name: Check PostgreSQL
+      systemd:
+        name: postgresql
+      check_mode: true
+      register: s1_pg_status
+      failed_when: false
+
+    - name: Test database connectivity
+      become_user: postgres
+      command: psql -d {{ db_name }} -c "SELECT 1;"
+      register: s1_db_check
+      changed_when: false
+      failed_when: false
+
+- name: "Section 1 Check | Arista cEOS"
+  hosts: network
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section1, services]
+
+  tasks:
+    - name: Check cEOS reachability
+      arista.eos.eos_facts:
+        gather_subset: min
+      register: s1_switch_info
+      failed_when: false
+
+- name: "Section 1 Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section1, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    checks:
+      - name: AAP Controller reachable
+        ok: "{{ hostvars['localhost']['s1_aap_ok'] | default(false) }}"
+      - name: "Credential: ZTA Vault Credential"
+        ok: "{{ (hostvars['localhost']['s1_cred_results'] | default({}))['ZTA Vault Credential'] | default(false) }}"
+      - name: "Credential: ZTA Machine Credential"
+        ok: "{{ (hostvars['localhost']['s1_cred_results'] | default({}))['ZTA Machine Credential'] | default(false) }}"
+      - name: "Credential: ZTA Arista Credential"
+        ok: "{{ (hostvars['localhost']['s1_cred_results'] | default({}))['ZTA Arista Credential'] | default(false) }}"
+      - name: "Credential: ZTA NetBox Credential"
+        ok: "{{ (hostvars['localhost']['s1_cred_results'] | default({}))['ZTA NetBox Credential'] | default(false) }}"
+      - name: "Credential: ZTA Vault SSH Credential"
+        ok: "{{ (hostvars['localhost']['s1_cred_results'] | default({}))['ZTA Vault SSH Credential'] | default(false) }}"
+      - name: "Project: ZTA Workshop"
+        ok: "{{ hostvars['localhost']['s1_project_ok'] | default(false) }}"
+      - name: "Inventory: ZTA Lab Inventory"
+        ok: "{{ hostvars['localhost']['s1_inventory_ok'] | default(false) }}"
+      - name: "Template: Verify ZTA Services"
+        ok: "{{ (hostvars['localhost']['s1_template_results'] | default({}))['Verify ZTA Services'] | default(false) }}"
+      - name: "Template: Test Vault Integration"
+        ok: "{{ (hostvars['localhost']['s1_template_results'] | default({}))['Test Vault Integration'] | default(false) }}"
+      - name: "Template: Test Vault SSH Certificates"
+        ok: "{{ (hostvars['localhost']['s1_template_results'] | default({}))['Test Vault SSH Certificates'] | default(false) }}"
+      - name: "Template: Test OPA Policy"
+        ok: "{{ (hostvars['localhost']['s1_template_results'] | default({}))['Test OPA Policy'] | default(false) }}"
+      - name: IdM services running
+        ok: "{{ 'RUNNING' in (c.s1_idm_status.stdout | default('')) }}"
+      - name: Vault healthy (unsealed)
+        ok: "{{ (c.s1_vault_health.status | default(0)) == 200 }}"
+      - name: OPA healthy
+        ok: "{{ (c.s1_opa_health.status | default(0)) == 200 }}"
+      - name: OPA policies loaded
+        ok: "{{ (c.s1_opa_policies.json.result | default([]) | length) > 0 }}"
+      - name: NetBox API accessible
+        ok: "{{ (c.s1_netbox_health.status | default(0)) == 200 }}"
+      - name: Kerberos TGT
+        ok: "{{ (c.s1_krb_check.rc | default(1)) == 0 }}"
+      - name: DNS resolution
+        ok: "{{ c.s1_dns_checks.results | default([]) | rejectattr('stdout', 'equalto', '') | list | length == (c.s1_dns_checks.results | default([]) | length) }}"
+      - name: OPA patching allow (ztauser)
+        ok: "{{ (c.s1_opa_patch_allow.json.result.allow | default(false)) == true }}"
+      - name: OPA patching deny (neteng)
+        ok: "{{ (c.s1_opa_patch_deny.json.result.allow | default(true)) == false }}"
+      - name: Vault KV readable
+        ok: "{{ (c.s1_vault_kv.status | default(0)) == 200 }}"
+      - name: Vault SSH CA role exists
+        ok: "{{ (c.s1_vault_ssh_role.status | default(0)) == 200 }}"
+      - name: PostgreSQL running
+        ok: "{{ (hostvars['db']['s1_pg_status']['status']['ActiveState'] | default('')) == 'active' }}"
+      - name: Database connectivity
+        ok: "{{ (hostvars['db']['s1_db_check']['rc'] | default(1)) == 0 }}"
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 1 verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║     Section 1 — Configure ZTA Components & AAP Integration     ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── INCOMPLETE ──                                              ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          {% else %}
+          ║  Section 1 complete — all exercises verified.                  ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

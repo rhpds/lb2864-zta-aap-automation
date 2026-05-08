@@ -1,0 +1,131 @@
+---
+# Pre-workshop setup: Deploy base OPA policies for all workshop scenarios
+- name: Configure OPA Base Policies
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Ensure OPA policy directory exists
+      file:
+        path: "{{ opa_policy_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Deploy patching policy
+      copy:
+        src: ../opa-policies/patching.rego
+        dest: "{{ opa_policy_dir }}/patching.rego"
+        mode: '0644'
+      register: patching_policy
+
+    - name: Deploy network policy
+      copy:
+        src: ../opa-policies/network.rego
+        dest: "{{ opa_policy_dir }}/network.rego"
+        mode: '0644'
+      register: network_policy
+
+    - name: Deploy database access policy
+      copy:
+        src: ../opa-policies/db_access.rego
+        dest: "{{ opa_policy_dir }}/db_access.rego"
+        mode: '0644'
+      register: db_policy
+
+    - name: Deploy base ZTA policy
+      copy:
+        src: ../opa-policies/zta_base.rego
+        dest: "{{ opa_policy_dir }}/zta_base.rego"
+        mode: '0644'
+      register: base_policy
+
+    - name: Deploy AAP gateway policy (Policy as Code)
+      copy:
+        src: ../opa-policies/aap_gateway.rego
+        dest: "{{ opa_policy_dir }}/aap_gateway.rego"
+        mode: '0644'
+      register: gateway_policy
+
+    - name: Deploy data classification policy (Section 3B)
+      copy:
+        src: ../opa-policies/data_classification.rego
+        dest: "{{ opa_policy_dir }}/data_classification.rego"
+        mode: '0644'
+      register: data_classification_policy
+
+    - name: Deploy identity-based authorisation policy
+      copy:
+        dest: "{{ opa_policy_dir }}/zta_authz.rego"
+        content: |
+          package zta.authz
+
+          import rego.v1
+
+          default allow := false
+
+          allow if {
+            input.user != ""
+            "zta-admins" in input.groups
+          }
+
+          decision := {
+            "allow": allow,
+            "user": input.user,
+            "groups": input.groups,
+          } if {
+            input.user
+          }
+
+          decision := {
+            "allow": false,
+            "reason": "missing user identity",
+          } if {
+            not input.user
+          }
+        mode: '0644'
+      register: authz_policy
+
+    - name: Deploy health check policy
+      copy:
+        dest: "{{ opa_policy_dir }}/health.rego"
+        content: |
+          package system
+
+          import rego.v1
+
+          main := {
+            "status": "healthy",
+            "version": "1.0",
+            "policies": ["zta_base", "zta_authz", "patching", "network", "db_access", "aap_gateway", "data_classification"],
+          }
+        mode: '0644'
+      register: health_policy
+
+    - name: Restart OPA to load updated policies
+      command: podman restart {{ opa_container_name }}
+      when: >
+        patching_policy.changed or network_policy.changed or
+        db_policy.changed or base_policy.changed or
+        gateway_policy.changed or data_classification_policy.changed or
+        authz_policy.changed or health_policy.changed
+
+    - name: Wait for OPA health
+      uri:
+        url: "{{ opa_url }}/health"
+        method: GET
+      register: opa_health
+      until: opa_health.status == 200
+      retries: 10
+      delay: 3
+
+    - name: Verify policies are loaded
+      uri:
+        url: "{{ opa_url }}/v1/policies"
+        method: GET
+        return_content: true
+      register: loaded_policies
+
+    - name: Display loaded policies
+      debug:
+        msg: "OPA has {{ loaded_policies.json.result | length }} policies loaded"

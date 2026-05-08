@@ -1,0 +1,177 @@
+---
+# Section 2 Solve: Deploy Application with Short-Lived Credentials
+#
+# Auto-creates:
+#   - 5 pipeline job templates
+#   - "Deploy Application Pipeline" workflow with success/failure links
+#   - Launches the workflow to deploy the application
+#
+# Prerequisites: Section 1 solve must be complete (credentials, project, inventory)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-section2.yml
+
+- name: "Section 2 Solve | Templates & Workflow"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section2]
+
+  vars_files:
+    - validation_vars.yml
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+    - name: Verify AAP Controller is reachable
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+
+    # ── Job Templates ──────────────────────────────────────────────────
+
+    - name: Create Section 2 job templates
+      ansible.controller.job_template:
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        project: "{{ expected_project }}"
+        playbook: "{{ item.playbook }}"
+        inventory: "{{ expected_inventory }}"
+        credentials: "{{ item.credentials }}"
+        state: present
+      loop:
+        - name: Check DB Access Policy
+          description: "Section 2 — OPA check before issuing DB credentials"
+          playbook: section2/playbooks/check-db-policy.yml
+          credentials: [ZTA Machine Credential]
+        - name: Create DB Credential
+          description: "Section 2 — Generate Vault dynamic DB credentials"
+          playbook: section2/playbooks/create-db-credential.yml
+          credentials: [ZTA Machine Credential]
+        - name: Configure DB Access List
+          description: "Section 2 — Apply Arista ACL for DB micro-segmentation"
+          playbook: section2/playbooks/configure-db-access.yml
+          credentials: [ZTA Machine Credential, ZTA Arista Credential]
+        - name: Deploy Application
+          description: "Section 2 — Deploy Global Telemetry Platform"
+          playbook: section2/playbooks/deploy-application.yml
+          credentials: [ZTA Machine Credential]
+        - name: Rotate DB Credentials
+          description: "Section 2 — Revoke old and issue new DB credentials"
+          playbook: section2/playbooks/rotate-credentials.yml
+          credentials: [ZTA Machine Credential]
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [templates]
+
+    # ── Workflow ───────────────────────────────────────────────────────
+
+    - name: Create Deploy Application Pipeline workflow
+      ansible.controller.workflow_job_template:
+        name: "{{ expected_section2_workflow }}"
+        description: "Section 2 — OPA → Vault → ACL → Deploy pipeline"
+        organization: "{{ aap_organization }}"
+        inventory: "{{ expected_inventory }}"
+        state: present
+      tags: [workflow]
+
+    - name: "Workflow node 1: Check DB Access Policy"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: check_policy
+        unified_job_template: Check DB Access Policy
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [workflow]
+
+    - name: "Workflow node 2: Create DB Credential (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: create_cred
+        unified_job_template: Create DB Credential
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [workflow]
+
+    - name: "Workflow node 3: Configure DB Access List (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: configure_acl
+        unified_job_template: Configure DB Access List
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [workflow]
+
+    - name: "Workflow node 4: Deploy Application (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: deploy_app
+        unified_job_template: Deploy Application
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [workflow]
+
+    - name: "Link: check_policy → create_cred (success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: check_policy
+        unified_job_template: Check DB Access Policy
+        organization: "{{ aap_organization }}"
+        success_nodes:
+          - create_cred
+        state: present
+      tags: [workflow]
+
+    - name: "Link: create_cred → configure_acl (success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: create_cred
+        unified_job_template: Create DB Credential
+        organization: "{{ aap_organization }}"
+        success_nodes:
+          - configure_acl
+        state: present
+      tags: [workflow]
+
+    - name: "Link: configure_acl → deploy_app (success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "{{ expected_section2_workflow }}"
+        identifier: configure_acl
+        unified_job_template: Configure DB Access List
+        organization: "{{ aap_organization }}"
+        success_nodes:
+          - deploy_app
+        state: present
+      tags: [workflow]
+
+    # ── Launch the workflow ────────────────────────────────────────────
+
+    - name: Launch Deploy Application Pipeline
+      ansible.controller.workflow_launch:
+        workflow_template: "{{ expected_section2_workflow }}"
+        wait: true
+        timeout: 300
+      register: s2_workflow_launch
+      tags: [launch]
+
+    - name: Display solve summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  Section 2 Solve — Complete                                    ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  Created:                                                      ║
+          ║    ✓ 5 job templates (policy, cred, ACL, deploy, rotate)       ║
+          ║    ✓ Workflow: Deploy Application Pipeline                     ║
+          ║    ✓ Workflow launched — application deployed                   ║
+          ║                                                                ║
+          ║  Run check-section2.yml to verify.                             ║
+          ╚══════════════════════════════════════════════════════════════════╝

@@ -1,0 +1,265 @@
+---
+# Job templates for setup/configure-aap-project.yml — one row per playbook under section*/playbooks/
+# Credentials and surveys mirror setup/validation/solve-section*.yml where applicable.
+
+zta_workshop_job_templates:
+  # ── Section 1 ───────────────────────────────────────────────────────
+  - section: 1
+    name: Verify ZTA Services
+    description: "Section 1 — Verify all ZTA infrastructure services"
+    playbook: section1/playbooks/verify-zta-services.yml
+    credentials: [ZTA Machine Credential]
+  - section: 1
+    name: Test Vault Integration
+    description: "Section 1 — Test Vault dynamic credentials"
+    playbook: section1/playbooks/test-vault-integration.yml
+    credentials: [ZTA Machine Credential]
+  - section: 1
+    name: Test Vault SSH Certificates
+    description: "Section 1 — Test Vault SSH signed certificates"
+    playbook: section1/playbooks/test-vault-ssh.yml
+    credentials: [ZTA Machine Credential]
+  - section: 1
+    name: Test OPA Policy
+    description: "Section 1 — Test OPA policy decisions"
+    playbook: section1/playbooks/test-opa-policy.yml
+    credentials: [ZTA Machine Credential]
+  - section: 1
+    name: Break Cert Trust
+    description: "Section 1 — Lab break step (cert trust)"
+    playbook: section1/playbooks/break-cert-trust.yml
+    credentials: [ZTA Machine Credential]
+  - section: 1
+    name: Fix Cert Trust
+    description: "Section 1 — Lab fix step (cert trust)"
+    playbook: section1/playbooks/fix-cert-trust.yml
+    credentials: [ZTA Machine Credential]
+  - section: 1
+    name: List OPA Policies
+    description: "Admin utility — List all policies loaded in OPA with health check"
+    playbook: utilities/list-opa-policies.yml
+    credentials: [ZTA Machine Credential]
+
+  # ── Section 2 ───────────────────────────────────────────────────────
+  - section: 2
+    name: Check DB Access Policy
+    description: "Section 2 — OPA check before issuing DB credentials"
+    playbook: section2/playbooks/check-db-policy.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Create DB Credential
+    description: "Section 2 — Generate Vault dynamic DB credentials"
+    playbook: section2/playbooks/create-db-credential.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Configure DB Access List
+    description: "Section 2 — Apply Arista ACL for DB micro-segmentation"
+    playbook: section2/playbooks/configure-db-access.yml
+    credentials: [ZTA Machine Credential, ZTA Arista Credential]
+  - section: 2
+    name: Deploy Application
+    description: "Section 2 — Deploy Global Telemetry Platform"
+    playbook: section2/playbooks/deploy-application.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Rotate DB Credentials
+    description: "Section 2 — Revoke old and issue new DB credentials"
+    playbook: section2/playbooks/rotate-credentials.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Break Vault DB Policy
+    description: "Section 2 — Lab break step (Vault DB policy)"
+    playbook: section2/playbooks/break-vault-policy.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Fix Vault DB Policy
+    description: "Section 2 — Lab fix step (Vault DB policy)"
+    playbook: section2/playbooks/fix-vault-policy.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Break Firewall
+    description: "Section 2 — Lab break step (firewall)"
+    playbook: section2/playbooks/break-firewall.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Fix Firewall
+    description: "Section 2 — Lab fix step (firewall)"
+    playbook: section2/playbooks/fix-firewall.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Break SELinux
+    description: "Section 2 — Lab break step (SELinux)"
+    playbook: section2/playbooks/break-selinux.yml
+    credentials: [ZTA Machine Credential]
+  - section: 2
+    name: Fix SELinux
+    description: "Section 2 — Lab fix step (SELinux)"
+    playbook: section2/playbooks/fix-selinux.yml
+    credentials: [ZTA Machine Credential]
+
+  # ── Section 3 ───────────────────────────────────────────────────────
+  - section: 3
+    name: Apply Security Patch
+    description: "Section 3 — Apply security hardening patch (AAP Policy as Code gated)"
+    playbook: section3/playbooks/apply-security-patch.yml
+    credentials: [ZTA Machine Credential]
+    survey_enabled: true
+    survey_spec:
+      name: "Patch target survey"
+      description: "Select the target host for the security patch"
+      spec:
+        - question_name: Target Host
+          question_description: "Hostname to apply the security patch to"
+          required: true
+          type: text
+          variable: target_host
+          default: app
+  - section: 3
+    name: Patch Server
+    description: "Section 3 — Patch server (direct playbook)"
+    playbook: section3/playbooks/patch-server.yml
+    credentials: [ZTA Machine Credential]
+  - section: 3
+    name: Break OPA Data Policy
+    description: "Section 3 — Lab break step (OPA data classification)"
+    playbook: section3/playbooks/break-opa-policy.yml
+    credentials: [ZTA Machine Credential]
+  - section: 3
+    name: Fix OPA Data Policy
+    description: "Section 3 — Lab fix step (OPA data classification)"
+    playbook: section3/playbooks/fix-opa-policy.yml
+    credentials: [ZTA Machine Credential]
+  - section: 3
+    name: Check Wazuh Security
+    description: "Section 3 — Wazuh security posture check"
+    playbook: section3/playbooks/check-wazuh-security.yml
+    credentials: [ZTA Machine Credential]
+    requires: wazuh
+
+  # ── Section 4 ───────────────────────────────────────────────────────
+  - section: 4
+    name: Configure VLAN
+    description: "Section 4 — SPIFFE-verified VLAN creation (two OPA policy rings)"
+    playbook: section4/playbooks/configure-vlan.yml
+    credentials: [ZTA Machine Credential, ZTA Arista Credential]
+    survey_enabled: true
+    survey_spec:
+      name: "VLAN configuration survey"
+      description: "Specify the VLAN ID and name to create"
+      spec:
+        - question_name: VLAN ID
+          question_description: "VLAN ID to create (100-999)"
+          required: true
+          type: integer
+          variable: new_vlan_id
+          default: 200
+        - question_name: VLAN Name
+          question_description: "Name for the new VLAN"
+          required: true
+          type: text
+          variable: new_vlan_name
+          default: DMZ
+  - section: 4
+    name: Manage IdM Identity
+    description: "Section 4 — Create groups, users, and group memberships in IdM"
+    playbook: section4/playbooks/manage-idm-identity.yml
+    credentials: [ZTA Machine Credential]
+    survey_enabled: true
+    survey_spec:
+      name: "IdM identity management survey"
+      description: "Select an action and provide the required fields"
+      spec:
+        - question_name: Action
+          question_description: "What do you want to do?"
+          required: true
+          type: multiplechoice
+          variable: action
+          choices: |-
+            create_group
+            create_user
+            add_user_to_group
+            show_identity
+          default: show_identity
+        - question_name: Group Name
+          question_description: "IdM group name (e.g. team-readonly)"
+          required: false
+          type: text
+          variable: group_name
+          default: ""
+        - question_name: Group Description
+          question_description: "Description for new group (create_group only)"
+          required: false
+          type: text
+          variable: group_desc
+          default: ""
+        - question_name: User ID
+          question_description: "IdM user login (e.g. neteng)"
+          required: false
+          type: text
+          variable: user_id
+          default: ""
+        - question_name: First Name
+          question_description: "First name (create_user only)"
+          required: false
+          type: text
+          variable: user_first
+          default: ""
+        - question_name: Last Name
+          question_description: "Last name (create_user only)"
+          required: false
+          type: text
+          variable: user_last
+          default: ""
+  - section: 4
+    name: Verify SPIFFE Trust
+    description: "Section 4 — SVID inspection, short-lived credentials, and rogue workload identity test"
+    playbook: section4/playbooks/verify-spiffe-trust.yml
+    credentials: [ZTA Machine Credential]
+  - section: 4
+    name: Break ACL
+    description: "Section 4 — Lab break step (ACL)"
+    playbook: section4/playbooks/break-acl.yml
+    credentials: [ZTA Machine Credential, ZTA Arista Credential]
+  - section: 4
+    name: Fix ACL
+    description: "Section 4 — Lab fix step (ACL)"
+    playbook: section4/playbooks/fix-acl.yml
+    credentials: [ZTA Machine Credential, ZTA Arista Credential]
+
+  # ── Section 5 ───────────────────────────────────────────────────────
+  - section: 5
+    name: Simulate Brute Force
+    description: "Section 5 — Credential abuse simulation"
+    playbook: section5/playbooks/simulate-bruteforce.yml
+    credentials: [ZTA Machine Credential]
+  - section: 5
+    name: "Emergency: Revoke App Credentials"
+    description: "Section 5 — Emergency revoke application credentials (triggered by EDA)"
+    playbook: section5/playbooks/revoke-app-credentials.yml
+    credentials: [ZTA Machine Credential]
+    ask_variables_on_launch: true
+  - section: 5
+    name: Restore App Credentials
+    description: "Section 5 — Restore application credentials"
+    playbook: section5/playbooks/restore-app-credentials.yml
+    credentials: [ZTA Machine Credential]
+
+  # ── Section 6 ───────────────────────────────────────────────────────
+  - section: 6
+    name: Break HBAC
+    description: "Section 6 — Lab break step (host-based access)"
+    playbook: section6/playbooks/break-hbac.yml
+    credentials: [ZTA Machine Credential]
+  - section: 6
+    name: Fix HBAC
+    description: "Section 6 — Lab fix step (host-based access)"
+    playbook: section6/playbooks/fix-hbac.yml
+    credentials: [ZTA Machine Credential]
+
+  # ── Section 7 ───────────────────────────────────────────────────────
+  - section: 7
+    name: Simulate Brute Force Wazuh
+    description: "Section 7 — Wazuh-driven brute-force simulation"
+    playbook: section7/playbooks/simulate-bruteforce-wazuh.yml
+    credentials: [ZTA Machine Credential]
+    requires: wazuh

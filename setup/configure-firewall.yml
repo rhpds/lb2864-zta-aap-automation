@@ -1,0 +1,123 @@
+---
+# configure-firewall.yml — Enable firewalld and open all workshop ports on central
+#
+# Podman/Netavark requires firewalld to expose container-mapped ports to
+# external hosts.  Without firewalld, the nftables rules Netavark creates
+# only allow traffic from within the container networks.
+#
+# This playbook must run BEFORE any playbook that connects to a container
+# service from an external host (AAP controller, student workstations).
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-firewall.yml
+
+- name: Configure Central Firewall for Workshop Services
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    workshop_tcp_ports:
+      # ── General ──
+      - 22       # SSH (central host)
+      - 80       # HTTP (IdM web UI)
+      - 443      # HTTPS (IdM web UI, AAP)
+      - 123      # NTP
+
+      # ── IdM / Kerberos / LDAP ──
+      - 88       # Kerberos KDC
+      - 389      # LDAP
+      - 464      # Kerberos kpasswd
+      - 636      # LDAPS
+
+      # ── Arista cEOS switches (SSH + eAPI) ──
+      - 2001     # ceos1 SSH
+      - 2002     # ceos2 SSH
+      - 2003     # ceos3 SSH
+      - 6031     # ceos1 eAPI
+      - 6032     # ceos2 eAPI
+      - 6033     # ceos3 eAPI
+
+      # ── RHEL containers ──
+      - 2022     # DB container SSH
+      - 2023     # App container SSH
+      - 5432     # PostgreSQL (DB container)
+      - 8081     # Global Telemetry Platform (App container)
+
+      # ── Keycloak ──
+      - 8080     # Keycloak HTTP
+      - 8443     # Keycloak HTTPS
+      - 8543     # Keycloak admin console
+
+      # ── OPA ──
+      - 8181     # OPA policy API
+
+      # ── SPIRE ──
+      - 8082     # SPIRE Server (agent attestation)
+
+      # ── Splunk ──
+      - 8000     # Splunk web UI
+      - 8088     # Splunk HEC (event collector)
+      - 8089     # Splunk management API
+      - 9997     # Splunk forwarder receiver
+
+      # ── Wazuh ──
+      - 1514     # Wazuh agent communication
+      - 1515     # Wazuh agent enrollment
+      - 5601     # Wazuh Dashboard
+      - 9200     # Wazuh Indexer (OpenSearch)
+      - 55000    # Wazuh Manager API
+
+      # ── Vault ──
+      - 8200     # Vault API
+      - 8201     # Vault cluster
+
+      # ── Netbox ──
+      - 8880     # Netbox web UI
+
+      # ── Gitea ──
+      - 3000     # Gitea web UI
+
+      # ── AAP / EDA ──
+      - 5000     # EDA Controller (webhook)
+
+      # ── ZTA Dashboard ──
+      - 5050     # Live Topology Dashboard
+
+    workshop_udp_ports:
+      - 514      # Wazuh syslog collection (Arista, hosts)
+
+  tasks:
+
+    - name: Ensure firewalld is installed
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+
+    - name: Ensure firewalld is running and enabled
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Open workshop TCP ports
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ workshop_tcp_ports }}"
+
+    - name: Open workshop UDP ports
+      ansible.posix.firewalld:
+        port: "{{ item }}/udp"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ workshop_udp_ports }}"
+
+    - name: Display firewall summary
+      ansible.builtin.debug:
+        msg: |
+          Central firewall configured — {{ workshop_tcp_ports | length }} TCP + {{ workshop_udp_ports | length }} UDP ports opened.
+          Run 'firewall-cmd --list-ports' on central to verify.

@@ -1,0 +1,136 @@
+---
+# SSH Lockdown — Layer 4: Wazuh Bypass Detection
+#
+# Deploy custom Wazuh rules that alert when:
+#   - An SSH login succeeds from a source that is NOT the AAP controller
+#   - An SSH login is attempted by an unauthorized IdM user (HBAC denied)
+#
+# These alerts are forwarded to EDA via the existing Wazuh→EDA integration
+# (setup/configure-wazuh-eda.yml), enabling automated incident response.
+
+- name: "SSH Lockdown | Layer 4 — Wazuh: Detect SSH Bypass Attempts"
+  hosts: wazuh_servers
+  become: true
+  gather_facts: false
+
+  vars:
+    wazuh_rules_dir: /var/ossec/etc/rules
+    aap_controller_ip: "192.168.1.10"
+    management_ip: "192.168.1.11"
+    eda_webhook_url: "http://control.zta.lab:5000/endpoint"
+
+  tasks:
+    # ── 1. Deploy custom bypass detection rules ──
+    - name: Deploy SSH bypass detection rules
+      copy:
+        dest: "{{ wazuh_rules_dir }}/ssh_bypass_rules.xml"
+        content: |
+          <!-- SSH Bypass Detection — Zero Trust Architecture Workshop
+               These rules detect SSH activity that bypasses the AAP enforcement point. -->
+
+          <group name="local,sshd,zta_bypass">
+
+            <!-- Successful SSH login from UNTRUSTED source (not AAP, not central) -->
+            <rule id="100020" level="12">
+              <if_sid>5715</if_sid>
+              <srcip>!{{ aap_controller_ip }}</srcip>
+              <srcip>!{{ management_ip }}</srcip>
+              <description>ZTA BYPASS: SSH login succeeded from non-AAP source $(srcip) — possible PEP bypass</description>
+              <group>authentication_success,zta_bypass</group>
+              <options>alert_by_email</options>
+            </rule>
+
+            <!-- SSH login attempt by IdM user denied by HBAC -->
+            <rule id="100021" level="10">
+              <if_sid>5710</if_sid>
+              <match>Access denied|not allowed</match>
+              <description>ZTA HBAC: SSH login denied by IdM HBAC for user $(dstuser) on $(hostname)</description>
+              <group>authentication_failed,zta_hbac</group>
+            </rule>
+
+            <!-- Successful SSH login from AAP controller (informational) -->
+            <rule id="100022" level="3">
+              <if_sid>5715</if_sid>
+              <srcip>{{ aap_controller_ip }}</srcip>
+              <description>ZTA OK: SSH login from AAP controller (expected path) — user $(dstuser)</description>
+              <group>authentication_success,zta_compliant</group>
+            </rule>
+
+            <!-- Firewall reject on SSH port from untrusted source -->
+            <rule id="100023" level="8">
+              <if_sid>4101</if_sid>
+              <action>REJECT</action>
+              <dstport>22</dstport>
+              <description>ZTA FIREWALL: SSH connection rejected from $(srcip) — firewall lockdown active</description>
+              <group>firewall,zta_bypass</group>
+            </rule>
+
+            <!-- Multiple HBAC denials from same source (possible recon) -->
+            <rule id="100024" level="13" frequency="3" timeframe="120">
+              <if_matched_sid>100021</if_matched_sid>
+              <same_source_ip />
+              <description>ZTA RECON: Repeated HBAC denials from $(srcip) — possible reconnaissance</description>
+              <group>authentication_failed,zta_bypass,recon</group>
+            </rule>
+
+          </group>
+        mode: '0640'
+        owner: root
+        group: wazuh
+      notify: Restart Wazuh manager
+
+    # ── 2. Add bypass rules to EDA integration (extend existing config) ──
+    - name: Update EDA integration to include bypass rules
+      blockinfile:
+        path: /var/ossec/etc/ossec.conf
+        insertbefore: "</ossec_config>"
+        block: |
+          <!-- ZTA Bypass Detection — forward to Event-Driven Ansible -->
+          <integration>
+            <name>custom-eda</name>
+            <hook_url>{{ eda_webhook_url }}</hook_url>
+            <rule_id>100020,100024</rule_id>
+            <alert_format>json</alert_format>
+          </integration>
+        marker: "<!-- {mark} ZTA BYPASS EDA INTEGRATION -->"
+      notify: Restart Wazuh manager
+
+    # ── 3. Verify rules loaded ──
+    - name: Test Wazuh rule syntax
+      command: /var/ossec/bin/wazuh-analysisd -t
+      register: rule_test
+      changed_when: false
+      failed_when: rule_test.rc != 0
+
+    - name: Display bypass detection summary
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║       Wazuh SSH Bypass Detection — Active                     ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Custom rules deployed:                                      ║
+          ║    100020  SSH login from non-AAP source       (level 12)    ║
+          ║    100021  HBAC denied SSH login                (level 10)    ║
+          ║    100022  SSH from AAP controller (compliant)  (level 3)     ║
+          ║    100023  Firewall rejected SSH attempt        (level 8)     ║
+          ║    100024  Repeated HBAC denials (recon)        (level 13)    ║
+          ║                                                              ║
+          ║  EDA integration:                                            ║
+          ║    Rules 100020, 100024 forwarded to EDA webhook             ║
+          ║    → Automatic incident response on bypass detection          ║
+          ║                                                              ║
+          ║  What triggers an alert:                                      ║
+          ║    1. Someone SSH-es to a host from their workstation         ║
+          ║    2. An IdM user denied by HBAC tries repeatedly            ║
+          ║    3. Firewall rejects an SSH connection on port 22           ║
+          ║                                                              ║
+          ║  All compliant AAP connections logged at level 3              ║
+          ║  (informational — full audit trail)                           ║
+          ╚════════════════════════════════════════════════════════════════╝
+
+  handlers:
+    - name: Restart Wazuh manager
+      systemd:
+        name: wazuh-manager
+        state: restarted

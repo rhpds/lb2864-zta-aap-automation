@@ -1,0 +1,251 @@
+---
+# Section 4: SPIFFE Trust Verification
+#
+# Two demonstrations:
+#   Part 1 — Inspect the SVID certificate (short-lived credential properties)
+#   Part 2 — Compare legitimate vs rogue workload identity against OPA
+#   Part 3 — Register a rogue entry in SPIRE, prove OPA still denies it, clean up
+
+
+- name: "Part 1: SVID Certificate Inspection"
+  hosts: automation
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Create temp directory for SVID export
+      file:
+        path: /tmp/spiffe-verify
+        state: directory
+        mode: '0700'
+
+    - name: Fetch X.509 SVID from SPIRE Agent
+      command: >
+        {{ spire_install_dir }}/bin/spire-agent api fetch x509
+        -socketPath {{ spire_agent_socket }}
+        -write /tmp/spiffe-verify
+      register: svid_fetch
+
+    - name: Extract SPIFFE ID from SAN
+      shell: >
+        openssl x509 -in /tmp/spiffe-verify/svid.0.pem -noout -ext subjectAltName
+        2>/dev/null | grep -oP 'URI:\K[^\s,]+'
+      register: svid_san
+
+    - name: Set workload SPIFFE ID fact
+      set_fact:
+        workload_spiffe_id: "{{ svid_san.stdout }}"
+
+    - name: Extract certificate validity dates
+      shell: |
+        not_before=$(openssl x509 -in /tmp/spiffe-verify/svid.0.pem -noout -startdate | cut -d= -f2)
+        not_after=$(openssl x509 -in /tmp/spiffe-verify/svid.0.pem -noout -enddate | cut -d= -f2)
+        start_epoch=$(date -d "$not_before" +%s)
+        end_epoch=$(date -d "$not_after" +%s)
+        now_epoch=$(date +%s)
+        total_min=$(( (end_epoch - start_epoch) / 60 ))
+        remaining_min=$(( (end_epoch - now_epoch) / 60 ))
+        echo "${total_min}|${remaining_min}|${not_before}|${not_after}"
+      register: svid_lifetime
+
+    - name: Extract certificate issuer
+      shell: >
+        openssl x509 -in /tmp/spiffe-verify/svid.0.pem -noout -issuer
+        | sed 's/^issuer=//'
+      register: svid_issuer
+
+    - name: Display SVID certificate analysis
+      vars:
+        parts: "{{ svid_lifetime.stdout.split('|') }}"
+      debug:
+        msg: |-
+          ══════════════════════════════════════════════════════════
+            SVID Certificate Analysis
+          ══════════════════════════════════════════════════════════
+
+            SPIFFE ID:  {{ workload_spiffe_id }}
+            Issuer:     {{ svid_issuer.stdout }}
+            Not Before: {{ parts[2] }}
+            Not After:  {{ parts[3] }}
+            Total TTL:  {{ parts[0] }} minutes
+            Remaining:  {{ parts[1] }} minutes
+
+          ── Compare with traditional credentials ──────────────
+            SSH key:       no expiry (compromised = permanent)
+            This SVID:     {{ parts[0] }} min TTL, auto-rotated by SPIRE
+            Vault DB cred: 5 min TTL (Section 2)
+
+            Short-lived + auto-rotated = stolen certs expire fast.
+          ══════════════════════════════════════════════════════════
+
+    - name: Clean up exported SVID
+      file:
+        path: /tmp/spiffe-verify
+        state: absent
+
+
+- name: "Part 2: Legitimate vs Rogue Workload Identity (OPA)"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  vars:
+    workload_spiffe_id: "{{ hostvars[groups['automation'][0]]['workload_spiffe_id'] }}"
+    rogue_spiffe_id: "spiffe://zta.lab/workload/rogue-automation"
+
+  tasks:
+    - name: Test OPA with LEGITIMATE workload identity
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body: >-
+          {{ {
+            "input": {
+              "user": "netadmin",
+              "user_groups": ["network-admins"],
+              "action": "create_vlan",
+              "vlan_id": 200,
+              "vlan_name": "test",
+              "spiffe_id": workload_spiffe_id
+            }
+          } }}
+      register: legitimate_result
+
+    - name: Test OPA with ROGUE workload identity
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body: >-
+          {{ {
+            "input": {
+              "user": "netadmin",
+              "user_groups": ["network-admins"],
+              "action": "create_vlan",
+              "vlan_id": 200,
+              "vlan_name": "test",
+              "spiffe_id": rogue_spiffe_id
+            }
+          } }}
+      register: rogue_result
+
+    - name: Display side-by-side comparison
+      debug:
+        msg: |-
+          ══════════════════════════════════════════════════════════
+            Workload Identity: Legitimate vs Rogue
+          ══════════════════════════════════════════════════════════
+
+            Both requests use the SAME user (netadmin), SAME group
+            (network-admins), SAME VLAN (200). Only the workload
+            SPIFFE ID differs.
+
+          ── Test 1: Legitimate workload ───────────────────────
+            SPIFFE ID:  {{ workload_spiffe_id }}
+            Result:     {{ 'ALLOWED' if legitimate_result.json.result.allow else 'DENIED' }}
+            Workload:   {{ 'TRUSTED' if legitimate_result.json.result.conditions.workload_verified else 'UNTRUSTED' }}
+
+          ── Test 2: Rogue workload ────────────────────────────
+            SPIFFE ID:  {{ rogue_spiffe_id }}
+            Result:     {{ 'ALLOWED' if rogue_result.json.result.allow else 'DENIED' }}
+            Workload:   {{ 'TRUSTED' if rogue_result.json.result.conditions.workload_verified else 'UNTRUSTED' }}
+
+            Same user credentials, different outcome.
+            Stolen credentials are useless without a trusted
+            workload identity from the attested platform.
+          ══════════════════════════════════════════════════════════
+
+
+- name: "Part 3: Register Rogue Entry in SPIRE (advanced)"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    rogue_spiffe_id: "spiffe://{{ spire_trust_domain }}/workload/rogue-automation"
+
+  tasks:
+    - name: Show current registered workloads (before)
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+      register: entries_before
+
+    - name: Extract parent ID from the network-automation entry
+      shell: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+        -spiffeID spiffe://{{ spire_trust_domain }}/workload/network-automation
+        | grep -oP 'Parent ID\s*:\s*\K\S+'
+      register: parent_id_result
+      failed_when: parent_id_result.stdout == ""
+
+    - name: Display registered entries (before)
+      debug:
+        msg: |-
+          ── Currently registered workloads ──
+          {{ entries_before.stdout }}
+
+    - name: Register rogue workload entry
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry create
+        -socketPath {{ spire_server_socket }}
+        -spiffeID {{ rogue_spiffe_id }}
+        -parentID {{ parent_id_result.stdout }}
+        -selector unix:uid:0
+      register: rogue_entry
+
+    - name: Capture rogue entry ID for cleanup
+      set_fact:
+        rogue_entry_id: "{{ rogue_entry.stdout | regex_search('Entry ID\\s*:\\s*(\\S+)', '\\1') | first }}"
+
+    - name: Show registered workloads (after — rogue added)
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+      register: entries_after
+
+    - name: Display registered entries (after)
+      debug:
+        msg: |-
+          ── Registered workloads (rogue entry added) ──
+          {{ entries_after.stdout }}
+
+          The rogue workload now has a VALID SPIRE registration.
+          SPIRE would issue it a real X.509 SVID.
+          But OPA only trusts 'network-automation' — not 'rogue-automation'.
+          A valid certificate is NOT the same as authorisation.
+
+    - name: Delete rogue entry (cleanup)
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry delete
+        -socketPath {{ spire_server_socket }}
+        -entryID {{ rogue_entry_id }}
+
+    - name: Verify cleanup
+      command: >
+        {{ spire_install_dir }}/bin/spire-server entry show
+        -socketPath {{ spire_server_socket }}
+      register: entries_cleaned
+
+    - name: Display final summary
+      debug:
+        msg: |-
+          ══════════════════════════════════════════════════════════
+            SPIFFE Trust Verification — Summary
+          ══════════════════════════════════════════════════════════
+
+            1. SVID certificates are SHORT-LIVED — stolen certs
+               expire within minutes, not months.
+
+            2. A valid SVID alone is not enough — OPA checks the
+               SPIFFE ID against a trusted allowlist. Having a
+               certificate from the same CA does not grant access.
+
+            3. Authentication (SPIRE) ≠ Authorisation (OPA).
+               SPIRE proves WHO the workload is.
+               OPA decides WHAT it may do.
+
+            Rogue entry has been cleaned up.
+          ══════════════════════════════════════════════════════════

@@ -1,0 +1,179 @@
+---
+# Section 3 Validation: AAP Policy as Code — Platform-Gated Patching
+#
+# Checks:
+#   - Apply Security Patch template exists in AAP
+#   - OPA aap.gateway blocks neteng from patching templates
+#   - OPA aap.gateway allows ztauser for patching templates
+#   - Security hardening applied on app: login banner, SSH config,
+#     password policy, audit rules
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section3.yml
+
+- name: "Section 3 Check | AAP Template & Gateway Policy"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section3, aap]
+
+  vars_files:
+    - validation_vars.yml
+
+  tasks:
+    - name: Check Apply Security Patch template
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ 'Apply Security Patch' | urlencode }}"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s3_template_check
+      failed_when: false
+
+    - name: Store template result
+      set_fact:
+        s3_template_ok: "{{ (s3_template_check.json.count | default(0)) > 0 }}"
+
+- name: "Section 3 Check | OPA Gateway Policy"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section3, opa]
+
+  tasks:
+    - name: Test OPA gateway denies neteng for patching
+      uri:
+        url: "{{ opa_url }}/v1/data/aap/gateway/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            name: Apply Security Patch
+            created_by:
+              username: neteng
+              is_superuser: false
+              teams: []
+      register: s3_gw_deny
+      failed_when: false
+
+    - name: Test OPA gateway allows ztauser for patching
+      uri:
+        url: "{{ opa_url }}/v1/data/aap/gateway/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            name: Apply Security Patch
+            created_by:
+              username: ztauser
+              is_superuser: false
+              teams:
+                - name: Infrastructure
+      register: s3_gw_allow
+      failed_when: false
+
+- name: "Section 3 Check | Security Patch Applied"
+  hosts: app_servers
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section3, patch]
+
+  tasks:
+    - name: Check login banner exists
+      stat:
+        path: /etc/issue
+      register: s3_banner_stat
+
+    - name: Check login banner content
+      command: grep -c "AUTHORISED ACCESS ONLY" /etc/issue
+      register: s3_banner_content
+      changed_when: false
+      failed_when: false
+
+    - name: Check SSH hardening — PermitRootLogin
+      shell: sshd -T 2>/dev/null | grep -i permitrootlogin
+      register: s3_ssh_root
+      changed_when: false
+      failed_when: false
+
+    - name: Check SSH hardening — MaxAuthTries
+      shell: sshd -T 2>/dev/null | grep -i maxauthtries
+      register: s3_ssh_maxtries
+      changed_when: false
+      failed_when: false
+
+    - name: Check password policy file
+      stat:
+        path: /etc/security/pwquality.conf.d/zta-policy.conf
+      register: s3_pwquality
+      failed_when: false
+
+    - name: Check audit rules
+      command: auditctl -l
+      register: s3_audit_rules
+      changed_when: false
+      failed_when: false
+
+- name: "Section 3 Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section3, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    a: "{{ hostvars['app'] | default({}) }}"
+    checks:
+      - name: "Template: Apply Security Patch"
+        ok: "{{ s3_template_ok | default(false) }}"
+      - name: OPA gateway denies neteng (patching)
+        ok: "{{ (c.s3_gw_deny.json.result.allowed | default(true)) == false }}"
+      - name: OPA gateway allows ztauser (patching)
+        ok: "{{ (c.s3_gw_allow.json.result.allowed | default(false)) == true }}"
+      - name: Login banner deployed
+        ok: "{{ (a.s3_banner_content.rc | default(1)) == 0 }}"
+      - name: SSH PermitRootLogin disabled
+        ok: "{{ 'no' in (a.s3_ssh_root.stdout | default('')) }}"
+      - name: SSH MaxAuthTries set to 3
+        ok: "{{ '3' in (a.s3_ssh_maxtries.stdout | default('')) }}"
+      - name: Password policy file exists
+        ok: "{{ a.s3_pwquality.stat.exists | default(false) }}"
+      - name: Audit rules active
+        ok: "{{ 'zta' in (a.s3_audit_rules.stdout | default('')) }}"
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 3 verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║   Section 3 — AAP Policy as Code: Platform-Gated Patching      ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── INCOMPLETE ──                                              ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          {% else %}
+          ║  Section 3 complete — all exercises verified.                  ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

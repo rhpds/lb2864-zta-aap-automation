@@ -1,0 +1,48 @@
+---
+# Master solve: auto-complete all workshop sections.
+#
+# Imports each section solve playbook sequentially.
+# Sections build on each other, so ordering matters.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-all.yml
+#
+# Run specific sections only:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-all.yml --tags section1
+#   ansible-playbook -i inventory/hosts.ini setup/validation/solve-all.yml --tags section2,section3
+#
+# Available tags:
+#   section1  — Credentials, project, inventory, verification templates
+#   section2  — Pipeline templates, workflow, application deployment
+#   section3  — Patching template, security hardening, OPA fix (3B)
+#   section3b — Fix data_classification OPA policy only
+#   section4  — VLAN template, VLAN 200 creation
+#   section5  — Incident response templates, Wazuh/EDA verification
+#   section6  — SSH lockdown (all 4 layers)
+#
+# Per-section tags: credentials, project, inventory, templates, workflow,
+#   launch, template, firewall, hbac, vault, wazuh, verify
+
+- name: "Solve All | Section 1 — ZTA Components & AAP Integration"
+  ansible.builtin.import_playbook: solve-section1.yml
+  tags: [section1]
+
+- name: "Solve All | Section 2 — Application Deployment"
+  ansible.builtin.import_playbook: solve-section2.yml
+  tags: [section2]
+
+- name: "Solve All | Section 3 — Platform-Gated Patching"
+  ansible.builtin.import_playbook: solve-section3.yml
+  tags: [section3]
+
+- name: "Solve All | Section 4 — SPIFFE-Verified VLAN Management"
+  ansible.builtin.import_playbook: solve-section4.yml
+  tags: [section4]
+
+- name: "Solve All | Section 5 — Automated Incident Response"
+  ansible.builtin.import_playbook: solve-section5.yml
+  tags: [section5]
+
+- name: "Solve All | Section 6 — SSH Lockdown & Break-Glass"
+  ansible.builtin.import_playbook: solve-section6.yml
+  tags: [section6]

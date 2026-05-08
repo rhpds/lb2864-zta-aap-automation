@@ -1,0 +1,44 @@
+---
+# Master validation: check all workshop sections.
+#
+# Imports each section check playbook and ends with a consolidated summary.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-all.yml
+#
+# Run specific sections only:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-all.yml --tags section1
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-all.yml --tags section2,section3
+#
+# Available tags:
+#   section1, section2, section3, section3b, section4, section5, section6
+#   aap, opa, services, app, network, spire, wazuh, eda, firewall, hbac, vault, patch
+#   summary (always runs)
+
+- name: "Check All | Section 1 — ZTA Components & AAP Integration"
+  ansible.builtin.import_playbook: check-section1.yml
+  tags: [section1]
+
+- name: "Check All | Section 2 — Application Deployment"
+  ansible.builtin.import_playbook: check-section2.yml
+  tags: [section2]
+
+- name: "Check All | Section 3 — Platform-Gated Patching"
+  ansible.builtin.import_playbook: check-section3.yml
+  tags: [section3]
+
+- name: "Check All | Section 3B — OPA Rego Authoring"
+  ansible.builtin.import_playbook: check-section3b.yml
+  tags: [section3b]
+
+- name: "Check All | Section 4 — SPIFFE-Verified VLAN Management"
+  ansible.builtin.import_playbook: check-section4.yml
+  tags: [section4]
+
+- name: "Check All | Section 5 — Automated Incident Response"
+  ansible.builtin.import_playbook: check-section5.yml
+  tags: [section5]
+
+- name: "Check All | Section 6 — SSH Lockdown & Break-Glass"
+  ansible.builtin.import_playbook: check-section6.yml
+  tags: [section6]

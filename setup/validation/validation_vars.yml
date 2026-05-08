@@ -1,0 +1,157 @@
+---
+# Shared variables for all validation (check) and solve playbooks.
+#
+# Override at runtime:
+#   ansible-playbook ... -e @setup/validation/validation_vars.yml -e aap_password=secret
+
+# ── AAP Controller connection ────────────────────────────────────────
+aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+aap_user: admin
+aap_password: "{{ lookup('env', 'AAP_ADMIN_PASSWORD') | default('ansible123!', true) }}"
+aap_verify_ssl: false
+aap_organization: Default
+
+# ── Vault connection (for solve playbooks that need tokens) ──────────
+vault_username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+vault_password_val: "{{ lookup('env', 'VAULT_PASSWORD') | default(idm_admin_password, true) }}"
+
+# ── Expected AAP resource names ─────────────────────────────────────
+
+expected_credentials:
+  - ZTA Vault Credential
+  - ZTA Machine Credential
+  - ZTA Arista Credential
+  - ZTA NetBox Credential
+  - ZTA Vault SSH Credential
+
+expected_project: ZTA Workshop
+expected_inventory: ZTA Lab Inventory
+expected_inventory_source: NetBox CMDB
+
+expected_section1_templates:
+  - Verify ZTA Services
+  - Test Vault Integration
+  - Test Vault SSH Certificates
+  - Test OPA Policy
+
+expected_section2_templates:
+  - Check DB Access Policy
+  - Create DB Credential
+  - Configure DB Access List
+  - Deploy Application
+  - Rotate DB Credentials
+
+expected_section2_workflow: Deploy Application Pipeline
+
+expected_section3_templates:
+  - Apply Security Patch
+  - Patch Server
+  - Break OPA Data Policy
+  - Fix OPA Data Policy
+
+expected_section4_templates:
+  - Configure VLAN
+  - Manage IdM Identity
+  - Verify SPIFFE Trust
+  - Break ACL
+  - Fix ACL
+
+expected_section5_templates:
+  - "Emergency: Revoke App Credentials"
+  - Simulate Brute Force
+  - Restore App Credentials
+
+# ── Expected inventory hosts ─────────────────────────────────────────
+expected_inventory_hosts:
+  - central.zta.lab
+  - control.zta.lab
+  - vault.zta.lab
+  - app.zta.lab
+  - db.zta.lab
+
+# ── OPA test payloads ────────────────────────────────────────────────
+
+opa_test_patching_allow:
+  user: ztauser
+  user_groups: [patch-admins]
+  target_server: app.zta.lab
+  target_server_status: Active
+  maintenance_approved: true
+
+opa_test_patching_deny:
+  user: neteng
+  user_groups: []
+  target_server: app.zta.lab
+  target_server_status: Active
+  maintenance_approved: true
+
+opa_test_db_allow:
+  user: appdev
+  user_groups: [app-deployers]
+  target_database: ztaapp
+  requested_permissions: [SELECT, INSERT, UPDATE]
+
+opa_test_db_deny:
+  user: neteng
+  user_groups: []
+  target_database: ztaapp
+  requested_permissions: [SELECT, INSERT, UPDATE]
+
+opa_test_network_allow:
+  user: netadmin
+  user_groups: [network-admins]
+  spiffe_id: "spiffe://zta.lab/workload/network-automation"
+  action: create_vlan
+  vlan_id: 200
+
+opa_test_network_deny:
+  user: neteng
+  user_groups: []
+  spiffe_id: "spiffe://zta.lab/workload/network-automation"
+  action: create_vlan
+  vlan_id: 200
+
+opa_test_gateway_patch_deny:
+  name: Apply Security Patch
+  created_by:
+    username: neteng
+    is_superuser: false
+    teams: []
+
+opa_test_gateway_patch_allow:
+  name: Apply Security Patch
+  created_by:
+    username: ztauser
+    is_superuser: false
+    teams:
+      - name: Infrastructure
+
+# ── Section 3B data classification tests ─────────────────────────────
+
+opa_test_dc_pii_secops_only:
+  user: spatel
+  user_groups: [security-ops]
+  data_classification: pii
+
+opa_test_dc_confidential_appdev:
+  user: appdev
+  user_groups: [app-deployers]
+  data_classification: confidential
+
+opa_test_dc_pii_both_groups:
+  user: nobrien
+  user_groups: [db-admins, security-ops]
+  data_classification: pii
+
+opa_test_dc_public_any:
+  user: appdev
+  user_groups: [app-deployers]
+  data_classification: public
+
+opa_test_dc_internal_appdev:
+  user: appdev
+  user_groups: [app-deployers]
+  data_classification: internal
+
+# ── Gitea project source ─────────────────────────────────────────────
+gitea_project_url: "http://gitea.zta.lab:3000/zta-workshop/zta-app.git"

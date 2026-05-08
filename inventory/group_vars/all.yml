@@ -1,0 +1,299 @@
+---
+# ── Lab Identity ─────────────────────────────────────────────────────
+# Auto-discovered from the target VM's facts.  Override at runtime:
+#   ansible-playbook <playbook> -e idm_domain=custom.lab
+
+idm_hostname: central.zta.lab
+idm_domain: zta.lab
+idm_realm: "{{ idm_domain | upper }}"
+idm_admin_password: ansible123!
+idm_dm_password: ansible123!
+
+# ── OPA (Open Policy Agent) — runs on central alongside IdM ─────────
+opa_url: "http://central.zta.lab:8181"
+opa_container_name: opa
+opa_policy_dir: /opt/opa/policies
+
+# ── HashiCorp Vault (own VM) ────────────────────────────────────────
+vault_addr: "http://192.168.1.12:8200"
+vault_skip_verify: true
+
+# ── Netbox / CMDB (own VM) ──────────────────────────────────────────
+netbox_url: "http://netbox.zta.lab:8000"
+netbox_token: "{{ lookup('env', 'NETBOX_TOKEN') | default('0123456789abcdef0123456789abcdef01234567', true) }}"
+
+# ── Gitea / Git Server (external — not managed by workshop automation) ──
+gitea_url: "http://gitea.zta.lab:3000"
+
+# ── Wazuh / SIEM (own VM) ──────────────────────────────────────────
+wazuh_url: "http://wazuh.zta.lab:5601"
+wazuh_api_url: "https://wazuh.zta.lab:55000"
+wazuh_api_user: wazuh
+wazuh_api_password: "x8.E0+DZi6zCCz3cG9jvXimSBn5+s4tx"
+wazuh_manager_host: wazuh.zta.lab
+
+# ── Splunk (container on central) ───────────────────────────────────
+splunk_url: "http://splunk.zta.lab:8000"
+splunk_hec_url: "https://splunk.zta.lab:8088"
+splunk_hec_token: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+eda_webhook_token: "zta-eda-webhook-a1b2c3d4-e5f6-7890"
+
+# ── Keycloak (container on central) ─────────────────────────────────
+keycloak_url: "https://keycloak.zta.lab:8543"
+
+# ── AAP Controller (own VM) ─────────────────────────────────────────
+aap_controller_url: "https://control.zta.lab"
+aap_controller_ip: "192.168.1.10"
+aap_validate_certs: false
+
+# ── Arista cEOS Switches (containers on central) ──────────────────
+# Replaced Cisco Catalyst 8000v with 3 containerized Arista cEOS switches.
+# Management access is via published ports on central's 192.168.1.x address.
+arista_switches:
+  ceos1:
+    role: spine
+    ssh_port: 2001
+    eapi_port: 6031
+  ceos2:
+    role: leaf-data-tier
+    ssh_port: 2002
+    eapi_port: 6032
+  ceos3:
+    role: leaf-app-tier
+    ssh_port: 2003
+    eapi_port: 6033
+
+# ── Database / PostgreSQL (container on central) ───────────────────
+# Management plane: accessible via central.zta.lab:5432 / SSH port 2022
+# Data plane: 10.30.0.10 on net2 (routed through ceos2)
+db_host: db.zta.lab
+db_port: 5432
+db_name: ztaapp
+db_admin_user: postgres
+db_admin_password: "{{ lookup('env', 'DB_ADMIN_PASSWORD') | default('postgres123!', true) }}"
+db_data_ip: "10.30.0.10"
+
+# ── Application Server (container on central) ─────────────────────
+# Management plane: accessible via central.zta.lab:8081 / SSH port 2023
+# Data plane: 10.20.0.10 on net3 (routed through ceos3)
+app_host: app.zta.lab
+app_port: 8081
+app_deploy_dir: /opt/ztaapp
+app_data_ip: "10.20.0.10"
+
+# ── IdM Teams (organisational units) ────────────────────────────────
+idm_teams:
+  - name: team-infrastructure
+    description: Infrastructure & Platform Engineering
+  - name: team-devops
+    description: DevOps & CI/CD
+  - name: team-security
+    description: Security Operations & Compliance
+  - name: team-applications
+    description: Application Development
+  - name: team-readonly
+    description: Read-only template visibility (all workshop users)
+
+# ── IdM Functional Groups (used in OPA policies for RBAC) ──────────
+idm_groups:
+  - name: zta-admins
+    description: ZTA Lab Administrators — full access
+  - name: patch-admins
+    description: Server patching operators
+  - name: network-admins
+    description: Network configuration operators
+  - name: app-deployers
+    description: Application deployment operators
+  - name: security-ops
+    description: Security operations — Wazuh, audit, compliance
+  - name: db-admins
+    description: Database administration
+  - name: change-approvers
+    description: Can approve maintenance windows and change requests
+
+# ── IdM Users ──────────────────────────────────────────────────────
+# The first 4 are the primary workshop scenario users.
+# The remaining 15 populate the directory to make it feel real-world.
+# All passwords: {{ idm_admin_password }}
+idm_workshop_users:
+  # Workshop scenario accounts
+  - uid: ztauser
+    first: ZTA
+    last: User
+    title: Workshop Admin
+    groups: [zta-admins, patch-admins, app-deployers, team-infrastructure]
+  - uid: netadmin
+    first: Network
+    last: Admin
+    title: Workshop Network Admin
+    groups: [zta-admins, network-admins, team-infrastructure]
+  - uid: appdev
+    first: App
+    last: Developer
+    title: Workshop App Developer
+    groups: [app-deployers, team-applications]
+  - uid: neteng
+    first: Network
+    last: Engineer
+    title: Workshop Network Engineer (denied by policy — visible via Readonly team)
+    groups: [team-readonly]
+
+  # Infrastructure team
+  - uid: jsmith
+    first: James
+    last: Smith
+    title: Infrastructure Team Lead
+    groups: [zta-admins, patch-admins, change-approvers, team-infrastructure]
+  - uid: rwilson
+    first: Robert
+    last: Wilson
+    title: Senior Systems Administrator
+    groups: [patch-admins, team-infrastructure]
+  - uid: nobrien
+    first: Nora
+    last: O'Brien
+    title: Database Administrator
+    groups: [db-admins, patch-admins, team-infrastructure]
+  - uid: djohnson
+    first: David
+    last: Johnson
+    title: Network Architect
+    groups: [network-admins, change-approvers, team-infrastructure]
+  - uid: agarcia
+    first: Ana
+    last: Garcia
+    title: Network Engineer
+    groups: [network-admins, team-infrastructure]
+
+  # DevOps team
+  - uid: lkim
+    first: Lisa
+    last: Kim
+    title: DevOps Lead
+    groups: [zta-admins, app-deployers, change-approvers, team-devops]
+  - uid: mchen
+    first: Michael
+    last: Chen
+    title: DevOps Engineer
+    groups: [app-deployers, patch-admins, team-devops]
+  - uid: ksato
+    first: Kenji
+    last: Sato
+    title: Platform Engineer
+    groups: [app-deployers, patch-admins, team-devops]
+
+  # Security team
+  - uid: mrodriguez
+    first: Maria
+    last: Rodriguez
+    title: Security Lead
+    groups: [zta-admins, security-ops, change-approvers, team-security]
+  - uid: spatel
+    first: Sarah
+    last: Patel
+    title: Security Analyst
+    groups: [security-ops, team-security]
+
+  # Application team
+  - uid: twright
+    first: Tom
+    last: Wright
+    title: Junior Developer
+    groups: [app-deployers, team-applications]
+  - uid: ebell
+    first: Emma
+    last: Bell
+    title: Senior Developer
+    groups: [app-deployers, team-applications]
+  - uid: cmorales
+    first: Carlos
+    last: Morales
+    title: QA Engineer
+    groups: [team-applications]
+  - uid: pryan
+    first: Patricia
+    last: Ryan
+    title: Release Manager
+    groups: [app-deployers, change-approvers, team-applications]
+  - uid: fnguyen
+    first: Felix
+    last: Nguyen
+    title: SOC Analyst
+    groups: [security-ops, team-security]
+
+# ── Vault Paths ─────────────────────────────────────────────────────
+vault_db_secrets_path: database
+vault_kv_secrets_path: secret
+vault_db_role_name: ztaapp-short-lived
+vault_db_max_ttl: 1h
+vault_db_default_ttl: 5m
+
+# ── Vault SSH Signed Certificates (Short-Lived Machine Credentials) ──
+vault_ssh_secrets_path: ssh
+vault_ssh_role_name: ssh-signer
+vault_ssh_ca_pubkey_path: /etc/ssh/trusted-user-ca-keys.pub
+vault_ssh_ttl: 30m
+vault_ssh_max_ttl: 1h
+vault_ssh_allowed_users: "rhel,aap-service"
+
+# ── Vault AppRole — AAP → Vault (Signed SSH credential) ───────────────
+# Defaults for setup/configure-aap-credentials.yml (--tags vault-ssh) and
+# setup/configure-aap-vault-ssh.yml. Changing names or policies requires
+# re-running those playbooks and refreshing AAP credentials; see
+# docs/deployment-guide.md (Vault AppRole naming and impact).
+ssh_approle_name: ssh-client
+ssh_approle_policies:
+  - ssh-access
+
+# AppRole created by setup/ssh_lockdown/lockdown-vault-policies.yml. Use its
+# Role ID and Secret ID for post-lockdown AAP credentials (see ssh_lockdown/README.md).
+vault_lockdown_approle_name: aap-automation
+vault_lockdown_approle_policies:
+  - app-deployer
+  - network-admin
+  - patch-admin
+  - ssh-access
+  - aap-automation
+
+# ── SPIFFE / SPIRE (Workload Identity) ─────────────────────────────
+spire_version: "1.12.0"
+spire_trust_domain: "{{ idm_domain }}"
+spire_server_host: central.zta.lab
+spire_server_bind_port: 8082
+spire_install_dir: /opt/spire
+spire_server_socket: /tmp/spire-server/private/api.sock
+spire_agent_socket: /run/spire/agent/api.sock
+spire_download_base: "https://github.com/spiffe/spire/releases/download"
+spire_arch: linux-amd64-musl
+
+spire_workloads:
+  - spiffe_id: "spiffe://{{ spire_trust_domain }}/workload/network-automation"
+    parent_host: control
+    description: AAP network automation workload
+    selectors:
+      - "unix:uid:0"
+  - spiffe_id: "spiffe://{{ spire_trust_domain }}/workload/database"
+    parent_host: db
+    description: PostgreSQL database workload
+    selectors:
+      - "unix:uid:0"
+  - spiffe_id: "spiffe://{{ spire_trust_domain }}/workload/vault"
+    parent_host: vault
+    description: HashiCorp Vault workload
+    selectors:
+      - "unix:uid:0"
+
+# ── Network Segmentation ────────────────────────────────────────────
+vlans:
+  app_tier:
+    id: 20
+    name: APP-TIER
+    network: 10.20.0.0/24
+  data_tier:
+    id: 30
+    name: DATA-TIER
+    network: 10.30.0.0/24
+  management:
+    id: 10
+    name: MGMT
+    network: 10.10.0.0/24

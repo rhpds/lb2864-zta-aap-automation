@@ -1,0 +1,162 @@
+---
+# Section 3B Validation: OPA Rego Authoring — Data Classification Policy
+#
+# Checks the data_classification policy for correct behavior:
+#   - PII denied for security-ops-only user (spatel)
+#   - Confidential denied for app-deployers (appdev)
+#   - PII allowed for user in BOTH security-ops AND db-admins
+#   - Public allowed for any authenticated user
+#   - Internal allowed for app-deployers
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section3b.yml
+
+- name: "Section 3B Check | Data Classification Policy Tests"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section3b, opa]
+
+  tasks:
+    - name: Check data_classification policy is loaded
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification"
+        method: GET
+      register: s3b_policy_loaded
+      failed_when: false
+
+    - name: "Test PII + security-ops only (should DENY)"
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: spatel
+            user_groups: [security-ops]
+            data_classification: pii
+      register: s3b_pii_secops
+      failed_when: false
+
+    - name: "Test confidential + app-deployers (should DENY)"
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: appdev
+            user_groups: [app-deployers]
+            data_classification: confidential
+      register: s3b_conf_appdev
+      failed_when: false
+
+    - name: "Test PII + app-deployers (should DENY)"
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: appdev
+            user_groups: [app-deployers]
+            data_classification: pii
+      register: s3b_pii_appdev
+      failed_when: false
+
+    - name: "Test PII + BOTH groups (should ALLOW)"
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: nobrien
+            user_groups: [db-admins, security-ops]
+            data_classification: pii
+      register: s3b_pii_both
+      failed_when: false
+
+    - name: "Test public + any user (should ALLOW)"
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: appdev
+            user_groups: [app-deployers]
+            data_classification: public
+      register: s3b_public
+      failed_when: false
+
+    - name: "Test internal + app-deployers (should ALLOW)"
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: appdev
+            user_groups: [app-deployers]
+            data_classification: internal
+      register: s3b_internal
+      failed_when: false
+
+- name: "Section 3B Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section3b, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    checks:
+      - name: Policy loaded (data_classification)
+        ok: "{{ (c.s3b_policy_loaded.status | default(0)) == 200 }}"
+      - name: "PII denied for security-ops only (spatel)"
+        ok: "{{ (c.s3b_pii_secops.json.result.allow | default(true)) == false }}"
+      - name: "Confidential denied for app-deployers (appdev)"
+        ok: "{{ (c.s3b_conf_appdev.json.result.allow | default(true)) == false }}"
+      - name: "PII denied for app-deployers (appdev)"
+        ok: "{{ (c.s3b_pii_appdev.json.result.allow | default(true)) == false }}"
+      - name: "PII allowed for BOTH db-admins + security-ops"
+        ok: "{{ (c.s3b_pii_both.json.result.allow | default(false)) == true }}"
+      - name: "Public allowed for any authenticated user"
+        ok: "{{ (c.s3b_public.json.result.allow | default(false)) == true }}"
+      - name: "Internal allowed for app-deployers"
+        ok: "{{ (c.s3b_internal.json.result.allow | default(false)) == true }}"
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 3B verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║   Section 3B — Data Classification Policy (Rego Authoring)      ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── POLICY BUGS REMAIN ──                                      ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          ║  Run: ansible-playbook section3/playbooks/fix-opa-policy.yml   ║
+          {% else %}
+          ║  Section 3B complete — all policy bugs fixed.                  ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

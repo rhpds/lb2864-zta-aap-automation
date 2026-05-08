@@ -1,0 +1,328 @@
+---
+# Deploy HashiCorp Vault as a container on central
+#
+# Services exposed:
+#   - UI / API:  http://central.zta.lab:8200
+#
+# Credentials (generated at first init):
+#   - Root token and unseal keys are written to {{ vault_data_dir }}/init-keys.json
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/deploy-vault.yml
+
+- name: Deploy HashiCorp Vault Container
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    vault_container_name: vault
+    vault_image: "docker.io/hashicorp/vault:1.17"
+    vault_data_dir: /opt/vault-data
+    vault_service_name: container-vault
+    vault_api_addr: "http://{{ ansible_host }}:8200"
+    vault_cluster_addr: "http://{{ ansible_host }}:8201"
+    vault_key_shares: 5
+    vault_key_threshold: 3
+
+  tasks:
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1 — Prerequisites
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Ensure podman is installed
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - python3-podman
+          - jq
+        state: present
+
+    - name: Create Vault persistent data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - "{{ vault_data_dir }}"
+        - "{{ vault_data_dir }}/data"
+        - "{{ vault_data_dir }}/config"
+        - "{{ vault_data_dir }}/logs"
+        - "{{ vault_data_dir }}/policies"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2 — Vault server configuration
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Deploy Vault server configuration
+      ansible.builtin.copy:
+        dest: "{{ vault_data_dir }}/config/vault.hcl"
+        mode: '0644'
+        content: |
+          ui = true
+          disable_mlock = true
+
+          storage "file" {
+            path = "/vault/data"
+          }
+
+          listener "tcp" {
+            address     = "0.0.0.0:8200"
+            tls_disable = 1
+          }
+
+          api_addr     = "{{ vault_api_addr }}"
+          cluster_addr = "{{ vault_cluster_addr }}"
+
+          log_level = "info"
+
+    - name: Set SELinux context on Vault data directory
+      ansible.builtin.command: "chcon -R -t container_file_t {{ vault_data_dir }}"
+      changed_when: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3 — Deploy Vault container
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Stop any existing Vault container
+      containers.podman.podman_container:
+        name: "{{ vault_container_name }}"
+        state: absent
+      failed_when: false
+
+    - name: Run Vault container
+      containers.podman.podman_container:
+        name: "{{ vault_container_name }}"
+        image: "{{ vault_image }}"
+        state: started
+        hostname: vault.zta.lab
+        command: vault server -config=/vault/config/vault.hcl
+        cap_add:
+          - IPC_LOCK
+        ports:
+          - "8200:8200"
+        env:
+          VAULT_ADDR: "http://127.0.0.1:8200"
+          VAULT_API_ADDR: "{{ vault_api_addr }}"
+          SKIP_CHOWN: "true"
+        volume:
+          - "{{ vault_data_dir }}/data:/vault/data:z"
+          - "{{ vault_data_dir }}/config:/vault/config:z"
+          - "{{ vault_data_dir }}/logs:/vault/logs:z"
+          - "{{ vault_data_dir }}/policies:/vault/policies:z"
+        detach: true
+      register: vault_container
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 4 — Wait for Vault and initialise
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Wait for Vault API to respond
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/health"
+        method: GET
+        status_code: [200, 429, 472, 473, 501, 503]
+      register: vault_health
+      until: vault_health.status in [200, 429, 472, 473, 501, 503]
+      retries: 30
+      delay: 5
+
+    - name: Check Vault initialisation status
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/init"
+        method: GET
+      register: vault_init_status
+
+    - name: Initialise Vault
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/init"
+        method: PUT
+        body_format: json
+        body:
+          secret_shares: "{{ vault_key_shares }}"
+          secret_threshold: "{{ vault_key_threshold }}"
+        status_code: [200]
+      register: vault_init_result
+      when: not vault_init_status.json.initialized
+
+    - name: Save init keys to file
+      ansible.builtin.copy:
+        dest: "{{ vault_data_dir }}/init-keys.json"
+        content: "{{ vault_init_result.json | to_nice_json }}"
+        mode: '0600'
+        owner: root
+        group: root
+      when: vault_init_result is not skipped
+
+    - name: Load init keys from file
+      ansible.builtin.slurp:
+        src: "{{ vault_data_dir }}/init-keys.json"
+      register: vault_keys_raw
+
+    - name: Parse init keys
+      ansible.builtin.set_fact:
+        vault_keys: "{{ vault_keys_raw.content | b64decode | from_json }}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 5 — Unseal Vault
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Check seal status
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/seal-status"
+        method: GET
+      register: seal_status
+
+    - name: Unseal Vault with threshold keys
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/unseal"
+        method: PUT
+        body_format: json
+        body:
+          key: "{{ item }}"
+        status_code: [200]
+      loop: "{{ vault_keys.keys[:vault_key_threshold] }}"
+      loop_control:
+        label: "unseal key {{ idx + 1 }}/{{ vault_key_threshold }}"
+        index_var: idx
+      when: seal_status.json.sealed
+
+    - name: Confirm Vault is unsealed and healthy
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/health"
+        method: GET
+        status_code: [200]
+      register: vault_final_health
+      retries: 10
+      delay: 3
+      until: vault_final_health.status == 200
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 6 — Enable KV secrets engine and create workshop policy
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Enable KV v2 secrets engine at secret/
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/mounts/secret"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_keys.root_token }}"
+        body_format: json
+        body:
+          type: kv
+          options:
+            version: "2"
+        status_code: [200, 204, 400]
+
+    - name: Deploy workshop policy file
+      ansible.builtin.copy:
+        dest: "{{ vault_data_dir }}/policies/workshop.hcl"
+        mode: '0644'
+        content: |
+          path "secret/*" {
+            capabilities = ["create", "read", "update", "delete", "list"]
+          }
+          path "sys/health" {
+            capabilities = ["read"]
+          }
+          path "auth/token/lookup-self" {
+            capabilities = ["read"]
+          }
+
+    - name: Create workshop policy in Vault
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/sys/policies/acl/workshop"
+        method: PUT
+        headers:
+          X-Vault-Token: "{{ vault_keys.root_token }}"
+        body_format: json
+        body:
+          policy: |
+            path "secret/*" {
+              capabilities = ["create", "read", "update", "delete", "list"]
+            }
+            path "sys/health" {
+              capabilities = ["read"]
+            }
+            path "auth/token/lookup-self" {
+              capabilities = ["read"]
+            }
+        status_code: [200, 204]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Systemd service for reboot persistence
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Generate systemd service file for Vault container
+      containers.podman.podman_generate_systemd:
+        name: "{{ vault_container_name }}"
+        dest: /etc/systemd/system/
+        restart_policy: always
+        new: false
+      register: vault_systemd
+
+    - name: Enable and start Vault systemd service
+      ansible.builtin.systemd:
+        name: "{{ vault_service_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 8 — Write a test secret
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Write test secret to Vault
+      ansible.builtin.uri:
+        url: "http://localhost:8200/v1/secret/data/zta/test"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_keys.root_token }}"
+        body_format: json
+        body:
+          data:
+            message: "ZTA Workshop Vault deployment verified"
+            deployed_by: ansible
+        status_code: [200]
+      register: test_secret
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Summary
+    # ═══════════════════════════════════════════════════════════════════
+
+    - name: Display Vault deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║         HashiCorp Vault — Deployment Complete                 ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  UI / API:   http://{{ ansible_host }}:8200{{ ' ' * 23 }}║
+          ║                                                              ║
+          ║  Root Token: {{ vault_keys.root_token[:20] }}...{{ ' ' * 26 }}║
+          ║  (full token in {{ vault_data_dir }}/init-keys.json){{ ' ' * 6 }}║
+          ║                                                              ║
+          ║  Unseal keys ({{ vault_key_threshold }}/{{ vault_key_shares }} threshold):{{ ' ' * 33 }}║
+          ║    Stored in {{ vault_data_dir }}/init-keys.json{{ ' ' * 13 }}║
+          ║                                                              ║
+          ║  Secrets Engine:  kv-v2 at secret/                           ║
+          ║  Policy:          workshop (full secret/ access)             ║
+          ║  Test secret:     secret/zta/test                            ║
+          ║                                                              ║
+          ║  Health check:    {{ ('OK' if vault_final_health.status == 200 else 'FAILED') }}║
+          ║                                                              ║
+          ║  Systemd:    {{ vault_service_name }}║
+          ║  Status:     systemctl status {{ vault_service_name }}║
+          ║  Logs:       journalctl -u {{ vault_service_name }}║
+          ║                                                              ║
+          ║  CLI usage:                                                  ║
+          ║    export VAULT_ADDR=http://{{ ansible_host }}:8200{{ ' ' * 15 }}║
+          ║    export VAULT_TOKEN=<root_token>                           ║
+          ║    vault status                                              ║
+          ║    vault kv get secret/zta/test                              ║
+          ║                                                              ║
+          ║  ⚠ NOTE: Vault re-seals on restart. Re-run this playbook    ║
+          ║    or unseal manually with keys from init-keys.json          ║
+          ╚════════════════════════════════════════════════════════════════╝

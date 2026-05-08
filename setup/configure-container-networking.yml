@@ -1,0 +1,161 @@
+---
+# configure-container-networking.yml — Non-destructive data-plane IP setup
+#
+# Ensures app and db containers have their data-plane IPs (10.20.0.10 and
+# 10.30.0.10) and peer routes, WITHOUT recreating or restarting containers.
+# Safe to run on pre-baked VM images and on every boot.
+#
+# What this does:
+#   1. Connects containers to cEOS switch-fabric networks (net2/net3) if
+#      not already connected
+#   2. Discovers the correct interface by matching the Podman network MAC
+#   3. Adds data-plane IP as a secondary address (preserves the
+#      Podman-assigned IP that backs port-forwarding DNAT rules)
+#   4. Adds the cross-subnet route via the cEOS gateway
+#   5. Writes a persistent NetworkManager keyfile so IPs survive restarts
+#
+# Prerequisites:
+#   - Containers "app" and "db" must already be running on central
+#   - Podman networks net2/net3 must exist (created by deploy-arista.yml)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-container-networking.yml
+
+- name: Configure Data-Plane Networking on App and DB Containers
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    containers:
+      - name: db
+        data_network: net2
+        data_ip: "{{ db_data_ip }}"
+        data_gateway: "10.30.0.1"
+        peer_network: "10.20.0.0/24"
+      - name: app
+        data_network: net3
+        data_ip: "{{ app_data_ip }}"
+        data_gateway: "10.20.0.1"
+        peer_network: "10.30.0.0/24"
+
+  tasks:
+    - name: Verify containers are running
+      command: "podman inspect --format '{{ '{{' }}.State.Status{{ '}}' }}' {{ item.name }}"
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: container_status
+      changed_when: false
+      failed_when: >-
+        container_status.rc != 0 or
+        (container_status.stdout | trim) != 'running'
+
+    - name: Connect containers to data-plane networks (if not already)
+      command: "podman network connect {{ item.data_network }} {{ item.name }}"
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.data_network }}"
+      register: net_connect
+      failed_when: net_connect.rc != 0 and 'already' not in (net_connect.stderr | default(''))
+      changed_when: net_connect.rc == 0 and 'already' not in (net_connect.stderr | default(''))
+
+    # Discover the correct interface by matching the MAC address that Podman
+    # assigned for the data-plane network.  This avoids the fragile tail -1
+    # approach that breaks when interface ordering varies between containers.
+    - name: Discover data-plane interface by Podman network MAC
+      shell: |
+        mac=$(podman inspect {{ item.name }} \
+          --format '{{ '{{' }}(index .NetworkSettings.Networks "{{ item.data_network }}").MacAddress{{ '}}' }}')
+        podman exec {{ item.name }} ip -o link show \
+          | awk -v mac="$mac" 'tolower($0) ~ tolower(mac) {split($2,a,"@"); print a[1]}'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.data_network }})"
+      register: data_ifaces
+      changed_when: false
+
+    - name: Add data-plane IP on containers (secondary, non-destructive)
+      shell: |
+        podman exec {{ item.item.name }} ip addr show dev {{ item.stdout | trim }} \
+          | grep -q '{{ item.item.data_ip }}/' \
+          || podman exec {{ item.item.name }} ip addr add {{ item.item.data_ip }}/24 dev {{ item.stdout | trim }}
+        podman exec {{ item.item.name }} ip link set {{ item.stdout | trim }} up
+      loop: "{{ data_ifaces.results }}"
+      loop_control:
+        label: "{{ item.item.name }}: {{ item.item.data_ip }}/24 on {{ item.stdout | trim }}"
+      changed_when: true
+
+    - name: Set MTU on all container interfaces to avoid fragmentation
+      shell: |
+        podman exec {{ item }} bash -c '
+          for iface in $(ip -o link show | grep -v lo | awk -F": " "{print \$2}" | sed "s/@.*//"); do
+            ip link set "$iface" mtu 1400
+          done
+        '
+      loop:
+        - db
+        - app
+      loop_control:
+        label: "{{ item }}: MTU 1400"
+      changed_when: true
+
+    - name: Add route to peer data-plane network inside containers
+      shell: >-
+        podman exec {{ item.name }}
+        bash -c 'ip route show | grep -q "{{ item.peer_network }}" ||
+        ip route add {{ item.peer_network }} via {{ item.data_gateway }}'
+      loop: "{{ containers }}"
+      loop_control:
+        label: "{{ item.name }}: {{ item.peer_network }} via {{ item.data_gateway }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Write persistent NetworkManager keyfile for data-plane interface
+      shell: |
+        podman exec {{ item.item.name }} bash -c '
+          mkdir -p /etc/NetworkManager/system-connections
+          printf "%s\n" \
+            "[connection]" \
+            "id=dataplane" \
+            "type=ethernet" \
+            "interface-name={{ item.stdout | trim }}" \
+            "autoconnect=true" \
+            "" \
+            "[ethernet]" \
+            "" \
+            "[ipv4]" \
+            "method=auto" \
+            "address1={{ item.item.data_ip }}/24" \
+            "route1={{ item.item.peer_network }},{{ item.item.data_gateway }}" \
+            "" \
+            "[ipv6]" \
+            "method=disabled" \
+            > /etc/NetworkManager/system-connections/dataplane.nmconnection
+          chmod 600 /etc/NetworkManager/system-connections/dataplane.nmconnection
+          nmcli connection reload 2>/dev/null || true
+        '
+      loop: "{{ data_ifaces.results }}"
+      loop_control:
+        label: "{{ item.item.name }}: persist {{ item.item.data_ip }} on {{ item.stdout | trim }}"
+      changed_when: true
+
+    - name: Verify data-plane connectivity (app → db)
+      shell: >-
+        podman exec app
+        bash -c 'timeout 3 bash -c "echo > /dev/tcp/{{ db_data_ip }}/{{ db_port }}" && echo "OPEN" || echo "CLOSED"'
+      register: dp_test
+      changed_when: false
+      failed_when: false
+
+    - name: Display networking summary
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+            Data-Plane Networking Configured
+          ═══════════════════════════════════════════════════════════
+            App: {{ app_data_ip }}/24 on net3 (via ceos3)
+            DB:  {{ db_data_ip }}/24 on net2 (via ceos2)
+            Route: app → {{ db_data_ip }}:{{ db_port }} = {{ dp_test.stdout | trim }}
+            Persistent NM keyfiles: written
+          ═══════════════════════════════════════════════════════════

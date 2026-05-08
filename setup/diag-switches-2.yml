@@ -1,0 +1,145 @@
+---
+# Diagnostic #2 — Focus on EXTERNAL access path for ports 2001/2002/2003
+- name: Diagnose external access to cEOS switches
+  hosts: zta_services
+  become: true
+  gather_facts: true
+
+  vars:
+    central_ip: "{{ ansible_host | default('192.168.1.11') }}"
+
+  tasks:
+
+    - name: "BASELINE — nftables DNAT rules for port 2001 (working)"
+      shell: "nft list ruleset 2>/dev/null | grep -i 2001 || echo 'No rules for 2001'"
+      register: nft_2001
+      changed_when: false
+
+    - name: "BASELINE — Show nft rules for 2001"
+      debug:
+        msg: "{{ nft_2001.stdout_lines }}"
+
+    - name: "EXT — Test from management IP (not localhost) to port 2001"
+      shell: "timeout 3 bash -c 'echo | nc -w2 {{ central_ip }} 2001' && echo OPEN || echo CLOSED"
+      register: ext_2001
+      changed_when: false
+      failed_when: false
+
+    - name: "EXT — Test from management IP to port 2002"
+      shell: "timeout 3 bash -c 'echo | nc -w2 {{ central_ip }} 2002' && echo OPEN || echo CLOSED"
+      register: ext_2002
+      changed_when: false
+      failed_when: false
+
+    - name: "EXT — Test from management IP to port 2003"
+      shell: "timeout 3 bash -c 'echo | nc -w2 {{ central_ip }} 2003' && echo OPEN || echo CLOSED"
+      register: ext_2003
+      changed_when: false
+      failed_when: false
+
+    - name: "EXT — Show external IP connectivity"
+      debug:
+        msg:
+          central_ip: "{{ central_ip }}"
+          port_2001: "{{ ext_2001.stdout_lines | last }}"
+          port_2002: "{{ ext_2002.stdout_lines | last }}"
+          port_2003: "{{ ext_2003.stdout_lines | last }}"
+
+    - name: "FORWARD — Dump nftables FORWARD chain (REJECT/DROP rules)"
+      shell: >-
+        nft list ruleset 2>/dev/null |
+        awk '/chain FORWARD/,/^[[:space:]]*\}/' |
+        head -40
+      register: nft_forward
+      changed_when: false
+      failed_when: false
+
+    - name: "FORWARD — Show"
+      debug:
+        msg: "{{ nft_forward.stdout_lines }}"
+
+    - name: "FORWARD — All REJECT and DROP rules in full ruleset"
+      shell: "nft list ruleset 2>/dev/null | grep -iE '(reject|drop)' | head -30 || echo 'none found'"
+      register: nft_reject
+      changed_when: false
+      failed_when: false
+
+    - name: "FORWARD — Show REJECT/DROP"
+      debug:
+        msg: "{{ nft_reject.stdout_lines }}"
+
+    - name: "ZONES — Check firewalld active zones"
+      shell: "firewall-cmd --get-active-zones 2>/dev/null || echo 'firewalld not running'"
+      register: fw_zones
+      changed_when: false
+      failed_when: false
+
+    - name: "ZONES — Show"
+      debug:
+        msg: "{{ fw_zones.stdout_lines }}"
+
+    - name: "ZONES — List ports in each active zone"
+      shell: |
+        for zone in $(firewall-cmd --get-active-zones | grep -v '^\s' | tr -d ':'); do
+          echo "=== $zone ==="
+          firewall-cmd --zone=$zone --list-all 2>/dev/null
+        done
+      register: fw_zone_detail
+      changed_when: false
+      failed_when: false
+
+    - name: "ZONES — Show zone details"
+      debug:
+        msg: "{{ fw_zone_detail.stdout_lines }}"
+
+    - name: "NETAVARK — Full DNAT chain for management network"
+      shell: >-
+        nft list ruleset 2>/dev/null |
+        awk '/chain.*d96dc56d.*HOSTPORT-DNAT/,/^[[:space:]]*\}/' |
+        head -50
+      register: nft_mgmt_dnat
+      changed_when: false
+      failed_when: false
+
+    - name: "NETAVARK — Show management DNAT chain"
+      debug:
+        msg: "{{ nft_mgmt_dnat.stdout_lines }}"
+
+    - name: "NETAVARK — List all chains"
+      shell: "nft list ruleset 2>/dev/null | grep 'chain ' | head -40"
+      register: nft_chains
+      changed_when: false
+      failed_when: false
+
+    - name: "NETAVARK — Show chains"
+      debug:
+        msg: "{{ nft_chains.stdout_lines }}"
+
+    - name: "IPTABLES — Check for legacy iptables NAT rules"
+      shell: "iptables -t nat -L -n 2>/dev/null | grep -E '(200[1-3])' || echo 'No legacy iptables NAT for 2001-2003'"
+      register: ipt_nat
+      changed_when: false
+      failed_when: false
+
+    - name: "IPTABLES — Show"
+      debug:
+        msg: "{{ ipt_nat.stdout_lines }}"
+
+    - name: "INTERFACES — Host network interfaces and IPs"
+      shell: "ip -4 addr show | grep -E '(inet |^[0-9])'"
+      register: host_ifaces
+      changed_when: false
+
+    - name: "INTERFACES — Show"
+      debug:
+        msg: "{{ host_ifaces.stdout_lines }}"
+
+    - name: "SS — Check what is listening on 2001/2002/2003 on the host"
+      shell: "ss -tlnp | grep -E ':(200[1-3]) '"
+      register: ss_host
+      changed_when: false
+      failed_when: false
+
+    - name: "SS — Show"
+      debug:
+        msg: "{{ ss_host.stdout_lines }}"

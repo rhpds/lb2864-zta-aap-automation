@@ -1,0 +1,22 @@
+=== Section 3B — Manual OPA Rego policy (extended)
+
+[TIP]
+.Policy as code is still code
+====
+A typo or wrong boolean in Rego can **over-allow** sensitive data paths while the rest of the ZTA stack looks “green.” This exercise stresses **testing PDP logic** like application code: negative tests, positive tests, and peer review—because **misconfiguration is an attack surface** as real as a missing firewall rule.
+====
+
+*Instructor:* `ansible-playbook section3/playbooks/break-opa-policy.yml`
+
+Goal: find bugs in `zta.data_classification` via `curl` to OPA, read `/opt/opa/policies/data_classification.rego` on central, fix logic (PII requires **both** groups AND; confidential uses `db-admins`; internal rule must check classification), restart OPA (`podman restart opa`), re-test.
+
+Reference curls and expected results are in `section3/README.md` Section 3B.
+
+*Bonus:* time-of-day restriction using `data.time` (example in README).
+
+=== 3B validation
+
+* [ ] PII denied for security-ops only
+* [ ] Confidential denied for app-deployers
+* [ ] Internal rule does not over-match
+* [ ] Dual-group user allowed for PII when appropriate

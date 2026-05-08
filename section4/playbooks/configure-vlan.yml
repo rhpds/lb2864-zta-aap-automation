@@ -1,0 +1,256 @@
+---
+# Section 4: SPIFFE-verified, OPA-gated VLAN creation on Arista cEOS switches
+#
+# Flow:
+#   1. Fetch X.509 SVID from SPIRE Agent → proves automation workload identity
+#   2. Query OPA with user context + SPIFFE ID → policy decision
+#   3. Configure VLAN on Arista cEOS switches
+#   4. Update Netbox CMDB
+
+
+- name: "Pre-check: Verify Automation Workload Identity (SPIFFE)"
+  hosts: automation
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Fetch X.509 SVID from SPIRE Agent
+      command: >
+        {{ spire_install_dir }}/bin/spire-agent api fetch x509
+        -socketPath {{ spire_agent_socket }}
+      register: svid_result
+
+    - name: Parse SPIFFE ID from SVID
+      set_fact:
+        workload_spiffe_id: "{{ svid_result.stdout | regex_search('SPIFFE ID:\\s+(spiffe://\\S+)', '\\1') | first }}"
+
+    - name: Display workload identity verification
+      debug:
+        msg: |
+          SPIFFE Workload Identity Verification
+          ======================================
+
+          SPIFFE ID: {{ workload_spiffe_id }}
+          Host:      {{ inventory_hostname }}
+          Status:    VERIFIED
+
+          The automation platform has proven its identity via
+          a cryptographic X.509 SVID issued by the SPIRE Server.
+          This SVID will be included in the OPA policy check.
+
+
+- name: "Pre-check: Validate Network Policy with OPA"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  vars:
+    new_vlan_id: "{{ new_vlan_id | int }}"
+    new_vlan_name: "{{ new_vlan_name | default('NEW-VLAN') }}"
+    network_user: "{{ awx_user_name | default('neteng') }}"
+    workload_spiffe_id: "{{ hostvars[groups['automation'][0]]['workload_spiffe_id'] }}"
+
+  tasks:
+    - name: Query IdM for launcher group membership
+      ansible.builtin.command:
+        cmd: "ipa user-show {{ network_user | quote }}"
+      register: ipa_user_out
+      changed_when: false
+      failed_when: false
+      become: true
+      when: network_user | length > 0
+
+    - name: Capture IdM Member of groups line
+      ansible.builtin.set_fact:
+        ipa_member_of_groups_line: >-
+          {{
+            ipa_user_out.stdout_lines | default([])
+            | select('search', 'Member of groups')
+            | list
+            | first
+            | default('')
+          }}
+      when:
+        - network_user | length > 0
+        - not (ipa_user_out.skipped | default(false))
+        - ipa_user_out.rc | default(-1) == 0
+
+    - name: Build network_user_groups list from IdM
+      ansible.builtin.set_fact:
+        network_user_groups: >-
+          {{
+            (
+              ipa_member_of_groups_line.split(':', 1)[1] | trim
+            ).split(',')
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+      when:
+        - network_user | length > 0
+        - not (ipa_user_out.skipped | default(false))
+        - ipa_user_out.rc | default(-1) == 0
+        - (ipa_member_of_groups_line | default('')) | length > 0
+        - (ipa_member_of_groups_line | default('')) is search(':')
+
+    - name: Default network_user_groups when IdM query fails or is skipped
+      ansible.builtin.set_fact:
+        network_user_groups: []
+      when: network_user_groups is not defined
+
+    - name: Query OPA network policy
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/network/decision"
+        method: POST
+        body_format: json
+        body: >-
+          {{ {
+            "input": {
+              "user": network_user,
+              "user_groups": network_user_groups,
+              "action": "create_vlan",
+              "vlan_id": new_vlan_id | int,
+              "vlan_name": new_vlan_name,
+              "spiffe_id": workload_spiffe_id
+            }
+          } }}
+      register: opa_decision
+
+    - name: Display OPA decision
+      debug:
+        msg: |
+          OPA Network Policy Decision
+          =============================
+
+          User:      {{ network_user }}
+          Groups:    {{ network_user_groups | join(', ') }}
+          Action:    create_vlan
+          VLAN ID:   {{ new_vlan_id }}
+          Name:      {{ new_vlan_name }}
+          SPIFFE ID: {{ workload_spiffe_id }}
+          Result:    {{ 'ALLOWED' if opa_decision.json.result.allow else 'DENIED' }}
+
+          Conditions:
+            Workload verified:      {{ 'PASS' if opa_decision.json.result.conditions.workload_verified else 'FAIL' }}
+            User in network-admins: {{ 'PASS' if opa_decision.json.result.conditions.user_authorized else 'FAIL' }}
+            Valid VLAN ID:          {{ 'PASS' if opa_decision.json.result.conditions.valid_vlan else 'FAIL' }}
+            Action permitted:       {{ 'PASS' if opa_decision.json.result.conditions.action_permitted else 'FAIL' }}
+
+          {{ opa_decision.json.result.reason }}
+
+    - name: Enforce OPA decision
+      assert:
+        that:
+          - opa_decision.json.result.allow == true
+        fail_msg: |
+          VLAN CONFIGURATION DENIED by OPA policy.
+          Reason: {{ opa_decision.json.result.reason }}
+
+          {% if not opa_decision.json.result.conditions.workload_verified %}
+          → Workload SPIFFE ID '{{ workload_spiffe_id }}' is not trusted.
+            Only the registered network-automation workload may make changes.
+          {% endif %}
+          {% if not opa_decision.json.result.conditions.user_authorized %}
+          → User '{{ network_user }}' must be added to the 'network-admins' group in IdM.
+          {% endif %}
+          {% if not opa_decision.json.result.conditions.valid_vlan %}
+          → VLAN ID {{ new_vlan_id }} is outside the permitted range (100-999).
+          {% endif %}
+        success_msg: "OPA policy check PASSED — proceeding with VLAN configuration"
+
+    - name: Store approval for downstream plays
+      set_fact:
+        opa_approved: true
+      delegate_to: localhost
+      delegate_facts: true
+
+
+- name: Configure VLAN on Arista cEOS Switches
+  hosts: network
+  gather_facts: false
+
+  vars:
+    new_vlan_id: "{{ new_vlan_id | int }}"
+    new_vlan_name: "{{ new_vlan_name | default('NEW-VLAN') }}"
+
+  tasks:
+    - name: Apply VLAN configuration
+      when: hostvars['localhost']['opa_approved'] | default(false)
+      block:
+        - name: Create VLAN on all cEOS switches
+          arista.eos.eos_vlans:
+            config:
+              - vlan_id: "{{ new_vlan_id | int }}"
+                name: "{{ new_vlan_name }}"
+                state: active
+            state: merged
+          register: vlan_result
+
+        - name: Verify VLAN creation
+          arista.eos.eos_command:
+            commands:
+              - "show vlan id {{ new_vlan_id }}"
+          register: vlan_verify
+
+        - name: Display VLAN configuration result
+          debug:
+            msg: |
+              VLAN {{ new_vlan_id }} ({{ new_vlan_name }}) created on {{ inventory_hostname }}
+              {{ vlan_verify.stdout[0] }}
+
+
+- name: Update Netbox CMDB with New VLAN
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  vars:
+    new_vlan_id: "{{ new_vlan_id | int }}"
+    new_vlan_name: "{{ new_vlan_name | default('NEW-VLAN') }}"
+    network_user: "{{ awx_user_name | default('unknown') }}"
+    workload_spiffe_id: "{{ hostvars[groups['automation'][0]]['workload_spiffe_id'] }}"
+
+  tasks:
+    - name: Update CMDB record
+      when: hostvars['localhost']['opa_approved'] | default(false)
+      block:
+        - name: Check if VLAN already exists in Netbox
+          uri:
+            url: "{{ netbox_url }}/api/ipam/vlans/?vid={{ new_vlan_id }}"
+            method: GET
+            headers:
+              Authorization: "Token {{ netbox_token }}"
+          register: netbox_vlan_check
+
+        - name: Create VLAN in Netbox
+          uri:
+            url: "{{ netbox_url }}/api/ipam/vlans/"
+            method: POST
+            headers:
+              Authorization: "Token {{ netbox_token }}"
+              Content-Type: application/json
+            body_format: json
+            body:
+              vid: "{{ new_vlan_id | int }}"
+              name: "{{ new_vlan_name }}"
+              status: active
+              description: "Created via ZTA Workshop by {{ network_user }} (workload: {{ workload_spiffe_id }})"
+            status_code: [201, 400]
+          register: netbox_create
+          when: netbox_vlan_check.json.count == 0
+
+        - name: CMDB update summary
+          debug:
+            msg: |
+              VLAN Configuration Complete
+              ===========================
+
+              VLAN {{ new_vlan_id }} ({{ new_vlan_name }})
+              Switches: ceos1, ceos2, ceos3 (Arista cEOS fabric)
+              Netbox:   {{ 'Created' if netbox_vlan_check.json.count == 0 else 'Already exists' }}
+              User:     {{ network_user }}
+              Workload: {{ workload_spiffe_id }}
+
+              Both user identity (IdM) and workload identity (SPIFFE)
+              were verified before this change was allowed.
+              CMDB is now the source of truth for this VLAN.

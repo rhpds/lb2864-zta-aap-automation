@@ -1,0 +1,1114 @@
+---
+# configure-aap-project.yml — Create the AAP project and execution
+# environment for the ZTA workshop lab.
+#
+# Creates:
+#   0. ZTA Workshop EE             — Custom execution environment (cEOS + RHEL)
+#   1. ZTA Workshop Project        — SCM project (Git)
+#   2. Job templates               — All playbooks under section*/playbooks/ (tagged per section)
+#   3. ZTA Workshop EDA Project    — EDA project for rulebook activations (--tags eda)
+#   4. ZTA AAP Credential (EDA)    — AAP credential in EDA controller (--tags eda)
+#   5. ZTA Decision Environment    — DE for EDA rulebook activations (--tags eda)
+#
+# Prerequisites:
+#   - AAP Controller is installed and reachable
+#   - SCM host reachable; zta-workshop-aap repo exists at project_scm_url
+#   - ansible.controller collection available
+#   - ZTA Lab Inventory and ZTA Machine Credential already exist on the controller
+#   - ZTA Arista Credential for templates that touch switches (see vars file)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags ee
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags project
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags templates
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags section1
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags section2
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags "section1,section2"
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags eda
+#
+# Remove job templates (does not delete project/EE):
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags remove_section -e aap_remove_section=3
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags remove_last_section
+#
+# Tags:
+#   ee                 — Execution environment only
+#   project            — SCM project only (sync included)
+#   templates          — All workshop job templates (all sections)
+#   section1 … section7— Only that section's job templates
+#   eda                — EDA project + AAP credential in Event-Driven Ansible controller
+#   remove_section     — Delete templates for aap_remove_section (integer, required)
+#   remove_last_section— Delete templates for the highest section number in the catalog
+#   rbac               — Project + inventory permissions for LDAP teams
+#   templates (+ full run)— Also assigns Read/Execute on each catalog job template for those teams
+#
+# LDAP authenticator maps (Exercise 1.2) place users in teams named below. Those teams
+# must have Read/Use on the workshop project and Read/Use on the lab inventory or IdM
+# users (e.g. appdev) cannot run jobs. Job templates are separate RBAC objects: teams
+# also need Read (see in UI) and Execute (Launch) on each template; OPA Policy as Code
+# still gates whether a launch is allowed. Grant Default org Read/Use on project and
+# inventory in the UI if org-only members must sync without team maps.
+
+- name: Create AAP Project and Execution Environment for ZTA Workshop
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/zta_workshop_job_templates.yml
+
+  vars:
+    aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+    aap_user: admin
+    aap_password: "{{ lookup('env', 'AAP_ADMIN_PASSWORD') | default('ansible123!', true) }}"
+    aap_verify_ssl: false
+    aap_organization: Default
+
+    ee_name: ZTA Workshop EE
+    ee_image: quay.io/nmartins/zta_ee
+
+    netbox_ee_name: Netbox
+    netbox_ee_image: quay.io/acme_corp/network-netbox-eda-ee:netbox-3.21
+
+    project_name: ZTA Workshop
+    project_scm_url: http://gitea:3000/gitea/zta-workshop-aap.git
+    #project_scm_url: https://github.com/nmartins0611/zta-workshop-aap.git
+
+    inventory_name: ZTA Lab Inventory
+    machine_credential_name: ZTA Machine Credential
+
+    aap_remove_section: 0
+
+    eda_project_name: ZTA Workshop EDA
+    eda_project_scm_url: https://github.com/nmartins0611/zta-workshop-aap.git
+    eda_project_scm_branch: zta-container
+    eda_credential_name: ZTA AAP Credential
+    eda_aap_cred_type_name: Red Hat Ansible Automation Platform
+    eda_de_name: ZTA Decision Environment
+    eda_de_image: quay.io/nmartins/network_de
+
+    wazuh_enabled: false
+
+    zta_workshop_rbac_teams:
+      - Infrastructure
+      - DevOps
+      - Security
+      - Applications
+
+    zta_workshop_readonly_team: Readonly
+
+  module_defaults:
+    group/ansible.controller.controller:
+      controller_host: "{{ aap_host }}"
+      controller_username: "{{ aap_user }}"
+      controller_password: "{{ aap_password }}"
+      validate_certs: "{{ aap_verify_ssl }}"
+
+  tasks:
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Determine which sections to process based on --tags
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Determine active sections from run tags
+      ansible.builtin.set_fact:
+        _active_sections: >-
+          {%- set section_tags = ansible_run_tags | select('match', '^section[0-9]+$') | list -%}
+          {%- if section_tags | length > 0 -%}
+          {{ section_tags | map('regex_replace', '^section', '') | map('int') | list }}
+          {%- else -%}
+          {{ range(1, 8) | list }}
+          {%- endif -%}
+      tags: [always]
+
+    - name: Build enabled feature set
+      ansible.builtin.set_fact:
+        _enabled_features: >-
+          {{ ['wazuh'] | select('in', (wazuh_enabled | bool) | ternary(['wazuh'], [])) | list }}
+      tags: [always]
+
+    - name: Build active template list for requested sections
+      ansible.builtin.set_fact:
+        _active_templates: >-
+          {{ zta_workshop_job_templates
+             | selectattr('section', 'in', _active_sections)
+             | rejectattr('requires', 'defined')
+             | list
+             +
+             zta_workshop_job_templates
+             | selectattr('section', 'in', _active_sections)
+             | selectattr('requires', 'defined')
+             | selectattr('requires', 'in', _enabled_features)
+             | list }}
+        _active_template_names: >-
+          {{ (zta_workshop_job_templates
+              | selectattr('section', 'in', _active_sections)
+              | rejectattr('requires', 'defined')
+              | list
+              +
+              zta_workshop_job_templates
+              | selectattr('section', 'in', _active_sections)
+              | selectattr('requires', 'defined')
+              | selectattr('requires', 'in', _enabled_features)
+              | list)
+             | map(attribute='name') | list }}
+      tags: [always]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Verify prerequisites
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Verify AAP Controller is reachable (API status)
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/ping/"
+        method: GET
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+        return_content: true
+      register: aap_ping
+      tags: [always]
+
+    - name: Confirm AAP Controller ping reports a ready controller
+      ansible.builtin.assert:
+        that:
+          - aap_ping.json is defined
+          - aap_ping.json is mapping
+          - (aap_ping.json.version | default('')) | length > 0
+          - (not (aap_ping.json.active is defined)) or (aap_ping.json.active | bool)
+        fail_msg: >-
+          AAP Controller status check failed for {{ aap_host }}/api/controller/v2/ping/.
+          HTTP {{ aap_ping.status | default('?') }}.
+          Response: {{ aap_ping.json | default({}) }}
+      tags: [always]
+
+    - name: Display AAP controller status
+      ansible.builtin.debug:
+        msg: >-
+          AAP Controller OK — version {{ aap_ping.json.version }}
+          {% if aap_ping.json.active is defined %} active={{ aap_ping.json.active }}{% endif %}
+          {% if aap_ping.json.ansible_version is defined %} ansible={{ aap_ping.json.ansible_version }}{% endif %}
+      tags: [always]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  1. Execution Environment — Custom EE with cEOS + RHEL collections
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Create ZTA Workshop Execution Environment
+      ansible.controller.execution_environment:
+        name: "{{ ee_name }}"
+        description: "Custom EE with Arista cEOS, RHEL, and network collections for ZTA workshop"
+        image: "{{ ee_image }}"
+        pull: missing
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [ee, aap-bootstrap, aap, aap-project]
+
+    - name: Create Netbox Execution Environment
+      ansible.controller.execution_environment:
+        name: "{{ netbox_ee_name }}"
+        description: "NetBox + EDA EE with netbox.netbox collection for inventory sync and CMDB lookups"
+        image: "{{ netbox_ee_image }}"
+        pull: missing
+        organization: "{{ aap_organization }}"
+        state: present
+      tags: [ee, aap-bootstrap, aap, aap-project]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  2. Project — SCM project pointing at Gitea
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Create ZTA Workshop Project
+      ansible.controller.project:
+        name: "{{ project_name }}"
+        description: "ZTA Workshop — playbooks, inventories, and roles from Gitea"
+        organization: "{{ aap_organization }}"
+        scm_type: git
+        scm_url: "{{ project_scm_url }}"
+        scm_branch: zta-container
+        scm_clean: true
+        scm_update_on_launch: true
+        default_environment: "{{ ee_name }}"
+        state: present
+      tags: [project, aap-bootstrap, aap, aap-project]
+
+    - name: Wait for initial project sync to complete
+      ansible.controller.project:
+        name: "{{ project_name }}"
+        organization: "{{ aap_organization }}"
+        wait: true
+        timeout: 120
+        state: present
+      tags: [project, aap-bootstrap, aap, aap-project]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  2b. RBAC — LDAP teams can use project and inventory
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Ensure workshop LDAP teams exist (names must match authenticator maps)
+      ansible.controller.team:
+        name: "{{ item }}"
+        organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams + [zta_workshop_readonly_team] }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _team_result
+      retries: 5
+      delay: 3
+      until: _team_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant workshop teams read access to project
+      ansible.controller.role:
+        role: read
+        projects:
+          - "{{ project_name }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant workshop teams use access to project
+      ansible.controller.role:
+        role: use
+        projects:
+          - "{{ project_name }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant workshop teams read access to lab inventory
+      ansible.controller.role:
+        role: read
+        inventories:
+          - "{{ inventory_name }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant workshop teams use access to lab inventory
+      ansible.controller.role:
+        role: use
+        inventories:
+          - "{{ inventory_name }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  3. Job templates — single dynamic loop for all active sections
+    #
+    #  _active_sections is computed from --tags (e.g. --tags section2
+    #  sets [2]; --tags templates or no tags sets [1..7]).
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Create job templates for active sections
+      ansible.controller.job_template:
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        project: "{{ project_name }}"
+        playbook: "{{ item.playbook }}"
+        inventory: "{{ inventory_name }}"
+        credentials: "{{ item.credentials }}"
+        survey_enabled: "{{ item.survey_enabled | default(false) | bool }}"
+        survey_spec: "{{ item.survey_spec | default(omit) }}"
+        ask_variables_on_launch: "{{ item.ask_variables_on_launch | default(false) | bool }}"
+        state: present
+      loop: "{{ _active_templates }}"
+      loop_control:
+        label: "S{{ item.section }} | {{ item.name }}"
+      tags: [templates, section1, section2, section3, section4, section5, section6, section7, aap-bootstrap, aap, aap-project]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  3a. Pre-create Deploy Application Pipeline workflow template
+    #
+    #  Pre-creates the Section 2 "Deploy Application Pipeline" workflow with
+    #  vault_db_default_ttl: 30m in extra_vars so that the Section 5 EDA chain
+    #  gets 30-minute Vault credentials (avoiding mid-pipeline TTL expiry).
+    #  The Section 2 teaching moment (short-lived TTL) comes from the Vault role
+    #  default (5m), not from this template — students still observe credential
+    #  expiry on first run before the extra_var takes effect.
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Pre-create Deploy Application Pipeline workflow template
+      ansible.controller.workflow_job_template:
+        name: Deploy Application Pipeline
+        description: "Section 2 — OPA policy check → Vault credential → ACL → Deploy pipeline"
+        organization: "{{ aap_organization }}"
+        inventory: "{{ inventory_name }}"
+        extra_vars:
+          vault_db_default_ttl: 30m
+        ask_variables_on_launch: false
+        state: present
+      tags: [templates, section2, aap-bootstrap, aap, aap-project]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  3b. RBAC on job templates — batched per team+role
+    #
+    #  Previous approach: Cartesian product of [read, execute] × templates × teams
+    #  = 2 × 31 × 4 = 248 serial API calls.
+    #
+    #  Batched approach: pass ALL active template names as a list in one
+    #  API call per team × role = 2 × 4 = 8 API calls.
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Grant teams read on active section templates (batched)
+      ansible.controller.role:
+        role: read
+        job_templates: "{{ _active_template_names }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }} → read → {{ _active_template_names | length }} templates"
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      when: _active_template_names | length > 0
+      tags: [templates, section1, section2, section3, section4, section5, section6, section7, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant teams execute on active section templates (batched)
+      ansible.controller.role:
+        role: execute
+        job_templates: "{{ _active_template_names }}"
+        teams:
+          - "{{ item }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ zta_workshop_rbac_teams }}"
+      loop_control:
+        label: "{{ item }} → execute → {{ _active_template_names | length }} templates"
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      when: _active_template_names | length > 0
+      tags: [templates, section1, section2, section3, section4, section5, section6, section7, rbac, aap-bootstrap, aap, aap-project]
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  3c. Readonly team — read on templates, project, inventory (no execute)
+    #  Allows users like neteng to SEE templates but get denied by gateway policy.
+    # ──────────────────────────────────────────────────────────────────────
+
+    - name: Grant Readonly team read on active section templates
+      ansible.controller.role:
+        role: read
+        job_templates: "{{ _active_template_names }}"
+        teams:
+          - "{{ zta_workshop_readonly_team }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      when: _active_template_names | length > 0
+      tags: [templates, section1, section2, section3, section4, section5, section6, section7, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant Readonly team read on project
+      ansible.controller.role:
+        role: read
+        projects:
+          - "{{ project_name }}"
+        teams:
+          - "{{ zta_workshop_readonly_team }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    - name: Grant Readonly team read on lab inventory
+      ansible.controller.role:
+        role: read
+        inventories:
+          - "{{ inventory_name }}"
+        teams:
+          - "{{ zta_workshop_readonly_team }}"
+        lookup_organization: "{{ aap_organization }}"
+        state: present
+      register: _rbac_role_result
+      retries: 5
+      delay: 3
+      until: _rbac_role_result is not failed
+      tags: [project, rbac, aap-bootstrap, aap, aap-project]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  4. Remove job templates (optional)
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Require aap_remove_section when using remove_section tag
+      ansible.builtin.assert:
+        that:
+          - aap_remove_section | default(0) | int > 0
+        fail_msg: >-
+          Pass a positive section number, e.g. -e aap_remove_section=3
+          when running with --tags remove_section.
+      tags: [remove_section]
+
+    - name: Remove job templates for a specific section
+      ansible.controller.job_template:
+        name: "{{ item.name }}"
+        state: absent
+      loop: "{{ zta_workshop_job_templates | selectattr('section', 'equalto', aap_remove_section | int) | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: aap_remove_section | default(0) | int > 0
+      tags: [remove_section]
+
+    - name: Remove job templates for last catalog section (highest section number)
+      vars:
+        zta_workshop_last_section: "{{ zta_workshop_job_templates | map(attribute='section') | max }}"
+      ansible.controller.job_template:
+        name: "{{ item.name }}"
+        state: absent
+      loop: "{{ zta_workshop_job_templates | selectattr('section', 'equalto', zta_workshop_last_section) | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [remove_last_section]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  5. Event-Driven Ansible (EDA) — Project + AAP Credential
+    #
+    #  Creates:
+    #    - AAP credential in EDA so rulebook activations can trigger job
+    #      templates on the automation controller
+    #    - Decision Environment for running EDA rulebooks
+    #    - EDA project pointing at the same Git repo (rulebooks live under
+    #      extensions/eda/rulebooks/)
+    #
+    #  Prerequisites:
+    #    - EDA controller must be running (part of AAP 2.6 containerised)
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Verify EDA API is reachable
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_api_check
+      tags: [eda, section5]
+
+    - name: Look up Default organization in EDA
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/organizations/?name={{ aap_organization | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_org
+      tags: [eda, section5]
+
+    - name: Set EDA organization ID
+      ansible.builtin.set_fact:
+        _eda_org_id: "{{ _eda_org.json.results[0].id }}"
+      tags: [eda, section5]
+
+    # -- AAP Credential in EDA ──────────────────────────────────────────
+
+    - name: Look up AAP credential type in EDA
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/credential-types/?name={{ eda_aap_cred_type_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_aap_cred_type
+      tags: [eda, section5]
+
+    - name: Set EDA AAP credential type ID
+      ansible.builtin.set_fact:
+        _eda_aap_cred_type_id: "{{ _eda_aap_cred_type.json.results[0].id }}"
+      tags: [eda, section5]
+
+    - name: Check if EDA AAP credential already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/?name={{ eda_credential_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_cred_check
+      tags: [eda, section5]
+
+    - name: Create AAP credential in EDA
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body: "{{ _eda_cred_body }}"
+        status_code: [201]
+      vars:
+        _eda_cred_body:
+          name: "{{ eda_credential_name }}"
+          credential_type_id: "{{ _eda_aap_cred_type_id | int }}"
+          inputs:
+            host: "{{ aap_host }}/api/controller/"
+            username: "{{ aap_user }}"
+            password: "{{ aap_password }}"
+            verify_ssl: false
+          organization_id: "{{ _eda_org_id | int }}"
+      when: (_eda_cred_check.json.count | default(0)) == 0
+      tags: [eda, section5]
+
+    - name: Report EDA credential status
+      ansible.builtin.debug:
+        msg: >-
+          EDA AAP credential "{{ eda_credential_name }}":
+          {{ 'CREATED' if (_eda_cred_check.json.count | default(0)) == 0 else 'already exists (skipped)' }}
+      tags: [eda, section5]
+
+    # -- EDA Decision Environment ─────────────────────────────────────
+
+    - name: Check if EDA Decision Environment already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/decision-environments/?name={{ eda_de_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_de_check
+      tags: [eda, section5]
+
+    - name: Create EDA Decision Environment
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/decision-environments/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body: "{{ _eda_de_body }}"
+        status_code: [201]
+      vars:
+        _eda_de_body:
+          name: "{{ eda_de_name }}"
+          image_url: "{{ eda_de_image }}"
+          organization_id: "{{ _eda_org_id | int }}"
+      when: (_eda_de_check.json.count | default(0)) == 0
+      tags: [eda, section5]
+
+    - name: Report EDA Decision Environment status
+      ansible.builtin.debug:
+        msg: >-
+          EDA Decision Environment "{{ eda_de_name }}":
+          {{ 'CREATED' if (_eda_de_check.json.count | default(0)) == 0 else 'already exists (skipped)' }}
+          — image {{ eda_de_image }}
+      tags: [eda, section5]
+
+    # -- EDA Project ────────────────────────────────────────────────────
+
+    - name: Check if EDA project already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/projects/?name={{ eda_project_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_project_check
+      tags: [eda, section5]
+
+    - name: Create EDA project
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/projects/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body: "{{ _eda_project_body }}"
+        status_code: [201]
+      vars:
+        _eda_project_body:
+          name: "{{ eda_project_name }}"
+          url: "{{ eda_project_scm_url }}"
+          scm_branch: "{{ eda_project_scm_branch }}"
+          organization_id: "{{ _eda_org_id | int }}"
+      when: (_eda_project_check.json.count | default(0)) == 0
+      register: _eda_project_create
+      tags: [eda, section5]
+
+    - name: Wait for EDA project sync to complete
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/projects/{{ _project_id }}/"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      vars:
+        _project_id: >-
+          {{ _eda_project_create.json.id
+             if (_eda_project_create is not skipped)
+             else _eda_project_check.json.results[0].id }}
+      register: _eda_project_status
+      until: (_eda_project_status.json.import_state | default('')) in ['completed', 'failed']
+      retries: 30
+      delay: 5
+      tags: [eda, section5]
+
+    - name: Report EDA project status
+      ansible.builtin.debug:
+        msg: >-
+          EDA project "{{ eda_project_name }}":
+          {{ 'CREATED' if (_eda_project_check.json.count | default(0)) == 0 else 'already exists' }}
+          — sync {{ _eda_project_status.json.import_state | default('unknown') }}
+          — branch {{ eda_project_scm_branch }}
+          — {{ eda_project_scm_url }}
+      tags: [eda, section5]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  5b. EDA Event Stream Credential — Vault-backed webhook token
+    #
+    #  Creates:
+    #    - HashiCorp Vault Secret Lookup credential in EDA (mirrors
+    #      the Controller-side ZTA Vault Credential)
+    #    - Token Event Stream credential whose token is read from Vault
+    #      at playbook time (secret/services/eda-webhook → token field)
+    #
+    #  The token value lives only in Vault. On rotation, re-run
+    #  rotate-eda-webhook-token.yml or update the credential in the UI.
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Authenticate to Vault for EDA webhook token
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/{{ eda_vault_username }}"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ eda_vault_password }}"
+        validate_certs: false
+        status_code: 200
+      vars:
+        eda_vault_username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+        eda_vault_password: "{{ lookup('env', 'VAULT_PASSWORD') | default('ansible123!', true) }}"
+      register: _eda_vault_login
+      tags: [eda, section5]
+
+    - name: Read EDA webhook token from Vault
+      uri:
+        url: "{{ vault_addr }}/v1/secret/data/services/eda-webhook"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ _eda_vault_login.json.auth.client_token }}"
+        validate_certs: false
+        status_code: 200
+      register: _eda_webhook_secret
+      tags: [eda, section5]
+
+    - name: Set EDA webhook token fact
+      ansible.builtin.set_fact:
+        _eda_webhook_token: "{{ _eda_webhook_secret.json.data.data.token }}"
+      tags: [eda, section5]
+
+    # -- Vault Secret Lookup credential in EDA ─────────────────────────
+
+    - name: Look up HashiCorp Vault Secret Lookup credential type in EDA
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/credential-types/?name={{ 'HashiCorp Vault Secret Lookup' | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_vault_cred_type
+      tags: [eda, section5]
+
+    - name: Set EDA Vault credential type ID
+      ansible.builtin.set_fact:
+        _eda_vault_cred_type_id: "{{ _eda_vault_cred_type.json.results[0].id }}"
+      tags: [eda, section5]
+
+    - name: Check if ZTA Vault Credential (EDA) already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/?name={{ eda_vault_cred_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      vars:
+        eda_vault_cred_name: ZTA Vault Credential (EDA)
+      register: _eda_vault_cred_check
+      tags: [eda, section5]
+
+    - name: Create ZTA Vault Credential (EDA)
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "{{ eda_vault_cred_name }}"
+          credential_type_id: "{{ _eda_vault_cred_type_id | int }}"
+          inputs:
+            url: "{{ vault_addr }}"
+            username: "{{ lookup('env', 'VAULT_USERNAME') | default('admin', true) }}"
+            password: "{{ lookup('env', 'VAULT_PASSWORD') | default('ansible123!', true) }}"
+            api_version: v2
+            default_auth_path: userpass
+          organization_id: "{{ _eda_org_id | int }}"
+        status_code: [201]
+      vars:
+        eda_vault_cred_name: ZTA Vault Credential (EDA)
+      when: (_eda_vault_cred_check.json.count | default(0)) == 0
+      tags: [eda, section5]
+
+    # -- Token Event Stream credential ────────────────────────────────
+
+    - name: Look up Token Event Stream credential type in EDA
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/credential-types/?name={{ 'Token Event Stream' | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_token_stream_type
+      tags: [eda, section5]
+
+    - name: Set Token Event Stream credential type ID
+      ansible.builtin.set_fact:
+        _eda_token_stream_type_id: "{{ _eda_token_stream_type.json.results[0].id }}"
+      tags: [eda, section5]
+
+    - name: Check if ZTA EDA Event Stream credential already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/?name={{ eda_event_stream_cred_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      vars:
+        eda_event_stream_cred_name: ZTA EDA Event Stream
+      register: _eda_stream_cred_check
+      tags: [eda, section5]
+
+    - name: Create ZTA EDA Event Stream credential (token from Vault)
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "{{ eda_event_stream_cred_name }}"
+          credential_type_id: "{{ _eda_token_stream_type_id | int }}"
+          inputs:
+            token: "{{ _eda_webhook_token }}"
+          organization_id: "{{ _eda_org_id | int }}"
+        status_code: [201]
+      vars:
+        eda_event_stream_cred_name: ZTA EDA Event Stream
+      when: (_eda_stream_cred_check.json.count | default(0)) == 0
+      tags: [eda, section5]
+
+    - name: Report EDA event stream credential status
+      ansible.builtin.debug:
+        msg: >-
+          EDA credentials:
+          "ZTA Vault Credential (EDA)" {{ 'CREATED' if (_eda_vault_cred_check.json.count | default(0)) == 0 else 'exists' }};
+          "ZTA EDA Event Stream" {{ 'CREATED' if (_eda_stream_cred_check.json.count | default(0)) == 0 else 'exists' }}
+          — token sourced from Vault KV secret/services/eda-webhook
+      tags: [eda, section5]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Summary
+    # ══════════════════════════════════════════════════════════════════════
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  5c. EDA Event Stream — create the webhook ingestion endpoint
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Look up ZTA EDA Event Stream credential ID
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/?name={{ 'ZTA EDA Event Stream' | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_stream_cred_lookup
+      tags: [eda, section5]
+
+    - name: Set EDA event stream credential ID
+      ansible.builtin.set_fact:
+        _eda_stream_cred_id: "{{ _eda_stream_cred_lookup.json.results[0].id }}"
+      tags: [eda, section5]
+
+    - name: Check if Splunk EDA event stream already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/event-streams/?name={{ 'Splunk EDA' | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_event_stream_check
+      tags: [eda, section5]
+
+    - name: Create Splunk EDA event stream
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/event-streams/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: Splunk EDA
+          eda_credential_id: "{{ _eda_stream_cred_id | int }}"
+          organization_id: "{{ _eda_org_id | int }}"
+        status_code: [201]
+      when: (_eda_event_stream_check.json.count | default(0)) == 0
+      register: _eda_event_stream_create
+      tags: [eda, section5]
+
+    - name: Set EDA event stream ID and URL
+      ansible.builtin.set_fact:
+        _eda_event_stream_id: >-
+          {{ _eda_event_stream_create.json.id
+             if (_eda_event_stream_create is not skipped)
+             else _eda_event_stream_check.json.results[0].id }}
+        _eda_event_stream_url: >-
+          {{ _eda_event_stream_create.json.url
+             if (_eda_event_stream_create is not skipped)
+             else _eda_event_stream_check.json.results[0].url }}
+      tags: [eda, section5]
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  5d. EDA Rulebook Activation — link Splunk EDA to splunk-credential-revoke.yml
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: Look up EDA project ID (needed to find rulebook)
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/projects/?name={{ eda_project_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_project_lookup
+      tags: [eda, section5]
+
+    - name: Look up splunk-credential-revoke.yml rulebook
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/rulebooks/?name={{ 'splunk-credential-revoke.yml' | urlencode }}&project_id={{ _eda_project_lookup.json.results[0].id }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_rulebook_lookup
+      tags: [eda, section5]
+
+    - name: Get rulebook detail to compute content hash
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/rulebooks/{{ _eda_rulebook_lookup.json.results[0].id }}/"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_rulebook_detail
+      tags: [eda, section5]
+
+    - name: Compute rulebook SHA256 hash
+      ansible.builtin.set_fact:
+        _eda_rulebook_id: "{{ _eda_rulebook_lookup.json.results[0].id }}"
+        _eda_rulebook_hash: "{{ _eda_rulebook_detail.json.rulesets | hash('sha256') }}"
+      tags: [eda, section5]
+
+    - name: Look up ZTA AAP Credential ID in EDA
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/eda-credentials/?name={{ eda_credential_name | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_aap_cred_lookup
+      tags: [eda, section5]
+
+    - name: Check if Splunk Events activation already exists
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/activations/?name={{ 'Splunk Events' | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_activation_check
+      tags: [eda, section5]
+
+    - name: Look up Default Decision Environment ID
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/decision-environments/?name={{ 'Default Decision Environment' | urlencode }}"
+        method: GET
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: _eda_default_de_lookup
+      tags: [eda, section5]
+
+    - name: Create Splunk Events rulebook activation
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/activations/"
+        method: POST
+        url_username: "{{ aap_user }}"
+        url_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: Splunk Events
+          rulebook_id: "{{ _eda_rulebook_id | int }}"
+          decision_environment_id: "{{ _eda_default_de_lookup.json.results[0].id | int }}"
+          organization_id: "{{ _eda_org_id | int }}"
+          eda_credentials:
+            - "{{ _eda_aap_cred_lookup.json.results[0].id | int }}"
+          source_mappings: |
+            - rulebook_hash: "{{ _eda_rulebook_hash }}"
+              source_name: __SOURCE_1
+              event_stream_id: {{ _eda_event_stream_id | int }}
+              event_stream_name: Splunk EDA
+          restart_policy: on-failure
+        status_code: [201]
+      when: (_eda_activation_check.json.count | default(0)) == 0
+      register: _eda_activation_create
+      tags: [eda, section5]
+
+    - name: Write EDA event stream URL to file for Splunk configuration
+      ansible.builtin.copy:
+        dest: /tmp/eda_event_stream_url
+        content: "{{ _eda_event_stream_url }}"
+        mode: '0600'
+      tags: [eda, section5]
+
+    - name: Report EDA event stream and activation status
+      ansible.builtin.debug:
+        msg: >-
+          EDA Event Stream "Splunk EDA":
+          {{ 'CREATED (ID ' + (_eda_event_stream_id | string) + ')' if (_eda_event_stream_check.json.count | default(0)) == 0 else 'already exists' }}
+          — URL: {{ _eda_event_stream_url }}
+
+          EDA Activation "Splunk Events":
+          {{ 'CREATED' if (_eda_activation_check.json.count | default(0)) == 0 else 'already exists (skipped)' }}
+          — Rulebook: splunk-credential-revoke.yml
+          — Hash: {{ _eda_rulebook_hash }}
+      tags: [eda, section5]
+
+    - name: Display configuration summary
+      tags: [always]
+      vars:
+        _tpl_count: "{{ _active_templates | length }}"
+      debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════════════════════╗
+          ║       AAP Project & EE — Configuration Complete                  ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║                                                                 ║
+          ║  ┌───┬──────────────────────────┬──────────────────────────────┐║
+          ║  │ # │ Resource                 │ Details                      │║
+          ║  ├───┼──────────────────────────┼──────────────────────────────┤║
+          ║  │ 0 │ Execution Environment    │ {{ ee_name }}{{ ' ' * (29 - ee_name | length) }}│║
+          ║  │   │   Image                  │ {{ ee_image }}{{ ' ' * (29 - ee_image | length) }}│║
+          ║  │ 1 │ Project                  │ {{ project_name }}{{ ' ' * (29 - project_name | length) }}│║
+          ║  │   │   SCM URL                │ (see below)                  │║
+          ║  │   │   Branch                 │ main                         │║
+          ║  │   │   Update on launch       │ yes                          │║
+          ║  │ 2 │ Job templates created    │ {{ _tpl_count }} (sections {{ _active_sections | join(', ') }}){{ ' ' * (12 - _tpl_count | string | length) }}│║
+          ║  │ 3 │ RBAC (batched)           │ {{ zta_workshop_rbac_teams | length }} teams × 2 roles + Readonly │║
+          ║  └───┴──────────────────────────┴──────────────────────────────┘║
+          ║                                                                 ║
+          ║  SCM URL: {{ project_scm_url }}{{ ' ' * (55 - project_scm_url | length) }}║
+          ║  Default EE: {{ ee_name }}{{ ' ' * (53 - ee_name | length) }}║
+          ║  Inventory: {{ inventory_name }}{{ ' ' * (53 - inventory_name | length) }}║
+          ║                                                                 ║
+          ║  Add per lab phase:  --tags sectionN   (or --tags templates for all) ║
+          ║  Remove section N:  --tags remove_section -e aap_remove_section=N   ║
+          ║  Remove last section: --tags remove_last_section                  ║
+          ║                                                                 ║
+          ╚═══════════════════════════════════════════════════════════════════╝

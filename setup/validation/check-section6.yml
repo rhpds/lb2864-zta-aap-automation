@@ -1,0 +1,197 @@
+---
+# Section 6 Validation: SSH Lockdown & Break-Glass Recovery
+#
+# Checks:
+#   - Firewall lockdown: SSH restricted on app/db
+#   - HBAC rules exist with correct members
+#   - aap-service is in allow_aap_automation (not broken)
+#   - Vault lockdown: human cannot sign SSH certs
+#   - Wazuh custom rules loaded (100030-100032)
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/validation/check-section6.yml
+
+- name: "Section 6 Check | Firewall Lockdown"
+  hosts: app_servers:db_servers
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section6, firewall]
+
+  tasks:
+    - name: Check firewall rich rules
+      command: firewall-cmd --list-rich-rules
+      register: s6_fw_rules
+      changed_when: false
+      failed_when: false
+
+    - name: Check firewall has SSH restrictions
+      set_fact:
+        s6_fw_locked: "{{ 'reject' in (s6_fw_rules.stdout | default('')) or 'drop' in (s6_fw_rules.stdout | default('')) }}"
+
+- name: "Section 6 Check | HBAC Rules"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section6, hbac]
+
+  tasks:
+    - name: Authenticate to IdM
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+      failed_when: false
+
+    - name: Check allow_aap_automation HBAC rule
+      command: ipa hbacrule-show allow_aap_automation --all
+      register: s6_hbac_aap
+      changed_when: false
+      failed_when: false
+
+    - name: Check allow_breakglass HBAC rule
+      command: ipa hbacrule-show allow_breakglass --all
+      register: s6_hbac_breakglass
+      changed_when: false
+      failed_when: false
+
+    - name: Test HBAC for aap-service
+      command: ipa hbactest --user=aap-service --host=app.zta.lab --service=sshd
+      register: s6_hbac_test_aap
+      changed_when: false
+      failed_when: false
+
+    - name: Test HBAC for neteng (should be denied)
+      command: ipa hbactest --user=neteng --host=app.zta.lab --service=sshd
+      register: s6_hbac_test_neteng
+      changed_when: false
+      failed_when: false
+
+- name: "Section 6 Check | Vault Lockdown"
+  hosts: zta_services
+  become: false
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section6, vault]
+
+  tasks:
+    - name: Authenticate to Vault as human
+      uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/login/admin"
+        method: POST
+        body_format: json
+        body:
+          password: "{{ idm_admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: s6_vault_login
+      failed_when: false
+      delegate_to: localhost
+
+    - name: "Test human cannot sign SSH certs (should 403)"
+      uri:
+        url: "{{ vault_addr }}/v1/ssh/sign/ssh-signer"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ s6_vault_login.json.auth.client_token | default('') }}"
+        body_format: json
+        body:
+          public_key: "ssh-rsa AAAAB3NzaC1yc2EAAA test@test"
+          valid_principals: rhel
+        validate_certs: false
+        status_code: [200, 403, 400]
+      register: s6_vault_ssh_sign
+      failed_when: false
+      delegate_to: localhost
+      when: s6_vault_login is not failed and s6_vault_login.status == 200
+
+    - name: "Test human can read KV (should succeed)"
+      uri:
+        url: "{{ vault_addr }}/v1/secret/data/network/arista"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ s6_vault_login.json.auth.client_token | default('') }}"
+        validate_certs: false
+        status_code: [200, 403]
+      register: s6_vault_kv_read
+      failed_when: false
+      delegate_to: localhost
+      when: s6_vault_login is not failed and s6_vault_login.status == 200
+
+- name: "Section 6 Check | Wazuh Custom Rules"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+  ignore_errors: true
+  ignore_unreachable: true
+  tags: [section6, wazuh]
+
+  tasks:
+    - name: Check Wazuh custom rules for AAP suppression
+      command: >
+        podman exec wazuh-manager
+        grep -c '100030\|100031\|100032' /var/ossec/etc/rules/local_rules.xml
+      register: s6_wazuh_rules
+      changed_when: false
+      failed_when: false
+
+- name: "Section 6 Check | Summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [section6, summary]
+
+  vars:
+    c: "{{ hostvars['central'] | default({}) }}"
+    checks:
+      - name: Firewall lockdown on app
+        ok: "{{ hostvars['app']['s6_fw_locked'] | default(false) }}"
+      - name: Firewall lockdown on db
+        ok: "{{ hostvars['db']['s6_fw_locked'] | default(false) }}"
+      - name: HBAC rule allow_aap_automation exists
+        ok: "{{ (c.s6_hbac_aap.rc | default(1)) == 0 }}"
+      - name: HBAC rule allow_breakglass exists
+        ok: "{{ (c.s6_hbac_breakglass.rc | default(1)) == 0 }}"
+      - name: aap-service passes HBAC test
+        ok: "{{ 'matched' in (c.s6_hbac_test_aap.stdout | default('')) | lower or 'Access granted' in (c.s6_hbac_test_aap.stdout | default('')) }}"
+      - name: neteng denied by HBAC
+        ok: "{{ 'not matched' in (c.s6_hbac_test_neteng.stdout | default('')) | lower or 'Access denied' in (c.s6_hbac_test_neteng.stdout | default('')) }}"
+      - name: Vault lockdown (human cannot sign SSH)
+        ok: "{{ (c.s6_vault_ssh_sign.status | default(200)) == 403 }}"
+      - name: Vault lockdown (human can read KV)
+        ok: "{{ (c.s6_vault_kv_read.status | default(0)) == 200 }}"
+      - name: Wazuh custom rules loaded (AAP suppression)
+        ok: "{{ (c.s6_wazuh_rules.rc | default(1)) == 0 and (c.s6_wazuh_rules.stdout | default('0') | int) >= 1 }}"
+
+  tasks:
+    - name: Build results
+      set_fact:
+        passed: "{{ checks | selectattr('ok') | list }}"
+        failed_checks: "{{ checks | rejectattr('ok') | list }}"
+
+    - name: Display Section 6 verification report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║   Section 6 — SSH Lockdown & Break-Glass Recovery              ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║  PASSED: {{ passed | length }} / {{ checks | length }}
+          ║                                                                ║
+          {% for item in checks %}
+          ║  {{ '✓' if item.ok else '✗' }}  {{ item.name }}
+          {% endfor %}
+          ║                                                                ║
+          {% if failed_checks | length > 0 %}
+          ║  ── INCOMPLETE ──                                              ║
+          {% for item in failed_checks %}
+          ║    - {{ item.name }}
+          {% endfor %}
+          {% else %}
+          ║  Section 6 complete — all lockdown layers verified.            ║
+          {% endif %}
+          ║                                                                ║
+          ╚══════════════════════════════════════════════════════════════════╝

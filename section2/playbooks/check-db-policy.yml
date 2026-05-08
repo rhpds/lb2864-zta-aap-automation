@@ -1,0 +1,128 @@
+---
+# Section 2, Step 1: Check OPA policy before issuing database credentials
+- name: Check Database Access Policy with OPA
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  # Launcher username comes from AAP (awx_user_name). Group membership for this
+  # PDP step is taken from IdM (ipa user-show "Member of groups:" line), not
+  # awx_user_groups: some controller/LDAP setups mis-report groups, and learners
+  # often add neteng to app-deployers while testing Exercise 2.5 — IdM is the SoT.
+  vars:
+    requesting_user: "{{ awx_user_name | default('', true) }}"
+    controller_reported_groups: "{{ awx_user_groups | default([], true) }}"
+
+  tasks:
+    - name: Query IdM for launcher group membership (authoritative for OPA input)
+      ansible.builtin.command:
+        cmd: "ipa user-show {{ requesting_user | quote }}"
+      register: ipa_user_out
+      changed_when: false
+      failed_when: false
+      become: true
+      when: requesting_user | length > 0
+
+    # Human-readable "Member of groups: a, b" is stable across IPA versions; LDIF
+    # --raw memberof attribute spelling varies and was yielding [] for some users.
+    # Use Jinja string.split(':', 1) — the Ansible | split(':', 1) filter is not
+    # portable across versions and can raise opaque template errors.
+    - name: Capture IdM Member of groups line from ipa user-show output
+      ansible.builtin.set_fact:
+        ipa_member_of_groups_line: >-
+          {{
+            ipa_user_out.stdout_lines | default([])
+            | select('search', 'Member of groups')
+            | list
+            | first
+            | default('')
+          }}
+      when:
+        - requesting_user | length > 0
+        - not (ipa_user_out.skipped | default(false))
+        - ipa_user_out.rc | default(-1) == 0
+
+    - name: Build requesting_groups list from Member of groups line
+      ansible.builtin.set_fact:
+        requesting_groups: >-
+          {{
+            (
+              ipa_member_of_groups_line.split(':', 1)[1] | trim
+            ).split(',')
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+      when:
+        - requesting_user | length > 0
+        - not (ipa_user_out.skipped | default(false))
+        - ipa_user_out.rc | default(-1) == 0
+        - (ipa_member_of_groups_line | default('')) | length > 0
+        - (ipa_member_of_groups_line | default('')) is search(':')
+
+    - name: Default requesting_groups when IdM line missing or query skipped
+      ansible.builtin.set_fact:
+        requesting_groups: []
+      when: requesting_groups is not defined
+
+    - name: Query OPA for database access decision
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/db_access/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: "{{ requesting_user }}"
+            user_groups: "{{ requesting_groups }}"
+            target_database: "{{ db_name }}"
+            requested_permissions: ["SELECT", "INSERT", "UPDATE"]
+      register: opa_decision
+
+    # OPA query API normally returns {"result": {...}}; some errors return only
+    # {"errors": [...]} with no result — avoid .result on a bare dict.
+    - name: Normalize OPA decision document
+      ansible.builtin.set_fact:
+        opa_result: >-
+          {{
+            (
+              opa_decision.json['result']
+              if (
+                opa_decision.json | default({}) is mapping
+                and 'result' in opa_decision.json
+                and opa_decision.json['result'] is not none
+              )
+              else (
+                opa_decision.json
+                if (opa_decision.json | default({}) is mapping and 'allow' in opa_decision.json)
+                else {}
+              )
+            )
+          }}
+
+    - name: Display OPA decision
+      debug:
+        msg: |
+          OPA Database Access Decision:
+            User:            {{ requesting_user }}
+            Groups (IdM):  {{ requesting_groups | join(', ') }}
+            {% if controller_reported_groups | length > 0
+                  and (controller_reported_groups | sort | join(',') != requesting_groups | sort | join(',')) %}
+            Controller saw: {{ controller_reported_groups | join(', ') }} (not used for this check)
+            {% endif %}
+            Database:        {{ db_name }}
+            Decision:        {{ 'ALLOWED' if (opa_result.allow | default(false)) else 'DENIED' }}
+            Reason:          {{ opa_result.reason | default('OPA returned no decision document (check policy load and URL).') }}
+            {% if opa_decision.json is mapping and ('errors' in opa_decision.json) %}
+            OPA errors:      {{ opa_decision.json.errors | to_json }}
+            {% endif %}
+
+    - name: Enforce OPA decision
+      assert:
+        that:
+          - opa_result.allow | default(false)
+        fail_msg: |
+          ACCESS DENIED by OPA policy.
+          User '{{ requesting_user }}' is not authorised to request database credentials.
+          Reason: {{ opa_result.reason | default('unknown') }}
+          Conditions: {{ opa_result.conditions | default({}) }}
+        success_msg: "OPA policy check passed — proceeding with credential issuance"

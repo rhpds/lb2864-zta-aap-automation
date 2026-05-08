@@ -1,0 +1,36 @@
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: ztaapp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123!
+    volumes:
+      - ./app/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro,z
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ztaapp"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: ./app
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ztaapp
+      DB_USER: postgres
+      DB_PASSWORD: "postgres123!"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8081"
+    ports:
+      - "8081:8081"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:

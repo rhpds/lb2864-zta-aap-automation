@@ -1,0 +1,134 @@
+---
+# Section 2 — Student Exercise: Write the OPA policy check
+#
+# This playbook has the IdM group lookup already done for you.
+# YOUR TASK: Complete the OPA query, display, and enforcement tasks.
+#
+# Hints:
+#   - OPA URL is available as {{ opa_url }}
+#   - The policy path is /v1/data/zta/db_access/decision
+#   - OPA expects a POST with JSON body containing an "input" object
+#   - The input needs: user, user_groups, target_database, requested_permissions
+#   - The response will be in opa_decision.json.result
+#   - Use the assert module to enforce the decision
+#
+# When done, create a job template using THIS playbook (not the instructor version)
+# and run it as both neteng (should be denied) and appdev (should be allowed).
+
+- name: Check Database Access Policy with OPA
+  hosts: zta_services
+  become: false
+  gather_facts: false
+
+  vars:
+    requesting_user: "{{ awx_user_name | default('', true) }}"
+
+  tasks:
+    # ── IdM group lookup (provided) ─────────────────────────────────
+    - name: Query IdM for launcher group membership
+      ansible.builtin.command:
+        cmd: "ipa user-show {{ requesting_user | quote }}"
+      register: ipa_user_out
+      changed_when: false
+      failed_when: false
+      become: true
+      when: requesting_user | length > 0
+
+    - name: Capture IdM Member of groups line
+      ansible.builtin.set_fact:
+        ipa_member_of_groups_line: >-
+          {{
+            ipa_user_out.stdout_lines | default([])
+            | select('search', 'Member of groups')
+            | list
+            | first
+            | default('')
+          }}
+      when:
+        - requesting_user | length > 0
+        - not (ipa_user_out.skipped | default(false))
+        - ipa_user_out.rc | default(-1) == 0
+
+    - name: Build requesting_groups list from IdM
+      ansible.builtin.set_fact:
+        requesting_groups: >-
+          {{
+            (
+              ipa_member_of_groups_line.split(':', 1)[1] | trim
+            ).split(',')
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+      when:
+        - requesting_user | length > 0
+        - not (ipa_user_out.skipped | default(false))
+        - ipa_user_out.rc | default(-1) == 0
+        - (ipa_member_of_groups_line | default('')) | length > 0
+        - (ipa_member_of_groups_line | default('')) is search(':')
+
+    - name: Default requesting_groups when IdM query skipped
+      ansible.builtin.set_fact:
+        requesting_groups: []
+      when: requesting_groups is not defined
+
+    # ── YOUR CODE STARTS HERE ───────────────────────────────────────
+
+    # TASK 1: Query OPA for the database access decision
+    #
+    # Use the uri module to POST to OPA. You need:
+    #   url:         "{{ opa_url }}/v1/data/zta/db_access/decision"
+    #   method:      POST
+    #   body_format: json
+    #   body:        an "input" object with these fields:
+    #                  user: "{{ requesting_user }}"
+    #                  user_groups: "{{ requesting_groups }}"
+    #                  target_database: "{{ db_name }}"
+    #                  requested_permissions: ["SELECT", "INSERT", "UPDATE"]
+    #
+    # Register the result as: opa_decision
+
+    - name: Query OPA for database access decision
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/db_access/decision"
+        method: "POST"
+        body_format: json
+        body:
+          input:
+            user: "{{ requesting_user }}"
+            user_groups: "{{ requesting_groups }}"
+            target_database: "{{ db_name }}"
+            requested_permissions: ["SELECT", "INSERT", "UPDATE"]
+      register: opa_decision
+
+    # TASK 2: Display the OPA decision to the job output
+    #
+    # Use the debug module to show:
+    #   - The user and their groups
+    #   - The decision (opa_decision.json.result.allow)
+    #   - The reason (opa_decision.json.result.reason)
+
+    - name: Display OPA decision
+      debug:
+        msg: |
+          OPA Database Access Decision:
+          User:     {{ requesting_user }}
+          Groups:   {{ requesting_groups | join(', ') }}
+          Database: {{ db_name }}
+          Decision: {{ 'ALLOWED' if opa_decision.json.result.allow else 'DENIED' }}
+          Reason:   {{ opa_decision.json.result.reason }}
+
+    # TASK 3: Enforce the OPA decision — fail the playbook if denied
+    #
+    # Use the assert module to check opa_decision.json.result.allow
+    # Include a clear fail_msg explaining why access was denied.
+
+    - name: Enforce OPA decision
+      assert:
+        that:
+          - "opa_decision.json.result.allow == true"
+        fail_msg: |
+          ACCESS DENIED by OPA policy.
+          User '{{ requesting_user }}' is not authorised to request database credentials.
+          Reason: {{ opa_decision.json.result.reason | default('unknown') }}
+        success_msg: "OPA policy check passed — proceeding with credential issuance"

@@ -1,0 +1,49 @@
+---
+# Section 6: Simulate an HBAC misconfiguration that blocks the AAP service account.
+#
+# This playbook deliberately removes aap-service from the allow_aap_automation
+# HBAC rule, causing all AAP job templates to fail with SSH authentication errors.
+# Participants must diagnose the problem and fix it using the break-glass path.
+#
+# Usage (instructor only):
+#   ansible-playbook section6/playbooks/break-hbac.yml
+
+- name: "Section 6 | Break HBAC — Remove AAP Service from HBAC Rule"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  vars:
+    aap_service_user: aap-service
+
+  tasks:
+    - name: Remove aap-service from the automation HBAC rule
+      redhat.rhel_idm.ipahbacrule:
+        ipaadmin_password: "{{ idm_admin_password }}"
+        name: allow_aap_automation
+        user:
+          - "{{ aap_service_user }}"
+        action: member
+        state: absent
+
+    - name: Display breakage confirmation (instructor only)
+      debug:
+        msg: |
+          HBAC BREAKAGE APPLIED — AAP IS NOW LOCKED OUT
+          ==============================================
+
+          What changed:
+            aap-service removed from allow_aap_automation HBAC rule
+
+          Effect:
+            ALL AAP job templates will fail with SSH errors
+            The aap-service user is denied login by IdM HBAC
+
+          Participants must:
+            1. Observe the AAP job failure
+            2. SSH to central as a breakglass-admins user
+            3. Diagnose with: ipa hbactest
+            4. Fix with: ipa hbacrule-add-user
+
+          Instructor fix (if needed):
+            ansible-playbook section6/playbooks/fix-hbac.yml

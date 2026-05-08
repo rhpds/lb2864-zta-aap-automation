@@ -1,0 +1,44 @@
+=== Exercise 1.9 — Certificate trust chain debugging
+
+[TIP]
+.Zero Trust for machines, not only people
+====
+Users authenticate to IdM; **services** must also prove they belong to the organisation. A self-signed HTTPS cert says “trust me because I say so”—there is **no anchor** tying the service to your enterprise PKI. ZTA expects **verifiable service identity** (here, via the IdM CA) so automation and humans do not train themselves to click through certificate warnings—a behaviour attackers exploit.
+====
+
+==== Scenario
+
+A test HTTPS endpoint on central uses a **self-signed** certificate instead of the IdM CA. Clients that trust only IdM will fail TLS verification.
+
+*Instructor:* `ansible-playbook section1/playbooks/break-cert-trust.yml`
+
+==== Steps
+
+. Observe failure:
++
+[source,bash]
+----
+curl https://central.zta.lab:9443/
+----
++
+Expect certificate verification error.
+
+. Inspect presented cert:
++
+[source,bash]
+----
+echo | openssl s_client -connect central.zta.lab:9443 2>/dev/null | \
+  openssl x509 -text -noout | grep -E "Issuer|Subject|Not "
+----
+
+. Compare with IdM UI cert (port 443).
+
+. On central, request IdM-signed cert with `ipa-getcert` (see `section1/README.md` for full `ipa-getcert request` example and paths).
+
+. Point the test service at IdM-signed cert/key; restart service; verify `curl` succeeds and issuer is IdM CA.
+
+==== Validation
+
+* [ ] Initial `curl` fails (untrusted issuer)
+* [ ] `openssl` shows self-signed issuer on :9443
+* [ ] After fix, `curl` succeeds and issuer is IdM CA

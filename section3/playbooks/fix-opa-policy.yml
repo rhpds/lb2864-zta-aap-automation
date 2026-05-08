@@ -1,0 +1,58 @@
+---
+# Section 3B: Deploy the correct data classification policy (instructor reset).
+#
+# Usage:
+#   ansible-playbook section3/playbooks/fix-opa-policy.yml
+
+- name: "Section 3B | Deploy Correct Data Classification Policy"
+  hosts: zta_services
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Deploy the CORRECT data classification policy
+      copy:
+        src: ../../opa-policies/data_classification.rego
+        dest: "{{ opa_policy_dir }}/data_classification.rego"
+        mode: '0644'
+      register: fixed_policy
+
+    - name: Restart OPA to load the fixed policy
+      command: podman restart {{ opa_container_name }}
+      when: fixed_policy.changed
+
+    - name: Wait for OPA health
+      uri:
+        url: "{{ opa_url }}/health"
+        method: GET
+      register: opa_health
+      until: opa_health.status == 200
+      retries: 10
+      delay: 3
+
+    - name: Verify PII is now correctly denied for security-ops alone
+      uri:
+        url: "{{ opa_url }}/v1/data/zta/data_classification/decision"
+        method: POST
+        body_format: json
+        body:
+          input:
+            user: "spatel"
+            user_groups: ["security-ops"]
+            data_classification: "pii"
+        return_content: true
+      register: pii_test
+
+    - name: Display fix confirmation
+      debug:
+        msg: |
+          CORRECT OPA POLICY DEPLOYED
+          ============================
+
+          All 3 bugs fixed:
+            PII requires BOTH security-ops AND db-admins
+            Confidential requires db-admins (not app-deployers)
+            Internal rule checks classification level
+
+          PII test (security-ops only): {{ pii_test.json.result.allow }}
+          Expected: false
