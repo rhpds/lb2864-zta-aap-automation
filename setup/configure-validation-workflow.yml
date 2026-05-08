@@ -1,0 +1,419 @@
+---
+# Configure ZTA Lab Validation Workflow in AAP
+#
+# Creates a paired Solve+Check job template for each lab section, then
+# builds a workflow that walks the full student journey:
+#
+#   [Solve S1] ──always──▶ [Check S1]
+#                                │ always
+#                                ▼
+#   [Solve S2] ──always──▶ [Check S2]
+#                                │ always
+#                                ▼  (continues through S6)
+#
+# How to read the result:
+#   ✓ green solve + green check  → student completed the section correctly
+#   ✗ green solve + red check    → solve script ran but outcome verification
+#                                   failed; check the check output to see what
+#                                   the student still needs to do
+#   ✗ red solve                  → the automation itself broke; investigate
+#
+# Idempotent — workflow nodes are purged and rebuilt on every run.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini setup/configure-validation-workflow.yml
+
+- name: Configure ZTA Lab Validation Workflow
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_host: "{{ aap_controller_url | default('https://control.zta.lab') }}"
+    aap_user: "{{ aap_admin_user | default('admin') }}"
+    aap_password: "{{ aap_admin_password | default('ansible123!') }}"
+    aap_verify_ssl: false
+
+    inventory_name: ZTA Lab Inventory
+    project_name: ZTA Workshop
+    ee_name: ZTA Workshop EE
+    machine_credential_name: ZTA Machine Credential
+    workflow_name: ZTA Lab Validation Suite
+
+    _extra_vars: |
+      aap_host: "{{ aap_host }}"
+      aap_user: "{{ aap_user }}"
+      aap_password: "{{ aap_password }}"
+      aap_verify_ssl: false
+
+    # Ordered section list — order determines the workflow chain
+    sections:
+      - id: s1
+        label: "Section 1"
+        topic: "ZTA Components & AAP Integration"
+        solve: "setup/validation/solve-section1.yml"
+        check: "setup/validation/check-section1.yml"
+
+      - id: s2
+        label: "Section 2"
+        topic: "Deploy Application with Short-Lived Credentials"
+        solve: "setup/validation/solve-section2.yml"
+        check: "setup/validation/check-section2.yml"
+
+      - id: s3
+        label: "Section 3"
+        topic: "Platform-Gated Patching & Security Hardening"
+        solve: "setup/validation/solve-section3.yml"
+        check: "setup/validation/check-section3.yml"
+
+      - id: s3b
+        label: "Section 3B"
+        topic: "OPA Rego Authoring — Data Classification"
+        solve: "setup/validation/solve-section3.yml"
+        check: "setup/validation/check-section3b.yml"
+
+      - id: s4
+        label: "Section 4"
+        topic: "SPIFFE-Verified VLAN Management"
+        solve: "setup/validation/solve-section4.yml"
+        check: "setup/validation/check-section4.yml"
+
+      - id: s5
+        label: "Section 5"
+        topic: "Automated Incident Response (EDA + Splunk)"
+        solve: "setup/validation/solve-section5.yml"
+        check: "setup/validation/check-section5.yml"
+
+      - id: s6
+        label: "Section 6"
+        topic: "SSH Lockdown & Break-Glass Recovery"
+        solve: "setup/validation/solve-section6.yml"
+        check: "setup/validation/check-section6.yml"
+
+  tasks:
+    # ── 0. Authenticate ──────────────────────────────────────────────
+    - name: Obtain AAP OAuth token
+      uri:
+        url: "{{ aap_host }}/api/gateway/v1/tokens/"
+        method: POST
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body: { description: "validation-workflow-setup" }
+        status_code: [201]
+      register: _auth
+
+    - name: Set token fact
+      set_fact:
+        _tok: "{{ _auth.json.token }}"
+
+    # ── 1. Look up resource IDs ──────────────────────────────────────
+    - name: Look up inventory, project, EE, org IDs
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/{{ item.ep }}/?name={{ item.name | urlencode }}"
+        method: GET
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+      register: _lookups
+      loop:
+        - { ep: inventories,            name: "ZTA Lab Inventory" }
+        - { ep: projects,               name: "ZTA Workshop" }
+        - { ep: execution_environments, name: "ZTA Workshop EE" }
+        - { ep: organizations,          name: "Default" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Look up Machine Credential ID
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/credentials/?name={{ machine_credential_name | urlencode }}&credential_type=1"
+        method: GET
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+      register: _cred
+
+    - name: Set resource ID facts
+      set_fact:
+        _inv:  "{{ _lookups.results[0].json.results[0].id }}"
+        _proj: "{{ _lookups.results[1].json.results[0].id }}"
+        _ee:   "{{ _lookups.results[2].json.results[0].id }}"
+        _org:  "{{ _lookups.results[3].json.results[0].id }}"
+        _cred_id: "{{ _cred.json.results[0].id }}"
+
+    # ── 2. Create Solve job templates ────────────────────────────────
+    - name: Create Solve job templates (skip if already exists)
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body:
+          name: "ZTA Solve: {{ item.label }} — {{ item.topic }}"
+          description: >-
+            Re-creates the student steps for {{ item.label }}.
+            If the paired Check node is red, this output shows exactly what
+            the student was supposed to do.
+          job_type: run
+          inventory: "{{ _inv | int }}"
+          project: "{{ _proj | int }}"
+          playbook: "{{ item.solve }}"
+          execution_environment: "{{ _ee | int }}"
+          credential: "{{ _cred_id | int }}"
+          verbosity: 0
+          organization: "{{ _org | int }}"
+          extra_vars: "{{ _extra_vars }}"
+        status_code: [201, 400]
+      loop: "{{ sections }}"
+      loop_control:
+        label: "Solve: {{ item.label }}"
+
+    # ── 3. Create Check job templates ────────────────────────────────
+    - name: Create Check job templates (skip if already exists)
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body:
+          name: "ZTA Check: {{ item.label }} — {{ item.topic }}"
+          description: >-
+            Verifies {{ item.label }} completion.
+            Green = student work is correct.
+            Red = see the paired Solve node for what was missing.
+          job_type: run
+          inventory: "{{ _inv | int }}"
+          project: "{{ _proj | int }}"
+          playbook: "{{ item.check }}"
+          execution_environment: "{{ _ee | int }}"
+          credential: "{{ _cred_id | int }}"
+          verbosity: 0
+          organization: "{{ _org | int }}"
+          extra_vars: "{{ _extra_vars }}"
+        status_code: [201, 400]
+      loop: "{{ sections }}"
+      loop_control:
+        label: "Check: {{ item.label }}"
+
+    # ── 4. Resolve final template IDs (handles pre-existing templates)
+    - name: Resolve Solve template IDs
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ ('ZTA Solve: ' + item.label + ' — ' + item.topic) | urlencode }}"
+        method: GET
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+      register: _solve_id_results
+      loop: "{{ sections }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    - name: Resolve Check template IDs
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/job_templates/?name={{ ('ZTA Check: ' + item.label + ' — ' + item.topic) | urlencode }}"
+        method: GET
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+      register: _check_id_results
+      loop: "{{ sections }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    - name: Build section template ID map
+      set_fact:
+        _jt_map: >-
+          {{
+            _jt_map | default({}) | combine({
+              sections[idx].id: {
+                'solve': _solve_id_results.results[idx].json.results[0].id,
+                'check': _check_id_results.results[idx].json.results[0].id
+              }
+            })
+          }}
+      loop: "{{ sections }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.label }}"
+
+    # ── 5. Ensure workflow template exists ───────────────────────────
+    - name: Create workflow template (skip if exists)
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_templates/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body:
+          name: "{{ workflow_name }}"
+          description: >-
+            Full learner journey — Solve then Check for every section.
+            Solve nodes simulate what a student does in the lab UI.
+            Check nodes verify the outcome matches lab objectives.
+            All edges are 'always' so the entire lab is exercised end-to-end.
+          organization: "{{ _org | int }}"
+          inventory: "{{ _inv | int }}"
+        status_code: [201, 400]
+
+    - name: Fetch workflow ID
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_templates/?name={{ workflow_name | urlencode }}"
+        method: GET
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+      register: _wf
+
+    - name: Set workflow ID fact
+      set_fact:
+        _wf_id: "{{ _wf.json.results[0].id }}"
+
+    # ── 6. Rebuild nodes (purge + create for clean idempotency) ─────
+    - name: List existing workflow nodes
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_templates/{{ _wf_id }}/workflow_nodes/?page_size=100"
+        method: GET
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [200]
+      register: _old_nodes
+
+    - name: Delete existing nodes
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_template_nodes/{{ item.id }}/"
+        method: DELETE
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: [204]
+      loop: "{{ _old_nodes.json.results }}"
+      loop_control:
+        label: "node {{ item.id }}"
+      when: _old_nodes.json.count > 0
+
+    # Create all Solve nodes in one loop, preserving index order
+    - name: Create Solve workflow nodes
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_template_nodes/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body:
+          workflow_job_template: "{{ _wf_id | int }}"
+          unified_job_template: "{{ _jt_map[item.id].solve | int }}"
+          identifier: "solve-{{ item.id }}"
+        status_code: [201]
+      register: _solve_nodes
+      loop: "{{ sections }}"
+      loop_control:
+        label: "solve-{{ item.id }}"
+
+    # Create all Check nodes
+    - name: Create Check workflow nodes
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_template_nodes/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body:
+          workflow_job_template: "{{ _wf_id | int }}"
+          unified_job_template: "{{ _jt_map[item.id].check | int }}"
+          identifier: "check-{{ item.id }}"
+        status_code: [201]
+      register: _check_nodes
+      loop: "{{ sections }}"
+      loop_control:
+        label: "check-{{ item.id }}"
+
+    # ── 7. Wire edges ────────────────────────────────────────────────
+    # Build a flat edge list first so both loops use simple integer variables
+    # rather than nested Jinja2 type-coercion inside the uri body dict.
+    - name: Build intra-section edges (Solve → Check)
+      set_fact:
+        _intra_edges: >-
+          {{
+            _intra_edges | default([]) + [{
+              'from': _solve_nodes.results[idx].json.id | int,
+              'to':   _check_nodes.results[idx].json.id | int,
+              'label': 'solve-' + item.id + ' → check-' + item.id
+            }]
+          }}
+      loop: "{{ sections }}"
+      loop_control:
+        index_var: idx
+        label: "solve-{{ item.id }} → check-{{ item.id }}"
+
+    - name: Build inter-section edges (Check(N) → Solve(N+1))
+      set_fact:
+        _inter_edges: >-
+          {{
+            _inter_edges | default([]) + [{
+              'from': _check_nodes.results[idx].json.id | int,
+              'to':   _solve_nodes.results[idx + 1].json.id | int,
+              'label': 'check-' + sections[idx].id + ' → solve-' + sections[idx + 1].id
+            }]
+          }}
+      loop: "{{ sections[:-1] }}"
+      loop_control:
+        index_var: idx
+        label: "check-{{ sections[idx].id }} → solve-{{ sections[idx + 1].id }}"
+
+    # Within each section: Solve ──always──▶ Check
+    - name: "Wire: Solve → Check (always) within each section"
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_template_nodes/{{ item.from }}/always_nodes/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body: "{{ {'id': item.to} }}"
+        status_code: [204]
+      loop: "{{ _intra_edges }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    # Between sections: Check(N) ──always──▶ Solve(N+1)
+    - name: "Wire: Check(N) → Solve(N+1) (always) between sections"
+      uri:
+        url: "{{ aap_host }}/api/controller/v2/workflow_job_template_nodes/{{ item.from }}/always_nodes/"
+        method: POST
+        headers: { Authorization: "Bearer {{ _tok }}" }
+        validate_certs: "{{ aap_verify_ssl }}"
+        body_format: json
+        body: "{{ {'id': item.to} }}"
+        status_code: [204]
+      loop: "{{ _inter_edges }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    # ── 8. Summary ───────────────────────────────────────────────────
+    - name: Report workflow configured
+      debug:
+        msg: |
+          ╔═════════════════════════════════════════════════════════════════╗
+          ║           ZTA Lab Validation Suite — configured               ║
+          ╠═════════════════════════════════════════════════════════════════╣
+          ║                                                               ║
+          ║  Workflow ID: {{ _wf_id }}
+          ║                                                               ║
+          ║  Chain (all edges: always):                                   ║
+          ║    Solve S1 → Check S1 →                                     ║
+          ║    Solve S2 → Check S2 →                                     ║
+          ║    Solve S3 → Check S3 →                                     ║
+          ║    Solve S3B → Check S3B →                                   ║
+          ║    Solve S4 → Check S4 →                                     ║
+          ║    Solve S5 → Check S5 →                                     ║
+          ║    Solve S6 → Check S6                                       ║
+          ║                                                               ║
+          ║  Reading results:                                             ║
+          ║    green solve + green check = section complete               ║
+          ║    green solve + red check   = student steps missing          ║
+          ║    red solve                 = automation broken              ║
+          ║                                                               ║
+          ║  Launch: AAP → Templates → ZTA Lab Validation Suite          ║
+          ╚═════════════════════════════════════════════════════════════════╝

@@ -44,22 +44,34 @@
       loop_control:
         label: "{{ item.item }}"
 
-- name: "Section 5 Check | EDA Webhook"
-  hosts: automation
-  become: false
+- name: "Section 5 Check | EDA Activation"
+  hosts: localhost
+  connection: local
   gather_facts: false
   ignore_errors: true
-  ignore_unreachable: true
   tags: [section5, eda]
 
+  vars_files:
+    - validation_vars.yml
+
   tasks:
-    - name: Check EDA webhook port (5000)
-      ansible.builtin.wait_for:
-        host: localhost
-        port: 5000
-        timeout: 5
-      register: s5_eda_port
+    - name: Check EDA activation 'Splunk Events' is running
+      uri:
+        url: "{{ aap_host }}/api/eda/v1/activations/?name=Splunk+Events"
+        method: GET
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        validate_certs: "{{ aap_verify_ssl }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: s5_eda_activation
       failed_when: false
+
+    - name: Store EDA activation result
+      set_fact:
+        s5_eda_running: >-
+          {{ (s5_eda_activation.json.results | default([])
+              | selectattr('status', 'equalto', 'running') | list | length) > 0 }}
 
 - name: "Section 5 Check | Application Health"
   hosts: zta_services
@@ -94,8 +106,8 @@
         ok: "{{ (s5_template_results | default({}))['Simulate Brute Force'] | default(false) }}"
       - name: "Template: Restore App Credentials"
         ok: "{{ (s5_template_results | default({}))['Restore App Credentials'] | default(false) }}"
-      - name: EDA webhook port listening (5000)
-        ok: "{{ (ctrl.s5_eda_port.state | default('')) == 'started' }}"
+      - name: EDA activation 'Splunk Events' running
+        ok: "{{ s5_eda_running | default(false) }}"
       - name: Application healthy (pre-attack)
         ok: "{{ (c.s5_app_health.status | default(0)) == 200 }}"
 

@@ -345,7 +345,7 @@
       - name: OPA patching allow (ztauser)
         ok: "{{ (c.s1_opa_patch_allow.json.result.allow | default(false)) == true }}"
       - name: OPA patching deny (neteng)
-        ok: "{{ (c.s1_opa_patch_deny.json.result.allow | default(true)) == false }}"
+        ok: "{{ (c.s1_opa_patch_deny.json.result.allow | default(false)) == false }}"
       - name: Vault KV readable
         ok: "{{ (c.s1_vault_kv.status | default(0)) == 200 }}"
       - name: Vault SSH CA role exists

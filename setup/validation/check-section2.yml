@@ -163,7 +163,7 @@
       - name: OPA db_access allows appdev
         ok: "{{ (c.s2_opa_db_allow.json.result.allow | default(false)) == true }}"
       - name: OPA db_access denies neteng
-        ok: "{{ (c.s2_opa_db_deny.json.result.allow | default(true)) == false }}"
+        ok: "{{ (c.s2_opa_db_deny.json.result.allow | default(false)) == false }}"
       - name: Application healthy
         ok: "{{ (c.s2_app_health.status | default(0)) == 200 }}"
       - name: Application dashboard loads

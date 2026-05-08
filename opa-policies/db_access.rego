@@ -16,6 +16,8 @@ allow if {
 }
 
 # Requester must be in the app-deployers group
+default condition_user_authorized := false
+
 condition_user_authorized if {
 	some group in input.user_groups
 	group == "app-deployers"
@@ -24,12 +26,16 @@ condition_user_authorized if {
 # Target database must be a known, registered database
 known_databases := {"ztaapp", "inventory", "monitoring"}
 
+default condition_valid_target := false
+
 condition_valid_target if {
 	known_databases[input.target_database]
 }
 
 # Requested permissions must not exceed least-privilege scope
 allowed_permissions := {"SELECT", "INSERT", "UPDATE"}
+
+default condition_least_privilege := false
 
 condition_least_privilege if {
 	every perm in input.requested_permissions {

@@ -21,6 +21,18 @@
 #   - Splunk deployed with EDA add-on: ansible-playbook setup/deploy-splunk.yml
 #   - AAP EDA Token Event Stream created (copy URL from Automation Decisions → Event Streams)
 #
+# INSTRUCTOR NOTE — vault_db_default_ttl for Section 5 (BF-1b)
+# ─────────────────────────────────────────────────────────────
+# The EDA chain in Section 5 triggers the "Deploy Application Pipeline" workflow.
+# If students built the workflow in Section 2 without the vault_db_default_ttl
+# extra_var, the Vault DB credential will use the 5-minute default TTL and
+# expire mid-pipeline. After students complete Section 2, set this on the workflow:
+#
+#   AAP → Templates → Deploy Application Pipeline → Edit
+#   Extra Variables:  vault_db_default_ttl: 30m
+#
+# The solve-section2.yml script sets this automatically.
+#
 # Usage:
 #   ansible-playbook -i inventory/hosts.ini setup/configure-splunk-eda.yml \
 #     -e eda_event_stream_url="https://192.168.1.10:443/eda-event-streams/api/eda/v1/external_event_stream/<UUID>/post/"
@@ -119,6 +131,11 @@
       register: _alert_update
 
     - name: Enable alert suppression to prevent repeated EDA triggers per brute-force event window
+      # IMPORTANT — 10-minute suppression window
+      # This alert suppresses duplicate triggers for 10 minutes after the first match.
+      # Students must wait 10 minutes between brute-force simulation runs (Section 5.5)
+      # before the EDA rulebook will fire again. If the chain does not trigger on a
+      # subsequent run, wait 10 minutes and retry.
       ansible.builtin.uri:
         url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
         method: POST

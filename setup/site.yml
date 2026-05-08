@@ -64,7 +64,8 @@
 #   keycloak        — Keycloak realm, LDAP federation, OIDC client, JWT OPA policies
 #   aap-project     — AAP project + execution environment
 #   aap-creds       — AAP credentials (Vault-sourced)
-#   aap-eda-setup   — EDA event stream + activation + Splunk webhook (run after aap-bootstrap)
+#   aap-eda-setup   — EDA event stream + Splunk webhook (activation excluded — see eda_activation)
+#   eda_activation  — EDA "Splunk Events" rulebook activation (student deliverable; use --skip-tags eda_activation on infrastructure reset)
 #   aap-inventory   — AAP static inventory
 #
 #   ── Group tags (span multiple playbooks) ──
@@ -303,7 +304,14 @@
   tags: [always]
 
 
-- name: "AAP Bootstrap 4: Configure EDA event stream and activation"
+- name: "AAP Bootstrap 4: Configure EDA event stream (infrastructure prerequisite)"
+  # Creates: EDA project, AAP credential in EDA, Decision Environment, event stream.
+  # Does NOT create the "Splunk Events" activation — that is a student deliverable
+  # in Section 5.3 (BF-3). The activation tasks are tagged eda_activation and are
+  # excluded from this bootstrap path via --skip-tags eda_activation.
+  #
+  # To also pre-create the activation (solve path / pre-built env):
+  #   ansible-playbook setup/configure-aap-project.yml --tags eda
   ansible.builtin.import_playbook: configure-aap-project.yml
   tags: [aap-eda-setup, eda]
 
@@ -311,6 +319,9 @@
   tags: [always]
 
 - name: "AAP Bootstrap 5: Configure Splunk → EDA webhook"
+  # Connects Splunk's 'ZTA: SSH Brute Force Detected' alert to the EDA event stream.
+  # Sets alert.suppress.period: 10m — students must wait 10 minutes between
+  # brute-force simulation runs in Section 5.5 before the EDA chain can re-fire.
   ansible.builtin.import_playbook: configure-splunk-eda.yml
   tags: [aap-eda-setup, splunk-eda]
 

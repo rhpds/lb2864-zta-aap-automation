@@ -21,17 +21,23 @@ allow if {
 }
 
 # Condition 1: User is in the patch-admins group
+default condition_user_authorized := false
+
 condition_user_authorized if {
 	some group in input.user_groups
 	group == "patch-admins"
 }
 
 # Condition 2: Target server is registered and active in the CMDB
+default condition_server_active := false
+
 condition_server_active if {
 	input.target_server_status == "Active"
 }
 
 # Condition 3: Maintenance window has been approved
+default condition_maintenance_approved := false
+
 condition_maintenance_approved if {
 	input.maintenance_approved == true
 }

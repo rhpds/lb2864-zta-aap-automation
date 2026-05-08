@@ -154,4 +154,6 @@ opa_test_dc_internal_appdev:
   data_classification: internal
 
 # ── Gitea project source ─────────────────────────────────────────────
-gitea_project_url: "http://gitea.zta.lab:3000/zta-workshop/zta-app.git"
+# "gitea" resolves to the Kubernetes service from within the AAP EE.
+# "gitea.zta.lab" is only reachable from lab VMs, not from OpenShift pods.
+gitea_project_url: "http://gitea:3000/gitea/zta-workshop-aap.git"

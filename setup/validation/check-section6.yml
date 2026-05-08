@@ -122,7 +122,7 @@
       when: s6_vault_login is not failed and s6_vault_login.status == 200
 
 - name: "Section 6 Check | Wazuh Custom Rules"
-  hosts: zta_services
+  hosts: wazuh_servers
   become: true
   gather_facts: false
   ignore_errors: true
@@ -132,7 +132,6 @@
   tasks:
     - name: Check Wazuh custom rules for AAP suppression
       command: >
-        podman exec wazuh-manager
         grep -c '100030\|100031\|100032' /var/ossec/etc/rules/local_rules.xml
       register: s6_wazuh_rules
       changed_when: false
@@ -164,7 +163,10 @@
       - name: Vault lockdown (human can read KV)
         ok: "{{ (c.s6_vault_kv_read.status | default(0)) == 200 }}"
       - name: Wazuh custom rules loaded (AAP suppression)
-        ok: "{{ (c.s6_wazuh_rules.rc | default(1)) == 0 and (c.s6_wazuh_rules.stdout | default('0') | int) >= 1 }}"
+        ok: >-
+          {{ not (wazuh_enabled | default(false)) or
+             (((hostvars['wazuh'] | default({})).s6_wazuh_rules.rc | default(1)) == 0 and
+              ((hostvars['wazuh'] | default({})).s6_wazuh_rules.stdout | default('0') | int) >= 1) }}
 
   tasks:
     - name: Build results

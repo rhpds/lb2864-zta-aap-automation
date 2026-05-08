@@ -87,6 +87,38 @@
   gather_facts: false
 
   tasks:
+    # ── 2a. Create a self-signed SPIRE Attestation CA ──────────────────
+    #
+    # This CA signs per-host certificates used by the x509pop NodeAttestor.
+    # x509pop replaces the one-time join_token attestation method so that
+    # agents can re-attest after any restart without requiring a new token.
+    # The CA and cert are valid for 10 years — longer than any lab lifecycle.
+    #
+    - name: Ensure SPIRE attestation CA directory exists
+      file:
+        path: "{{ spire_install_dir }}/conf/server"
+        state: directory
+        mode: '0700'
+
+    - name: Check if attestation CA already exists (idempotent)
+      stat:
+        path: "{{ spire_install_dir }}/conf/server/x509pop-ca.key"
+      register: _spire_ca_key
+
+    - name: Generate SPIRE attestation CA private key
+      command: >
+        openssl genrsa -out {{ spire_install_dir }}/conf/server/x509pop-ca.key 2048
+      when: not _spire_ca_key.stat.exists
+
+    - name: Generate SPIRE attestation CA self-signed certificate (10 years)
+      command: >
+        openssl req -x509 -new -nodes
+        -key {{ spire_install_dir }}/conf/server/x509pop-ca.key
+        -sha256 -days 3650
+        -subj "/CN=SPIRE Attestation CA/O=ZTA Workshop"
+        -out {{ spire_install_dir }}/conf/server/x509pop-ca.crt
+      when: not _spire_ca_key.stat.exists
+
     - name: Deploy SPIRE Server configuration
       copy:
         dest: "{{ spire_install_dir }}/conf/server/server.conf"
@@ -100,7 +132,7 @@
               log_level = "INFO"
 
               ca_ttl = "24h"
-              default_x509_svid_ttl = "1h"
+              default_x509_svid_ttl = "12h"
           }
 
           plugins {
@@ -111,8 +143,11 @@
                   }
               }
 
-              NodeAttestor "join_token" {
-                  plugin_data {}
+              NodeAttestor "x509pop" {
+                  plugin_data {
+                      ca_bundle_path = "{{ spire_install_dir }}/conf/server/x509pop-ca.crt"
+                      agent_path_template = "/cn/{{ "{{" }} .Subject.CommonName {{ "}}" }}"
+                  }
               }
 
               KeyManager "disk" {
@@ -203,37 +238,117 @@
         src: "{{ spire_install_dir }}/conf/server/bootstrap.crt"
       register: spire_trust_bundle
 
+    - name: Read attestation CA certificate
+      slurp:
+        src: "{{ spire_install_dir }}/conf/server/x509pop-ca.crt"
+      register: spire_attestation_ca_cert
 
-# ── Phase 3: Generate join tokens and start SPIRE Agents ────────────
-- name: "Phase 3: Bootstrap SPIRE Agents"
+    - name: Read attestation CA private key
+      slurp:
+        src: "{{ spire_install_dir }}/conf/server/x509pop-ca.key"
+      register: spire_attestation_ca_key
+
+
+# ── Phase 3: Issue per-host certs and start SPIRE Agents ────────────
+#
+# x509pop attestation: each agent gets a certificate signed by the
+# SPIRE Attestation CA (generated in Phase 2). On every restart the
+# agent presents its certificate to the SPIRE server to re-attest —
+# no one-time tokens, no expiry of the attestation mechanism.
+#
+# Agent SPIFFE ID = spiffe://<trust_domain>/cn/<inventory_hostname>
+# (derived from the cert CN via the server's agent_path_template).
+#
+- name: "Phase 3: Bootstrap SPIRE Agents (x509pop)"
   hosts: spire_agents
   become: true
   gather_facts: false
   serial: 1
 
   tasks:
-    - name: Generate join token on SPIRE Server
-      command: >
-        {{ spire_install_dir }}/bin/spire-server token generate
-        -spiffeID spiffe://{{ spire_trust_domain }}/host/{{ inventory_hostname }}
-        -socketPath {{ spire_server_socket }}
-        -ttl 600
-      delegate_to: "{{ groups['zta_services'][0] }}"
-      register: token_result
-
-    - name: Parse join token
+    - name: Set agent SPIFFE ID (deterministic from hostname)
       set_fact:
-        spire_join_token: "{{ token_result.stdout | regex_search('Token:\\s+(\\S+)', '\\1') | first }}"
-
-    - name: Record this agent's SPIFFE ID (derived from join token)
-      set_fact:
-        spire_agent_id: "spiffe://{{ spire_trust_domain }}/spire/agent/join_token/{{ spire_join_token }}"
+        # SPIRE prepends /spire/agent/ to the agent_path_template result.
+        # With template="/cn/{{ .Subject.CommonName }}" and CN=<hostname>,
+        # the full agent SPIFFE ID is spiffe://<domain>/spire/agent/cn/<hostname>.
+        spire_agent_id: "spiffe://{{ spire_trust_domain }}/spire/agent/cn/{{ inventory_hostname }}"
 
     - name: Distribute trust bundle
       copy:
         content: "{{ hostvars[groups['zta_services'][0]]['spire_trust_bundle']['content'] | b64decode }}"
         dest: "{{ spire_install_dir }}/conf/agent/bootstrap.crt"
         mode: '0644'
+
+    - name: Check if agent attestation certificate already exists
+      stat:
+        path: "{{ spire_install_dir }}/conf/agent/x509pop.crt"
+      register: _agent_cert
+
+    - name: Generate agent private key
+      command: >
+        openssl genrsa -out {{ spire_install_dir }}/conf/agent/x509pop.key 2048
+      when: not _agent_cert.stat.exists
+
+    - name: Generate agent CSR (CN = inventory_hostname)
+      command: >
+        openssl req -new
+        -key {{ spire_install_dir }}/conf/agent/x509pop.key
+        -subj "/CN={{ inventory_hostname }}/O=ZTA Workshop"
+        -out {{ spire_install_dir }}/conf/agent/x509pop.csr
+      when: not _agent_cert.stat.exists
+
+    - name: Read CSR from agent into variable
+      slurp:
+        src: "{{ spire_install_dir }}/conf/agent/x509pop.csr"
+      register: _agent_csr_content
+      when: not _agent_cert.stat.exists
+
+    - name: Copy CSR to central for signing
+      copy:
+        content: "{{ _agent_csr_content.content | b64decode }}"
+        dest: "/tmp/spire-csr-{{ inventory_hostname }}.csr"
+        mode: '0600'
+      delegate_to: "{{ groups['zta_services'][0] }}"
+      when: not _agent_cert.stat.exists
+
+    - name: Write OpenSSL extensions file for SPIRE x509pop on central
+      copy:
+        content: |
+          [x509pop_ext]
+          keyUsage = critical, digitalSignature
+          basicConstraints = CA:FALSE
+        dest: /tmp/spire-x509pop.ext
+        mode: '0600'
+      delegate_to: "{{ groups['zta_services'][0] }}"
+      when: not _agent_cert.stat.exists
+
+    - name: Sign agent CSR with attestation CA (on central)
+      command: >
+        openssl x509 -req
+        -in /tmp/spire-csr-{{ inventory_hostname }}.csr
+        -CA {{ spire_install_dir }}/conf/server/x509pop-ca.crt
+        -CAkey {{ spire_install_dir }}/conf/server/x509pop-ca.key
+        -CAcreateserial
+        -sha256 -days 3650
+        -extfile /tmp/spire-x509pop.ext
+        -extensions x509pop_ext
+        -out /tmp/spire-cert-{{ inventory_hostname }}.crt
+      delegate_to: "{{ groups['zta_services'][0] }}"
+      when: not _agent_cert.stat.exists
+
+    - name: Read signed certificate from central
+      slurp:
+        src: "/tmp/spire-cert-{{ inventory_hostname }}.crt"
+      register: _agent_cert_content
+      delegate_to: "{{ groups['zta_services'][0] }}"
+      when: not _agent_cert.stat.exists
+
+    - name: Deploy signed certificate to agent
+      copy:
+        content: "{{ _agent_cert_content.content | b64decode }}"
+        dest: "{{ spire_install_dir }}/conf/agent/x509pop.crt"
+        mode: '0600'
+      when: not _agent_cert.stat.exists
 
     - name: Create agent socket directory
       file:
@@ -258,7 +373,7 @@
         state: directory
         mode: '0755'
 
-    - name: Deploy SPIRE Agent configuration
+    - name: Deploy SPIRE Agent configuration (x509pop)
       copy:
         dest: "{{ spire_install_dir }}/conf/agent/agent.conf"
         mode: '0644'
@@ -274,8 +389,11 @@
           }
 
           plugins {
-              NodeAttestor "join_token" {
-                  plugin_data {}
+              NodeAttestor "x509pop" {
+                  plugin_data {
+                      private_key_path = "{{ spire_install_dir }}/conf/agent/x509pop.key"
+                      certificate_path = "{{ spire_install_dir }}/conf/agent/x509pop.crt"
+                  }
               }
 
               KeyManager "disk" {
@@ -303,7 +421,7 @@
 
           [Service]
           Type=simple
-          ExecStart={{ spire_install_dir }}/bin/spire-agent run -config {{ spire_install_dir }}/conf/agent/agent.conf -joinToken {{ spire_join_token }}
+          ExecStart={{ spire_install_dir }}/bin/spire-agent run -config {{ spire_install_dir }}/conf/agent/agent.conf
           Restart=on-failure
           RestartSec=5
 
@@ -323,29 +441,6 @@
       until: agent_health.rc == 0
       retries: 15
       delay: 3
-
-    - name: Remove join token from systemd unit after successful attestation
-      copy:
-        dest: /etc/systemd/system/spire-agent.service
-        mode: '0644'
-        content: |
-          [Unit]
-          Description=SPIRE Agent
-          After=network-online.target
-          Wants=network-online.target
-
-          [Service]
-          Type=simple
-          ExecStart={{ spire_install_dir }}/bin/spire-agent run -config {{ spire_install_dir }}/conf/agent/agent.conf
-          Restart=on-failure
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-
-    - name: Reload systemd (join token removed)
-      systemd:
-        daemon_reload: true
 
 
 # ── Phase 4: Register workload entries ──────────────────────────────

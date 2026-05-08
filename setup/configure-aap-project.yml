@@ -357,15 +357,23 @@
     # ══════════════════════════════════════════════════════════════════════
     #  3a. Pre-create Deploy Application Pipeline workflow template
     #
-    #  Pre-creates the Section 2 "Deploy Application Pipeline" workflow with
-    #  vault_db_default_ttl: 30m in extra_vars so that the Section 5 EDA chain
-    #  gets 30-minute Vault credentials (avoiding mid-pipeline TTL expiry).
-    #  The Section 2 teaching moment (short-lived TTL) comes from the Vault role
-    #  default (5m), not from this template — students still observe credential
-    #  expiry on first run before the extra_var takes effect.
+    #  INTENTIONALLY REMOVED from the provisioning path (BF-1b).
+    #
+    #  Students build the "Deploy Application Pipeline" workflow themselves
+    #  in Section 2. Pre-creating it here would spoil the exercise.
+    #
+    #  The Section 5 EDA chain needs vault_db_default_ttl: 30m set on the
+    #  workflow; after students complete Section 2, an instructor or the
+    #  solve-section5.yml script updates the extra_vars on the workflow.
+    #
+    #  solve-section2.yml always passes vault_db_default_ttl: 30m when
+    #  creating the workflow, so the automated-solve path is unaffected.
+    #
+    #  To run this task manually for a pre-built environment:
+    #    ansible-playbook setup/configure-aap-project.yml --tags workflow-precreate
     # ══════════════════════════════════════════════════════════════════════
 
-    - name: Pre-create Deploy Application Pipeline workflow template
+    - name: Pre-create Deploy Application Pipeline workflow template (instructor-only)
       ansible.controller.workflow_job_template:
         name: Deploy Application Pipeline
         description: "Section 2 — OPA policy check → Vault credential → ACL → Deploy pipeline"
@@ -375,7 +383,8 @@
           vault_db_default_ttl: 30m
         ask_variables_on_launch: false
         state: present
-      tags: [templates, section2, aap-bootstrap, aap, aap-project]
+      tags: [workflow-precreate]
+      # NOT tagged aap-bootstrap — excluded from all provisioning and reset paths.
 
     # ══════════════════════════════════════════════════════════════════════
     #  3b. RBAC on job templates — batched per team+role
@@ -1009,6 +1018,14 @@
       register: _eda_aap_cred_lookup
       tags: [eda, section5]
 
+    # ── Activation tasks (BF-3) ─────────────────────────────────────────
+    # Tagged eda_activation in ADDITION to eda/section5 so that the
+    # site.yml instructor-reset path can skip activation creation while
+    # still creating the event stream infrastructure.
+    #
+    # Infrastructure reset:  --skip-tags eda_activation
+    # Solve/pre-build path:  --tags eda  (creates both stream + activation)
+
     - name: Check if Splunk Events activation already exists
       uri:
         url: "{{ aap_host }}/api/eda/v1/activations/?name={{ 'Splunk Events' | urlencode }}"
@@ -1019,7 +1036,7 @@
         force_basic_auth: true
         status_code: [200]
       register: _eda_activation_check
-      tags: [eda, section5]
+      tags: [eda, section5, eda_activation]
 
     - name: Look up Default Decision Environment ID
       uri:
@@ -1031,7 +1048,7 @@
         force_basic_auth: true
         status_code: [200]
       register: _eda_default_de_lookup
-      tags: [eda, section5]
+      tags: [eda, section5, eda_activation]
 
     - name: Create Splunk Events rulebook activation
       uri:
@@ -1058,7 +1075,7 @@
         status_code: [201]
       when: (_eda_activation_check.json.count | default(0)) == 0
       register: _eda_activation_create
-      tags: [eda, section5]
+      tags: [eda, section5, eda_activation]
 
     - name: Write EDA event stream URL to file for Splunk configuration
       ansible.builtin.copy:

@@ -1,0 +1,17 @@
+---
+# Collection dependencies for setup and validation playbooks.
+# Install before running any setup or validation playbook outside the ZTA Workshop EE:
+#
+#   ansible-galaxy collection install -r setup/requirements.yml
+#
+# The ZTA Workshop EE (quay.io/nmartins/zta_ee) bundles all of these;
+# only needed when running playbooks directly on the control node.
+
+collections:
+  - name: arista.eos
+  - name: ansible.netcommon
+  - name: ansible.utils
+  - name: awx.awx
+    # ansible.controller on Automation Hub; awx.awx is the Galaxy equivalent
+  - name: community.general
+  - name: netbox.netbox

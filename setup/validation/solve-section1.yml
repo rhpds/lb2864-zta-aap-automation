@@ -80,7 +80,11 @@
         source_path: inventory/netbox_inventory.yml
         credential: ZTA NetBox Credential
         overwrite: true
-        update_on_launch: true
+        # update_on_launch disabled: the ZTA Workshop EE does not include the
+        # netbox.netbox collection required by nb_inventory. Static sources
+        # (hosts.ini, hosts.yml) provide host connectivity for all lab jobs.
+        # Sync manually via AAP UI when a NetBox CMDB refresh is needed.
+        update_on_launch: false
         state: present
       tags: [inventory]
 
