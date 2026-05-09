@@ -79,6 +79,9 @@
         description: "Section 2 — OPA → Vault → ACL → Deploy pipeline"
         organization: "{{ aap_organization }}"
         inventory: "{{ expected_inventory }}"
+        extra_vars:
+          requesting_user: ztauser
+        ask_variables_on_launch: true
         state: present
       tags: [workflow]
 
