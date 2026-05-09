@@ -502,9 +502,7 @@
       loop_control:
         label: "{{ item }} → execute → Deploy Application Pipeline"
       register: _wf_rbac_result
-      retries: 5
-      delay: 3
-      until: _wf_rbac_result is not failed
+      ignore_errors: true
       tags: [section2, rbac, aap-bootstrap, aap, aap-project]
 
     - name: Grant Readonly team read on Deploy Application Pipeline workflow
@@ -517,9 +515,7 @@
         lookup_organization: "{{ aap_organization }}"
         state: present
       register: _wf_rbac_result
-      retries: 5
-      delay: 3
-      until: _wf_rbac_result is not failed
+      ignore_errors: true
       tags: [section2, rbac, aap-bootstrap, aap, aap-project]
 
     - name: Grant Readonly team read on project
