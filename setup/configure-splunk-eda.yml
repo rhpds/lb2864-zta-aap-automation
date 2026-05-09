@@ -112,7 +112,7 @@
 
     - name: Check if ZTA saved search already exists
       ansible.builtin.uri:
-        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected?output_mode=json"
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected?output_mode=json"
         method: GET
         user: admin
         password: "{{ splunk_password }}"
@@ -123,7 +123,7 @@
 
     - name: Create ZTA saved search if it does not exist
       ansible.builtin.uri:
-        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches"
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/saved/searches"
         method: POST
         user: admin
         password: "{{ splunk_password }}"
@@ -146,19 +146,16 @@
           action.ansible_core: "1"
           action.ansible_core.param.alert_type: webhook
           action.ansible_core.param.environment: ZTA
-          counttype: "number of events"
           cron_schedule: "*/1 * * * *"
           dispatch.earliest_time: "-5m"
           dispatch.latest_time: "now"
-          enableSched: "1"
-          quantity: "0"
-          relation: "greater than"
+          is_scheduled: "1"
         status_code: [200, 201]
       when: _search_exists.status == 404
 
     - name: Update ZTA saved search to detect Failed password (sshd) and Authentication failure (PAM)
       ansible.builtin.uri:
-        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
         method: POST
         user: admin
         password: "{{ splunk_password }}"
@@ -183,7 +180,7 @@
       # before the EDA rulebook will fire again. If the chain does not trigger on a
       # subsequent run, wait 10 minutes and retry.
       ansible.builtin.uri:
-        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/saved/searches/ZTA%3A%20SSH%20Brute%20Force%20Detected"
         method: POST
         user: admin
         password: "{{ splunk_password }}"
@@ -197,7 +194,7 @@
 
     - name: Verify alert is scheduled
       ansible.builtin.uri:
-        url: "{{ splunk_mgmt }}/servicesNS/admin/ansible_addon_for_splunk/saved/searches/ZTA%3A+SSH+Brute+Force+Detected?output_mode=json"
+        url: "{{ splunk_mgmt }}/servicesNS/admin/search/saved/searches/ZTA%3A+SSH+Brute+Force+Detected?output_mode=json"
         user: admin
         password: "{{ splunk_password }}"
         force_basic_auth: true
