@@ -338,6 +338,17 @@
         status_code: [200]
       register: splunk_mgmt_ready
       until: splunk_mgmt_ready.status == 200
+
+    - name: Reload Splunk saved searches conf to pick up the new stanza
+      ansible.builtin.uri:
+        url: "https://localhost:8089/servicesNS/admin/ansible_addon_for_splunk/saved/searches/_reload"
+        method: GET
+        user: admin
+        password: "{{ splunk_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 201, 204]
+      ignore_errors: true
       retries: 30
       delay: 5
       tags: [eda_webhook]
