@@ -228,7 +228,7 @@
         organization: "{{ aap_organization }}"
         scm_type: git
         scm_url: "{{ project_scm_url }}"
-        scm_branch: zta-container
+        scm_branch: main
         scm_clean: true
         scm_update_on_launch: true
         default_environment: "{{ ee_name }}"
