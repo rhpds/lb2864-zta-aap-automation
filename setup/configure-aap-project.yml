@@ -240,9 +240,9 @@
       ansible.builtin.uri:
         url: "{{ aap_host }}/api/controller/v2/projects/?name={{ project_name | urlencode }}"
         method: GET
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
-          Content-Type: application/json
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
         validate_certs: "{{ aap_verify_ssl }}"
         status_code: 200
       register: _proj_lookup
@@ -252,9 +252,9 @@
       ansible.builtin.uri:
         url: "{{ aap_host }}/api/controller/v2/projects/{{ _proj_lookup.json.results[0].id }}/"
         method: PATCH
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
-          Content-Type: application/json
+        user: "{{ aap_user }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
         body_format: json
         body:
           scm_branch: main
