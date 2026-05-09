@@ -176,6 +176,8 @@
     - name: Launch Deploy Application Pipeline
       ansible.controller.workflow_launch:
         workflow_template: "{{ expected_section2_workflow }}"
+        extra_vars:
+          requesting_user: ztauser
         wait: true
         timeout: 300
       register: s2_workflow_launch
