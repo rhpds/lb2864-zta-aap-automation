@@ -235,6 +235,34 @@
         state: present
       tags: [project, aap-bootstrap, aap, aap-project]
 
+    - name: Force project scm_branch to main (idempotent patch — ansible.controller.project
+        does not update scm_branch on existing projects via state:present)
+      ansible.builtin.uri:
+        url: "{{ aap_host }}/api/controller/v2/projects/?name={{ project_name | urlencode }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Content-Type: application/json
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      register: _proj_lookup
+      tags: [project, aap-bootstrap, aap, aap-project]
+
+    - name: Patch project scm_branch to main if currently stale
+      ansible.builtin.uri:
+        url: "{{ aap_host }}/api/controller/v2/projects/{{ _proj_lookup.json.results[0].id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          scm_branch: main
+        validate_certs: "{{ aap_verify_ssl }}"
+        status_code: 200
+      when: _proj_lookup.json.results[0].scm_branch != 'main'
+      tags: [project, aap-bootstrap, aap, aap-project]
+
     - name: Wait for initial project sync to complete
       ansible.controller.project:
         name: "{{ project_name }}"
