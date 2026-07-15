@@ -42,6 +42,15 @@
         ip: "{{ central_ip }}"
 
   tasks:
+    - name: Authenticate to IdM
+      shell: echo '{{ idm_admin_password }}' | kinit admin
+      changed_when: false
+      no_log: true
+      register: kinit_result
+      until: kinit_result.rc == 0
+      retries: 5
+      delay: 5
+
     - name: Remove stale gitea DNS record
       redhat.rhel_idm.ipadnsrecord:
         ipaadmin_password: "{{ idm_admin_password }}"
@@ -50,11 +59,6 @@
         record_type: A
         record_value: "{{ central_ip }}"
         state: absent
-
-    - name: Authenticate to IdM
-      shell: echo '{{ idm_admin_password }}' | kinit admin
-      changed_when: false
-      no_log: true
 
     - name: Check current DNS forwarders
       command: ipa dnsconfig-show --raw
