@@ -5,7 +5,7 @@
 # Creates:
 #   0. ZTA Workshop EE             — Custom execution environment (cEOS + RHEL)
 #   1. ZTA Workshop Project        — SCM project (Git)
-#   2. Job templates               — All playbooks under section*/playbooks/ (tagged per section)
+#   2. Job templates               — All catalog templates with Section 1–7 Labels (default: all at once)
 #   3. ZTA Workshop EDA Project    — EDA project for rulebook activations (--tags eda)
 #   4. ZTA AAP Credential (EDA)    — AAP credential in EDA controller (--tags eda)
 #   5. ZTA Decision Environment    — DE for EDA rulebook activations (--tags eda)
@@ -19,11 +19,10 @@
 #
 # Usage:
 #   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags templates
 #   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags ee
 #   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags project
-#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags templates
-#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags section1
-#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags section2
+#   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags section3
 #   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags "section1,section2"
 #   ansible-playbook -i inventory/hosts.ini setup/configure-aap-project.yml --tags eda
 #
@@ -34,8 +33,8 @@
 # Tags:
 #   ee                 — Execution environment only
 #   project            — SCM project only (sync included)
-#   templates          — All workshop job templates (all sections)
-#   section1 … section7— Only that section's job templates
+#   templates          — All workshop job templates (all sections) with Section N Labels (default)
+#   section1 … section7— Optional: only that section's job templates and Label
 #   eda                — EDA project + AAP credential in Event-Driven Ansible controller
 #   remove_section     — Delete templates for aap_remove_section (integer, required)
 #   remove_last_section— Delete templates for the highest section number in the catalog
@@ -365,9 +364,21 @@
     # ══════════════════════════════════════════════════════════════════════
     #  3. Job templates — single dynamic loop for all active sections
     #
-    #  _active_sections is computed from --tags (e.g. --tags section2
-    #  sets [2]; --tags templates or no tags sets [1..7]).
+    #  Default / --tags templates / aap-bootstrap: sections [1..7], all
+    #  catalog templates, each with a "Section N" Label.
+    #  Optional subset: --tags section2 sets _active_sections to [2].
+    #  Labels must exist before job_template can attach them.
     # ══════════════════════════════════════════════════════════════════════
+
+    - name: Create section Labels for active sections
+      ansible.controller.label:
+        name: "Section {{ item }}"
+        organization: "{{ aap_organization }}"
+        state: present
+      loop: "{{ _active_sections }}"
+      loop_control:
+        label: "Section {{ item }}"
+      tags: [templates, section1, section2, section3, section4, section5, section6, section7, aap-bootstrap, aap, aap-project]
 
     - name: Create job templates for active sections
       ansible.controller.job_template:
@@ -380,6 +391,8 @@
         survey_enabled: "{{ item.survey_enabled | default(false) | bool }}"
         survey_spec: "{{ item.survey_spec | default(omit) }}"
         ask_variables_on_launch: "{{ item.ask_variables_on_launch | default(false) | bool }}"
+        labels:
+          - "Section {{ item.section }}"
         state: present
       loop: "{{ _active_templates }}"
       loop_control:
@@ -1190,7 +1203,8 @@
           ║  Default EE: {{ ee_name }}{{ ' ' * (53 - ee_name | length) }}║
           ║  Inventory: {{ inventory_name }}{{ ' ' * (53 - inventory_name | length) }}║
           ║                                                                 ║
-          ║  Add per lab phase:  --tags sectionN   (or --tags templates for all) ║
+          ║  Default: --tags templates (all sections, with Section N Labels)    ║
+          ║  Optional subset: --tags sectionN                                  ║
           ║  Remove section N:  --tags remove_section -e aap_remove_section=N   ║
           ║  Remove last section: --tags remove_last_section                  ║
           ║                                                                 ║
